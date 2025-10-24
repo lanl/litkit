@@ -1,5 +1,57 @@
 # /src/litkit/embeddings/devices.py
 
+"""
+Device and threading helpers for LitKit embeddings
+
+This module centralizes two concerns that must be handled early in process
+startup:
+
+1) **Thread caps for BLAS/FAISS** — to avoid oversubscription, instability, or
+   rare crashes on shared nodes. Call `configure_threads()` *before importing*
+   libraries that spawn worker threads (notably `faiss`).
+
+2) **Device selection for PyTorch/Transformers** — consistent, side-effect-free
+   detection of a suitable compute device for embedding models with a simple
+   override mechanism.
+
+Environment variables
+---------------------
+- LITKIT_THREADS: If set (e.g., "16"), caps:
+  VECLIB_MAXIMUM_THREADS, OMP_NUM_THREADS, OPENBLAS_NUM_THREADS, MKL_NUM_THREADS,
+  BLIS_NUM_THREADS, FAISS_NUM_THREADS. If unset, reasonable caps are derived
+  from `os.cpu_count()` and applied (FAISS gets a stricter cap).
+- LITKIT_FORCE_DEVICE: Force device selection: "cpu" | "cuda" | "mps".
+
+Public API
+----------
+- configure_threads(default: str | None = None) -> dict[str, str]
+    Apply thread caps (respecting existing env). Return the effective values.
+
+- detect_device(force_env: str | None = None) -> str
+    Return a PyTorch device string: "cuda" (if available), else "mps" (if
+    available and usable), else "cpu". Honors LITKIT_FORCE_DEVICE.
+
+- resolve_embed_devices(spec: str, force: bool = False) -> list[str]
+    Normalize a device spec into a concrete list of devices. Supports:
+    "auto", "cpu", "mps", "cuda:0", "cuda:0,cuda:1". In "auto" mode, selects
+    all visible CUDA devices, otherwise "mps" or "cpu".
+
+Notes
+-----
+- Imports of heavy dependencies (`torch`) are **lazy** and occur inside the
+  functions to keep module import side effects minimal.
+- Call `configure_threads()` as early as possible, ideally immediately after
+  process start and **before** any `faiss` import.
+
+Example
+-------
+    from litkit.embeddings.devices import configure_threads, detect_device, resolve_embed_devices
+
+    configure_threads()          # must happen before importing faiss
+    device = detect_device()     # e.g., "cuda" | "mps" | "cpu"
+    devices = resolve_embed_devices("auto")  # e.g., ["cuda:0", "cuda:1"]
+"""
+
 from __future__ import annotations
 
 import os
@@ -92,7 +144,8 @@ def resolve_embed_devices(spec: str, force: bool = False) -> list[str]:
         bad = [tok for tok in items if tok.startswith("cuda") and ":" not in tok]
         if bad and not force:
             raise ValueError(
-                f"Invalid CUDA device tokens {bad}; use 'cuda:0,cuda:1,...' or --force-embed-devices"
+                "Invalid CUDA device tokens "
+                f"{bad}; use 'cuda:0,cuda:1,...' or --force-embed-devices"
             )
         return items or ["cpu"]
     if s.startswith("cuda:"):
@@ -109,5 +162,6 @@ def resolve_embed_devices(spec: str, force: bool = False) -> list[str]:
             return ["mps"]
         return ["cpu"]
     return [s]  # fallback: user input is treated as a single device token
+
 
 __all__ = ["configure_threads", "detect_device", "resolve_embed_devices"]
