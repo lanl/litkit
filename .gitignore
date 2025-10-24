@@ -6,3 +6,7 @@ build/
 *.egg-info/
 .venv/
 .pytest_cache/
+
+# HF models and runtime artifacts
+workspace/
+workspace/**/
