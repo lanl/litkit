@@ -33,7 +33,7 @@ Outputs
   * ``doc_refs``: a list of representative dicts in order of first in-text mention, each with:
     ``docnum``, ``pmcid``, ``pmid``, ``doi``, ``paper_title``, ``year``.
 
-Notes
+Notes:
 -----
 - This module has no dependencies beyond the Python standard library.
 """
@@ -41,10 +41,11 @@ Notes
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, Tuple
+from collections.abc import Iterable
+from typing import Any
 
 
-def _doc_key(ch: Dict[str, Any]) -> str:
+def _doc_key(ch: dict[str, Any]) -> str:
     doi = (ch.get("doi") or "").strip().lower()
     if doi:
         return f"doi:{doi}"
@@ -61,13 +62,12 @@ def _doc_key(ch: Dict[str, Any]) -> str:
     return f"title:{title}" if title else f"rowid:{id(ch)}"
 
 
-def _expand_ranges(nums: str) -> List[int]:
-    """
-    Turn strings like '1-3, 5, 7–8' into [1,2,3,5,7,8].
+def _expand_ranges(nums: str) -> list[int]:
+    """Turn strings like '1-3, 5, 7–8' into [1,2,3,5,7,8].
     Accepts hyphen '-', en dash '–', and em dash '—' as range separators.
     Accepts ASCII comma ',' and common CJK commas.
     """
-    out: List[int] = []
+    out: list[int] = []
     for part in re.split(r"[,\u3001\uFF0C]", nums):  # comma, CJK comma variants
         part = part.strip()
         if not part:
@@ -89,9 +89,9 @@ _CITATION_BLOCK = re.compile(
 )
 
 
-def _unique_preserve(seq: Iterable[int]) -> List[int]:
+def _unique_preserve(seq: Iterable[int]) -> list[int]:
     seen = set()
-    out: List[int] = []
+    out: list[int] = []
     for x in seq:
         if x not in seen:
             seen.add(x)
@@ -100,10 +100,9 @@ def _unique_preserve(seq: Iterable[int]) -> List[int]:
 
 
 def normalize_answer_and_build_refs(
-    answer: str, selected_chunks: List[Dict[str, Any]]
-) -> Tuple[str, List[Dict[str, Any]]]:
-    """
-    Convert chunk-wise numeric citations in `answer` to doc-wise citations and
+    answer: str, selected_chunks: list[dict[str, Any]]
+) -> tuple[str, list[dict[str, Any]]]:
+    """Convert chunk-wise numeric citations in `answer` to doc-wise citations and
     return a doc-wise bibliography list (ordered by first mention).
 
     Parameters
@@ -113,7 +112,7 @@ def normalize_answer_and_build_refs(
     selected_chunks : List[dict]
         The chunks list where the 1-based index corresponds to the numbers used in `answer`.
 
-    Returns
+    Returns:
     -------
     normalized_answer : str
         The answer with citations renumbered to refer to unique documents (papers).
@@ -122,9 +121,9 @@ def normalize_answer_and_build_refs(
         Each dict includes: "docnum", "pmcid", "pmid", "doi", "paper_title", "year".
     """
     # Map chunk index -> document key
-    idx2key: Dict[int, str] = {i + 1: _doc_key(ch) for i, ch in enumerate(selected_chunks)}
-    key2docnum: Dict[str, int] = {}
-    chunk2docnum: Dict[int, int] = {}
+    idx2key: dict[int, str] = {i + 1: _doc_key(ch) for i, ch in enumerate(selected_chunks)}
+    key2docnum: dict[str, int] = {}
+    chunk2docnum: dict[int, int] = {}
 
     # First pass: discover order of first mentions (assign doc numbers)
     def _discover(match: re.Match) -> str:
@@ -155,7 +154,7 @@ def normalize_answer_and_build_refs(
     normalized_answer = _CITATION_BLOCK.sub(_replace, answer)
 
     # Build representative refs in docnum order
-    rep_by_key: Dict[str, Dict[str, Any]] = {}
+    rep_by_key: dict[str, dict[str, Any]] = {}
     for ch in selected_chunks:
         k = _doc_key(ch)
         if k not in rep_by_key:
@@ -163,7 +162,7 @@ def normalize_answer_and_build_refs(
 
     # Sort keys by docnum
     inv = sorted(((docnum, key) for key, docnum in key2docnum.items()), key=lambda x: x[0])
-    doc_refs: List[Dict[str, Any]] = []
+    doc_refs: list[dict[str, Any]] = []
     for docnum, key in inv:
         ch = rep_by_key.get(key, {})
         doc_refs.append(
@@ -179,9 +178,8 @@ def normalize_answer_and_build_refs(
     return normalized_answer, doc_refs
 
 
-def render_references(doc_refs: List[Dict[str, Any]]) -> str:
-    """
-    Render a simple bibliography block from `doc_refs` returned by
+def render_references(doc_refs: list[dict[str, Any]]) -> str:
+    """Render a simple bibliography block from `doc_refs` returned by
     normalize_answer_and_build_refs(). Always includes a header.
     """
     # Accept list or dict-like (defensive)
@@ -195,7 +193,7 @@ def render_references(doc_refs: List[Dict[str, Any]]) -> str:
         items = list(doc_refs)
 
     # Sort by docnum if present
-    def _doc_key(d: Dict[str, Any]) -> int:
+    def _doc_key(d: dict[str, Any]) -> int:
         try:
             return int(d.get("docnum", 10**9))
         except Exception:
@@ -203,7 +201,7 @@ def render_references(doc_refs: List[Dict[str, Any]]) -> str:
 
     items.sort(key=_doc_key)
 
-    lines: List[str] = []
+    lines: list[str] = []
     lines.append("References")
 
     for d in items:
@@ -212,7 +210,7 @@ def render_references(doc_refs: List[Dict[str, Any]]) -> str:
         year = d.get("year")
         year_str = f" ({year})" if year else ""
 
-        id_parts: List[str] = []
+        id_parts: list[str] = []
         doi = (d.get("doi") or "").strip()
         pmcid = (d.get("pmcid") or "").strip()
         pmid = (d.get("pmid") or "").strip()
@@ -227,6 +225,7 @@ def render_references(doc_refs: List[Dict[str, Any]]) -> str:
         lines.append(f"[{n}] {title}{year_str}.{id_str}")
 
     return "\n".join(lines)
+
 
 # Public API
 __all__ = [

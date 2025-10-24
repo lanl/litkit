@@ -1,15 +1,14 @@
 # src/litkit/cli.py
 
-# -*- coding: utf-8 -*-
-
-from . import __version__ as LITKIT_VERSION
-
 import os
 import sys
+
+from . import __version__ as LITKIT_VERSION
 
 # -------- simple early quieting (env), used before argparse exists ----------
 # Set LITKIT_QUIET=1 to squelch startup banners that print before args are parsed.
 QUIET = os.environ.get("LITKIT_QUIET", "0") == "1"
+
 
 def _version_banner() -> str:
     git = (os.environ.get("LITKIT_SHA") or "").strip()
@@ -18,82 +17,73 @@ def _version_banner() -> str:
     tail = f" (git:{git})" if git else ""
     return f"litkit {LITKIT_VERSION}{tail}"
 
+
 # -------------------- Standard library imports --------------------
-import re
-import sys
-import json
-import math
-import time
 import argparse
-import sqlite3
-from pathlib import Path
-from typing import List, Dict, Optional, Tuple
-import errno
-import logging
-import hashlib
-import unicodedata
-import threading
-import multiprocessing as mp
-import signal
 import atexit
+import errno
+import hashlib
+import json
+import logging
+import math
+import multiprocessing as mp
+import random
+import re
+import signal
 import socket
-import math, random
+import sqlite3
+import threading
+import time
+import unicodedata
+from pathlib import Path
 
 # Third-party import used early in XML parsing utilities.
-#from lxml import etree
-
+# from lxml import etree
 from types import SimpleNamespace
+from typing import Optional
 
-from litkit.ingest.ingest import (
-    parse_xml_fileobj,
-    iter_tar_xml_streams,
-    iter_tar_paths,
-    count_tar_xml_members,
-)
+from litkit.embeddings.devices import configure_threads, detect_device, resolve_embed_devices
 from litkit.formatting.answers import (
     normalize_answer_and_build_refs,
     render_references,
 )
 from litkit.frontload.cap import cap_chunks_per_paper
+from litkit.ingest.ingest import (
+    count_tar_xml_members,
+    iter_tar_paths,
+    iter_tar_xml_streams,
+    parse_xml_fileobj,
+)
+
+configure_threads()
+DEVICE = detect_device()
+if not QUIET:
+    print(f"[version] {_version_banner()}")
+    print(f"[device] using {DEVICE}")
 
 # fcntl is not available on Windows
 try:
     import fcntl
+
     FLOCK_AVAILABLE = True
 except ModuleNotFoundError:
     fcntl = None
     FLOCK_AVAILABLE = False
 
-logging.basicConfig(
-    level=logging.WARNING, 
-    format="%(levelname)s %(name)s: %(message)s"
-)
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
-# Tame threading to avoid rare crashes; these lines must appear before import faiss
-_DEFAULT_THREADS = os.environ.get("LITKIT_THREADS", "").strip()
-if _DEFAULT_THREADS:
-    for k in ("VECLIB_MAXIMUM_THREADS","OMP_NUM_THREADS","OPENBLAS_NUM_THREADS",
-              "MKL_NUM_THREADS","BLIS_NUM_THREADS","FAISS_NUM_THREADS"):
-        os.environ.setdefault(k, _DEFAULT_THREADS)
-else:
-    # Respect pre-set values; otherwise size to the node
-    cpu = os.cpu_count() or 32
-    polite = str(min(32, cpu))
-    faiss_polite = str(min(16, max(4, cpu // 2)))
-    os.environ.setdefault("FAISS_NUM_THREADS", faiss_polite)
-    for k in ("OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","BLIS_NUM_THREADS","VECLIB_MAXIMUM_THREADS"):
-        os.environ.setdefault(k, polite)
 
 def main(argv=None) -> int:
     # parse args, do work, return 0/1
     return 0
 
+
 if __name__ == "__main__":
     raise SystemExit(main())
 
+
 def _effective_nlist(n_train: int, requested_nlist: int, min_nlist: int = 16) -> int:
-    """
-    ...
+    """...
     For larger corpora, enforce a higher floor (>=256) so search doesn’t
     concentrate in very few lists.
     """
@@ -109,12 +99,13 @@ def _effective_nlist(n_train: int, requested_nlist: int, min_nlist: int = 16) ->
 
     return max(floor, min(cap_by_data, cap_by_heuristic))
 
+
 def _create_writer_guard_or_exit(args):
     if not getattr(args, "faiss_writer", False):
         return
     try:
         fd = os.open(WRITER_GUARD, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, f"{os.getpid()} {socket.gethostname()} {int(time.time())}\n".encode("utf-8"))
+        os.write(fd, f"{os.getpid()} {socket.gethostname()} {int(time.time())}\n".encode())
         os.close(fd)
         atexit.register(lambda: (os.path.exists(WRITER_GUARD) and os.remove(WRITER_GUARD)))
     except FileExistsError:
@@ -127,6 +118,7 @@ def _create_writer_guard_or_exit(args):
             "Stop the other job or remove the stale guard if you are sure it is dead.\n"
         )
         sys.exit(2)
+
 
 # -------------------- Paths & offline env --------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -158,8 +150,10 @@ try:
     SQLITE_DIR.mkdir(parents=True, exist_ok=True)
     INDICES_DIR.mkdir(parents=True, exist_ok=True)
 except Exception as e:
-    sys.stderr.write(f"[paths] ERROR: cannot create {SQLITE_DIR} or {INDICES_DIR}: {e}\n"
-                     "[paths] Set LITKIT_HOME to a writable Lustre/NFS path and re-run.\n")
+    sys.stderr.write(
+        f"[paths] ERROR: cannot create {SQLITE_DIR} or {INDICES_DIR}: {e}\n"
+        "[paths] Set LITKIT_HOME to a writable Lustre/NFS path and re-run.\n"
+    )
     sys.exit(2)
 
 DB_PATH = SQLITE_DIR / "brag.sqlite3"
@@ -169,10 +163,12 @@ CKPT_PATH = SQLITE_DIR / "build_checkpoint.json"
 if os.environ.get("LITKIT_HOME") and not QUIET:
     print(f"[paths] LITKIT_HOME set → using {ROOT} for sqlite/, indices/, hf_cache/")
 
+
 class FileLock:
     def __init__(self, path: Path):
         self.path = path
         self._fd = None
+
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fd = open(self.path, "w")
@@ -183,11 +179,14 @@ class FileLock:
             fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX)
         except OSError as e:
             if e.errno in (getattr(errno, "ENOTSUP", 95), getattr(errno, "EOPNOTSUPP", 95)):
-                print(f"[lock] WARNING: flock unsupported on {self.path}; proceeding without advisory lock.")
+                print(
+                    f"[lock] WARNING: flock unsupported on {self.path}; proceeding without advisory lock."
+                )
                 globals()["_ADVISORY_LOCK_DISABLED"] = True
             else:
                 raise
         return self
+
     def __exit__(self, exc_type, exc, tb):
         try:
             if FLOCK_AVAILABLE and fcntl is not None:
@@ -198,8 +197,9 @@ class FileLock:
         finally:
             self._fd.close()
 
+
 # Always acquire in this order to avoid deadlock: DB_LOCK then FAISS_LOCK
-DB_LOCK    = SQLITE_DIR / "db.writer.lock"
+DB_LOCK = SQLITE_DIR / "db.writer.lock"
 FAISS_LOCK = SQLITE_DIR / "faiss.writer.lock"
 WRITER_GUARD = SQLITE_DIR / "faiss_writer.guard"
 
@@ -218,33 +218,33 @@ chunk_seg_writer = None
 paper_seg_writer = None
 
 # -------------------- Model IDs --------------------
-SPECTER2_ID = "allenai/specter2_base"                       # paper-level (title+abstract)
-SBERT_ID    = "sentence-transformers/all-mpnet-base-v2"     # chunk-level
+SPECTER2_ID = "allenai/specter2_base"  # paper-level (title+abstract)
+SBERT_ID = "sentence-transformers/all-mpnet-base-v2"  # chunk-level
 
 # -------------------- LLM defaults --------------------
 # (HPC) production: o3; laptop testing: gpt-oss:20b
-DEFAULT_LLM_MODEL       = os.environ.get("LLM_MODEL", "gpt-oss:20b")
+DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-oss:20b")
 # default LLM timeout (seconds) for OpenAI client; safe on air-gapped cluster
 OPENAI_TIMEOUT_SEC = int(os.environ.get("LITKIT_OPENAI_TIMEOUT_SEC", "15"))
 
+
 def _default_base_url_for(model: str) -> str:
-    """
-    Resolve a sensible default OpenAI-compatible base URL based on model name.
+    """Resolve a sensible default OpenAI-compatible base URL based on model name.
 
     - "gpt-oss:*" → local endpoints (e.g., LM Studio) at http://localhost:1234/v1
     - "o3*"       → official OpenAI endpoint
     - otherwise   → default to local endpoint to keep offline-friendly behavior
     """
     m = model.lower()
-    if m.startswith("gpt-oss"):     # LM Studio local OpenAI-compatible
+    if m.startswith("gpt-oss"):  # LM Studio local OpenAI-compatible
         return os.environ.get("OPENAI_BASE_URL", "http://localhost:1234/v1")
     if m.startswith("o3"):
         return os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
     return os.environ.get("OPENAI_BASE_URL", "http://localhost:1234/v1")
 
+
 def _default_api_key_for(model: str) -> str:
-    """
-    Provide an API key default appropriate for the target endpoint.
+    """Provide an API key default appropriate for the target endpoint.
 
     Local testing (gpt-oss:*) tolerates "no-auth". OpenAI (o3*) expects a key.
     """
@@ -255,10 +255,11 @@ def _default_api_key_for(model: str) -> str:
         return os.environ.get("OPENAI_API_KEY", "")
     return os.environ.get("OPENAI_API_KEY", "")
 
+
 # -------------------- Build / search knobs (sane defaults) --------------------
-TOP_PAPERS_DEFAULT   = 500      # wide shortlist for quality in Stage 1
-TOP_CHUNKS_DEFAULT   = 30       # final chunks given to LLM in Stage 2
-OVERSHOOT_DEFAULT    = 20       # widen ANN chunk search before candidate-paper filter
+TOP_PAPERS_DEFAULT = 500  # wide shortlist for quality in Stage 1
+TOP_CHUNKS_DEFAULT = 30  # final chunks given to LLM in Stage 2
+OVERSHOOT_DEFAULT = 20  # widen ANN chunk search before candidate-paper filter
 
 # -------------------- Progress / render defaults --------------------
 # How often to refresh per-tar progress (seconds). Higher = fewer lines.
@@ -266,25 +267,26 @@ TAR_RENDER_SEC = float(os.environ.get("LITKIT_TAR_RENDER_SEC", "5.0"))
 
 # Optional % gating. 0 => disabled (time-based only).
 # Accept both the canonical var and the short alias LITKIT_TAR_RENDER_PCT_STP.
-TAR_RENDER_PCT_STEP = float(os.environ.get(
-    "LITKIT_TAR_RENDER_PCT_STEP",
-    os.environ.get("LITKIT_TAR_RENDER_PCT_STP", "0")
-))
+TAR_RENDER_PCT_STEP = float(
+    os.environ.get("LITKIT_TAR_RENDER_PCT_STEP", os.environ.get("LITKIT_TAR_RENDER_PCT_STP", "0"))
+)
 
 # batching (large batches are OK; flush gated by --faiss-writer)
-PAPER_BATCH          = 20000    # embed-add papers per batch
-CHUNK_BATCH          = 20000    # embed-add chunks per batch
-TRAIN_CHUNK_SAMPLES  = 150_000  # IVF-PQ training sample size (chunk embeddings)
-CKPT_EVERY           = 500      # checkpoint scan progress every N processed files
+PAPER_BATCH = 20000  # embed-add papers per batch
+CHUNK_BATCH = 20000  # embed-add chunks per batch
+TRAIN_CHUNK_SAMPLES = 150_000  # IVF-PQ training sample size (chunk embeddings)
+CKPT_EVERY = 500  # checkpoint scan progress every N processed files
 
 # chunking parameters (aggregate paragraphs into ~CHUNK_TARGET_CHARS)
-BODY_MIN_CHARS       = 300
-CHUNK_TARGET_CHARS   = 1200
-CHUNK_OVERLAP_CHARS  = 200
-BATCH_TRAIN_FLUSH    = int(os.environ.get("LITKIT_TRAIN_FLUSH", "4000"))  # how many training chunks per embed flush
+BODY_MIN_CHARS = 300
+CHUNK_TARGET_CHARS = 1200
+CHUNK_OVERLAP_CHARS = 200
+BATCH_TRAIN_FLUSH = int(
+    os.environ.get("LITKIT_TRAIN_FLUSH", "4000")
+)  # how many training chunks per embed flush
 
 # token budgets (approx; ~4 chars/token heuristic used)
-BUDGET_TOKENS_O3     = 32000
+BUDGET_TOKENS_O3 = 32000
 BUDGET_TOKENS_OSS20B = 3000
 
 # -------------------- DB schema --------------------
@@ -316,6 +318,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS papers_pmcid_uq ON papers(pmcid) WHERE pmcid <
 CREATE UNIQUE INDEX IF NOT EXISTS papers_pmid_uq  ON papers(pmid)  WHERE pmid  <> '';
 """
 
+
 # -------------------- Destructive action confirmation --------------------
 def _fmt_bytes(n: int) -> str:
     """Human-ish size."""
@@ -327,6 +330,7 @@ def _fmt_bytes(n: int) -> str:
         i += 1
     return f"{x:.1f} {units[i]}"
 
+
 def _file_size_str(p: Path) -> str:
     try:
         st = p.stat()
@@ -336,9 +340,9 @@ def _file_size_str(p: Path) -> str:
     except Exception:
         return "unknown"
 
+
 def _confirm_rebuild(conn) -> None:
-    """
-    Ask the user to confirm --rebuild when in an interactive TTY.
+    """Ask the user to confirm --rebuild when in an interactive TTY.
     In non-interactive mode, require --yes or LITKIT_ASSUME_YES=1.
     """
     # Allow fully non-interactive approvals
@@ -355,13 +359,13 @@ def _confirm_rebuild(conn) -> None:
     # Summarize what will be affected
     p_idx_sz = _file_size_str(PAPER_INDEX_PATH)
     c_idx_sz = _file_size_str(CHUNK_INDEX_PATH)
-    tf_flag  = f"{CHUNK_TRAINED_FLAG} ({'exists' if CHUNK_TRAINED_FLAG.exists() else 'missing'})"
-    ckpt_sz  = _file_size_str(CKPT_PATH) if CKPT_PATH.exists() else "missing"
+    tf_flag = f"{CHUNK_TRAINED_FLAG} ({'exists' if CHUNK_TRAINED_FLAG.exists() else 'missing'})"
+    ckpt_sz = _file_size_str(CKPT_PATH) if CKPT_PATH.exists() else "missing"
     try:
         cur = conn.cursor()
-        n_p  = cur.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
-        n_c  = cur.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-        n_f  = cur.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        n_p = cur.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+        n_c = cur.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        n_f = cur.execute("SELECT COUNT(*) FROM files").fetchone()[0]
         counts = f"DB rows → papers={n_p}, chunks={n_c}, files={n_f}"
     except Exception:
         counts = "DB rows → (unavailable)"
@@ -378,9 +382,9 @@ def _confirm_rebuild(conn) -> None:
         print("[rebuild] Aborted by user.")
         sys.exit(2)
 
-def _resolve_question(args) -> Optional[str]:
-    """
-    Resolve the effective question from one of:
+
+def _resolve_question(args) -> str | None:
+    """Resolve the effective question from one of:
     1) --question-file FILE (or '-' for stdin)
     2) Positional 'question' that is:
         - '@path' shorthand (read from path)
@@ -412,6 +416,7 @@ def _resolve_question(args) -> Optional[str]:
     # 2c) treat as literal question
     return q.strip()
 
+
 def _maybe_fsync_dir(p: Path):
     # Optional: fsync the containing directory for extra safety on some NFS setups
     if os.environ.get("LITKIT_SEGMENT_FSYNC_DIR", "0") != "1":
@@ -425,10 +430,10 @@ def _maybe_fsync_dir(p: Path):
     except Exception:
         pass
 
+
 # -------------------- Utils --------------------
 def init_db(journal_mode: str, busy_timeout_ms: int):
-    """
-    Initialize (or open) the SQLite database and ensure schema exists.
+    """Initialize (or open) the SQLite database and ensure schema exists.
 
     Supported journal modes: TRUNCATE (default) | WAL
     - TRUNCATE: safe on shared HPC filesystems (reduced metadata churn vs DELETE).
@@ -447,8 +452,10 @@ def init_db(journal_mode: str, busy_timeout_ms: int):
 
     if mode == "WAL":
         # WAL can misbehave on shared HPC filesystems; warn the operator.
-        print("[db] WARNING: WAL selected. Ensure the DB is on node-local storage. "
-              "On shared FS (NFS/Lustre), prefer --sqlite-journal-mode TRUNCATE.")
+        print(
+            "[db] WARNING: WAL selected. Ensure the DB is on node-local storage. "
+            "On shared FS (NFS/Lustre), prefer --sqlite-journal-mode TRUNCATE."
+        )
         conn.execute("PRAGMA wal_autocheckpoint=1000;")
 
     eff_mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
@@ -456,12 +463,13 @@ def init_db(journal_mode: str, busy_timeout_ms: int):
 
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)};")
-    conn.execute("PRAGMA temp_store=MEMORY;") # force in-memory temp storage
+    conn.execute("PRAGMA temp_store=MEMORY;")  # force in-memory temp storage
 
     conn.executescript(SCHEMA)
     _ensure_in_index_columns(conn)
     conn.commit()
     return conn
+
 
 def _ensure_in_index_columns(conn):
     """Idempotent migration: ensure `in_index` exists on {papers,chunks}."""
@@ -472,9 +480,11 @@ def _ensure_in_index_columns(conn):
             cur.execute(f"ALTER TABLE {table} ADD COLUMN in_index INTEGER DEFAULT 0")
     conn.commit()
 
-def pack_paragraphs(paras, max_chars=CHUNK_TARGET_CHARS, min_chars=BODY_MIN_CHARS, overlap_chars=CHUNK_OVERLAP_CHARS):
-    """
-    Greedy pack paragraphs, then add a small character overlap between
+
+def pack_paragraphs(
+    paras, max_chars=CHUNK_TARGET_CHARS, min_chars=BODY_MIN_CHARS, overlap_chars=CHUNK_OVERLAP_CHARS
+):
+    """Greedy pack paragraphs, then add a small character overlap between
     consecutive chunks to reduce claim-splitting.
     """
     chunks, buf, total = [], [], 0
@@ -493,23 +503,23 @@ def pack_paragraphs(paras, max_chars=CHUNK_TARGET_CHARS, min_chars=BODY_MIN_CHAR
     for p in paras:
         if buf and total + len(p) + 1 > max_chars:
             _flush_buf()
-        buf.append(p); total += len(p) + 1
+        buf.append(p)
+        total += len(p) + 1
     _flush_buf()
 
     if overlap_chars > 0 and len(chunks) > 1:
         out = [chunks[0]]
         for i in range(1, len(chunks)):
-            tail = chunks[i-1][-overlap_chars:]
+            tail = chunks[i - 1][-overlap_chars:]
             out.append((tail + " " + chunks[i]).strip())
         chunks = out
     return chunks
 
-def _dedupe_ids_and_texts(ids: List[int], texts: List[str]) -> Tuple[List[int], List[str]]:
-    """
-    Keep the first occurrence of each id; return aligned id/text lists.
-    """
+
+def _dedupe_ids_and_texts(ids: list[int], texts: list[str]) -> tuple[list[int], list[str]]:
+    """Keep the first occurrence of each id; return aligned id/text lists."""
     out_ids, out_texts, seen = [], [], set()
-    for i, t in zip(ids, texts):
+    for i, t in zip(ids, texts, strict=False):
         if i in seen:
             continue
         seen.add(i)
@@ -517,7 +527,9 @@ def _dedupe_ids_and_texts(ids: List[int], texts: List[str]) -> Tuple[List[int], 
         out_texts.append(t)
     return out_ids, out_texts
 
+
 # -------------------- HF local snapshot helpers --------------------
+
 
 def _hf_repo_root(repo_id: str) -> Path:
     """Return the preferred local HF root; fall back to script-local cache."""
@@ -530,10 +542,11 @@ def _hf_repo_root(repo_id: str) -> Path:
     # fallback: script-local ./hf_cache/hub
     return SCRIPT_DIR / "hf_cache" / "hub" / sub
 
+
 def _local_snapshot_dir(repo_id: str) -> Path:
     root = _hf_repo_root(repo_id)
     snaps = root / "snapshots"
-    refs  = root / "refs" / "main"
+    refs = root / "refs" / "main"
     if refs.exists():
         commit = refs.read_text().strip()
         p = snaps / commit
@@ -551,7 +564,8 @@ def _local_snapshot_dir(repo_id: str) -> Path:
         )
     raise FileNotFoundError(f"No local snapshot found for {repo_id} under {root}")
 
-def _find_any(root: Path, names: List[str]) -> Optional[Path]:
+
+def _find_any(root: Path, names: list[str]) -> Path | None:
     """Return the first existing file among `names` under `root`, else None."""
     for n in names:
         p = root / n
@@ -559,9 +573,10 @@ def _find_any(root: Path, names: List[str]) -> Optional[Path]:
             return p
     return None
 
+
 # -------------------- Embedders --------------------
-import numpy as np
 import faiss
+import numpy as np
 
 # Deterministic FAISS training (IVF/PQ k-means init)
 try:
@@ -570,88 +585,27 @@ except Exception:
     pass
 
 import torch
-from transformers import (
-    AutoTokenizer, AutoModel,
-    BertTokenizerFast, BertModel, BertConfig,
-    RobertaTokenizerFast, RobertaModel, RobertaConfig,
-    MPNetTokenizerFast, MPNetModel, MPNetConfig,
-)
 from sentence_transformers import SentenceTransformer
-
-
-# Device selection (CUDA -> MPS -> CPU), overridable via LITKIT_FORCE_DEVICE.
-try:
-    _ = torch.tensor([0.0]).to("mps")
-    _ = (_ + 1).cpu()
-    MPS_OK = True
-except Exception:
-    MPS_OK = False
-
-FORCE_DEVICE = os.environ.get("LITKIT_FORCE_DEVICE", "").lower()
-if FORCE_DEVICE in {"cpu", "cuda", "mps"}:
-    DEVICE = FORCE_DEVICE
-else:
-    if torch.cuda.is_available():
-        DEVICE = "cuda"
-    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() and MPS_OK:
-        DEVICE = "mps"
-    else:
-        DEVICE = "cpu"
-
-if not QUIET:
-    print(f"[version] {_version_banner()}")
-    print(f"[device] using {DEVICE}")
-
-def _resolve_embed_devices(spec: str, force: bool = False) -> List[str]:
-    """
-    Normalize the --embed-devices value into a concrete device list.
-
-    Rules
-    -----
-    - "auto": CUDA GPUs if available (cuda:0..cuda:N-1); else "mps" if available; else "cpu"
-    - "mps" / "cpu": return a single-item list
-    - Comma-separated list (e.g., "cuda:0,cuda:1"): split and strip
-    - Validation is light; later patches will actually bind workers to these
-    """
-    s = (spec or "auto").strip().lower()
-
-    # explicit singletons
-    if s in {"cpu", "mps"}:
-        return [s]
-
-    # explicit comma-separated list
-    if "," in s:
-        items = [x.strip() for x in s.split(",") if x.strip()]
-        bad = [tok for tok in items if tok.startswith("cuda") and ":" not in tok]
-        if bad and not force:
-            raise ValueError(f"Invalid CUDA device tokens {bad}; use 'cuda:0,cuda:1,...' or --force-embed-devices")
-        return items or ["cpu"]
-
-    # explicit single cuda device like "cuda:0"
-    if s.startswith("cuda:"):
-        return [s]
-
-    # auto detection
-    if s == "auto":
-        if torch.cuda.is_available():
-            try:
-                n = torch.cuda.device_count()
-            except Exception:
-                n = 1
-            return [f"cuda:{i}" for i in range(max(1, n))]
-        # Apple Metal (MPS)
-        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            return ["mps"]
-        return ["cpu"]
-
-    # fallback: treat whatever the user typed as a single device token
-    return [s]
+from transformers import (
+    AutoModel,
+    AutoTokenizer,
+    BertConfig,
+    BertModel,
+    BertTokenizerFast,
+    MPNetConfig,
+    MPNetModel,
+    MPNetTokenizerFast,
+    RobertaConfig,
+    RobertaModel,
+    RobertaTokenizerFast,
+)
 
 # --- shared progress line state (prevents line collisions) ---
 
 _PROGRESS_LOCK = threading.Lock()
 _PROGRESS_LAST_LEN = 0
 PROGRESS_MODE = os.environ.get("LITKIT_PROGRESS_MODE", "auto").lower()  # use "auto" not "append"
+
 
 def _progress_is_append():
     # TTY-aware: default 'auto' rewrites in-place on terminals.
@@ -671,23 +625,31 @@ def _progress_is_append():
         pass
     return True
 
+
 def _progress_write(s: str, stream):
     """Render a single-line progress message, erasing any longer prior line."""
     global _PROGRESS_LAST_LEN
     with _PROGRESS_LOCK:
         if _progress_is_append():
-            stream.write(s + "\n"); stream.flush(); _PROGRESS_LAST_LEN = 0
+            stream.write(s + "\n")
+            stream.flush()
+            _PROGRESS_LAST_LEN = 0
         else:
             pad = max(0, _PROGRESS_LAST_LEN - len(s))
-            stream.write("\r" + s + (" " * pad)); stream.flush(); _PROGRESS_LAST_LEN = len(s)
+            stream.write("\r" + s + (" " * pad))
+            stream.flush()
+            _PROGRESS_LAST_LEN = len(s)
+
 
 def _progress_newline(stream):
     """Commit the current line (newline) and reset shared width."""
     global _PROGRESS_LAST_LEN
     with _PROGRESS_LOCK:
         if not _progress_is_append():
-            stream.write("\n"); stream.flush()
+            stream.write("\n")
+            stream.flush()
         _PROGRESS_LAST_LEN = 0
+
 
 def _phase(name: str, stream=None):
     """Print a simple phase banner (operator log only)."""
@@ -700,30 +662,36 @@ def _phase(name: str, stream=None):
     stream.flush()
     try:
         with _PROGRESS_LOCK:
-            globals()['_PROGRESS_LAST_LEN'] = 0
+            globals()["_PROGRESS_LAST_LEN"] = 0
     except Exception:
         pass
 
-def _pick_nprobe(nlist: int, user: Optional[int]) -> int:
+
+def _pick_nprobe(nlist: int, user: int | None) -> int:
     if user is not None:
         target = int(user)
     else:
         target = int(math.sqrt(max(1, nlist)))
     min_floor = 32 if nlist >= 16384 else 8
-    max_cap  = 1024 if nlist >= 65536 else 512
+    max_cap = 1024 if nlist >= 65536 else 512
     return min(nlist, max(min_floor, min(max_cap, target)))
+
 
 class _SegmentWriter:
     def __init__(self, outdir: Path, segment_size: int, dtype: str, shard_id: int, kind: str):
-        self.outdir = Path(outdir); self.outdir.mkdir(parents=True, exist_ok=True)
+        self.outdir = Path(outdir)
+        self.outdir.mkdir(parents=True, exist_ok=True)
         self.segment_size = int(segment_size)
         self.dtype = np.float16 if dtype == "fp16" else np.float32
-        self.shard_id = int(shard_id); self.seq = 0; self.kind = kind
+        self.shard_id = int(shard_id)
+        self.seq = 0
+        self.kind = kind
 
     def _next_path(self) -> Path:
         ts = int(time.time())
         p = self.outdir / f"{self.kind}_sh{self.shard_id:02d}_{ts}_{self.seq:06d}.npz"
-        self.seq += 1; return p
+        self.seq += 1
+        return p
 
     def write(self, ids: np.ndarray, vecs: np.ndarray):
         if ids.size == 0:
@@ -733,9 +701,9 @@ class _SegmentWriter:
 
         for start in range(0, ids.shape[0], self.segment_size):
             end = min(ids.shape[0], start + self.segment_size)
-            ids_i  = np.ascontiguousarray(ids[start:end], dtype=np.int64)
+            ids_i = np.ascontiguousarray(ids[start:end], dtype=np.int64)
             vecs_i = np.ascontiguousarray(vecs[start:end])
-            dim    = vecs_i.shape[1]
+            dim = vecs_i.shape[1]
 
             final = self._next_path()
             tmp = final.with_suffix(final.suffix + ".tmp")
@@ -743,11 +711,9 @@ class _SegmentWriter:
             # Write to a temp file, fsync, then atomic replace
             final.parent.mkdir(parents=True, exist_ok=True)
             with open(tmp, "wb") as fh:
-                np.savez(fh,
-                         ids=ids_i,
-                         vecs=vecs_i,
-                         dim=np.int32(dim),
-                         count=np.int32(ids_i.shape[0]))
+                np.savez(
+                    fh, ids=ids_i, vecs=vecs_i, dim=np.int32(dim), count=np.int32(ids_i.shape[0])
+                )
                 try:
                     if os.environ.get("LITKIT_SEGMENT_FSYNC_FILE", "1") == "1":
                         fh.flush()
@@ -758,10 +724,18 @@ class _SegmentWriter:
             os.replace(tmp, final)
             _maybe_fsync_dir(final)
 
+
 # --- lightweight progress line (stderr), dependency-free ---
 class _Progress:
-    def __init__(self, label: str, total: Optional[int] = None, start: int = 0,
-                 min_interval: float = 0.2, stream=None, emit_final_line: bool = True):
+    def __init__(
+        self,
+        label: str,
+        total: int | None = None,
+        start: int = 0,
+        min_interval: float = 0.2,
+        stream=None,
+        emit_final_line: bool = True,
+    ):
         self.label = label
         self.total = total if (total is not None and total > 0) else None
         self.done = int(start)
@@ -780,7 +754,7 @@ class _Progress:
         rate = self.done / elapsed
         if self.total is None:
             return f"[progress] {self.label}: {self.done}  ({rate:.1f}/s)"
-        pct = (100.0 * self.done / max(1, self.total))
+        pct = 100.0 * self.done / max(1, self.total)
         return f"[progress] {self.label}: {self.done}/{self.total}  ({pct:.1f}%)  {rate:.1f}/s"
 
     def tick(self, inc: int = 1, force: bool = False):
@@ -794,15 +768,17 @@ class _Progress:
     #     # Render final state and then print a new line
     #     _progress_write(self._fmt(), self.stream)
     #     _progress_newline(self.stream)
-    def finish(self, emit_final_line: Optional[bool] = None):
+    def finish(self, emit_final_line: bool | None = None):
         # Use instance default unless overridden per-call
         do_emit = self.emit_final_line if emit_final_line is None else bool(emit_final_line)
         if do_emit:
             _progress_write(self._fmt(), self.stream)
         _progress_newline(self.stream)
 
+
 class _Pulse:
     """Background heartbeat that refreshes a single progress line with elapsed time."""
+
     def __init__(self, label: str, period: float = 0.5, stream=None):
         self.label = label
         self.period = float(period)
@@ -810,22 +786,16 @@ class _Pulse:
         self._stop = threading.Event()
         self._t0 = time.time()
         self._thr = threading.Thread(target=self._run, daemon=True)
-        # self._last_len = 0
-        # # In append mode, don't try to live-refresh; print start/end lines instead.
-        # if _progress_is_append():
-        #     _progress_write(f"[progress] {self.label}: started", self.stream)
-        # else:
-        #     self._thr.start()
-        
-    def stop(self):
-        self._stop.set()
-        try:
-            self._thr.join(timeout=2.0)
-        except Exception:
-            pass
-        elapsed = int(time.time() - self._t0)
-        _progress_write(f"[done] {self.label}: completed in {elapsed}s", self.stream)
-        _progress_newline(self.stream)
+
+    # def stop(self):
+    #     self._stop.set()
+    #     try:
+    #         self._thr.join(timeout=2.0)
+    #     except Exception:
+    #         pass
+    #     elapsed = int(time.time() - self._t0)
+    #     _progress_write(f"[done] {self.label}: completed in {elapsed}s", self.stream)
+    #     _progress_newline(self.stream)
 
     def _print_line(self, s: str):
         _progress_write(s, self.stream)
@@ -843,10 +813,15 @@ class _Pulse:
         except Exception:
             pass
         if _progress_is_append():
-            _progress_write(f"[progress] {self.label}: completed in {int(time.time()-self._t0)}s", self.stream)
+            _progress_write(
+                f"[progress] {self.label}: completed in {int(time.time()-self._t0)}s", self.stream
+            )
         else:
-            self._print_line(f"[progress] {self.label}: training… {int(time.time()-self._t0)}s elapsed")
+            self._print_line(
+                f"[progress] {self.label}: training… {int(time.time()-self._t0)}s elapsed"
+            )
             _progress_newline(self.stream)
+
 
 def _idmap_bloom(index, bits_per_key=8):
     # Build once per process when needed
@@ -858,15 +833,19 @@ def _idmap_bloom(index, bits_per_key=8):
             ids = faiss.vector_to_array(index.index.id_map)
     except Exception:
         return None
-    if ids is None: return None
-    import math, hashlib
+    if ids is None:
+        return None
+    import hashlib
+    import math
+
     n = len(ids)
     m = max(1024, n * bits_per_key)  # bits
     k = max(2, int(round((m / n) * math.log(2))))  # hash rounds
     bitarr = bytearray((m + 7) // 8)
 
     def _set(h):
-        i = h % m; bitarr[i // 8] = bitarr[i // 8] | (1 << (i % 8))
+        i = h % m
+        bitarr[i // 8] = bitarr[i // 8] | (1 << (i % 8))
 
     def _hashes(x):
         b = int(x).to_bytes(8, "little", signed=False)
@@ -876,7 +855,8 @@ def _idmap_bloom(index, bits_per_key=8):
             yield (h1 + t * h2)
 
     for x in ids:
-        for h in _hashes(x): _set(h)
+        for h in _hashes(x):
+            _set(h)
 
     def contains(x):
         for h in _hashes(int(x)):
@@ -887,9 +867,9 @@ def _idmap_bloom(index, bits_per_key=8):
 
     return contains
 
+
 def _inline_progress_renderer(label: str, total: int, stream=None, done_summary: bool = True):
-    """
-    Render a compact progress line. Honors LITKIT_PROGRESS_MODE:
+    """Render a compact progress line. Honors LITKIT_PROGRESS_MODE:
       - "tty": single-line in-place updates via carriage return
       - others: appended lines (no carriage returns in logs)
     Always prints a final newline when final=True, and emits a [done] line with duration.
@@ -910,7 +890,9 @@ def _inline_progress_renderer(label: str, total: int, stream=None, done_summary:
                 stream.flush()
                 prev_len = 0
                 if final:
-                    stream.write(f"[done] {label}: completed in {int(elapsed)}s — {done}/{total}  ({(100.0*done/max(1,total)):.1f}%)  {rate:.1f}/s\n")
+                    stream.write(
+                        f"[done] {label}: completed in {int(elapsed)}s — {done}/{total}  ({(100.0*done/max(1,total)):.1f}%)  {rate:.1f}/s\n"
+                    )
                     stream.flush()
             else:
                 # TTY mode: single-line rewrite
@@ -936,9 +918,9 @@ def _inline_progress_renderer(label: str, total: int, stream=None, done_summary:
 
     return _render
 
+
 class EmbeddingPool:
-    """
-    Simple multi-GPU embedding pool for SentenceTransformers.
+    """Simple multi-GPU embedding pool for SentenceTransformers.
     Spawns one subprocess per CUDA device and runs encode() on its GPU.
 
     • Uses spawn() context for CUDA safety.
@@ -946,13 +928,13 @@ class EmbeddingPool:
     • Shuts down gracefully on normal exit or SIGINT/SIGTERM.
     """
 
-    def __init__(self, model_path: Path, devices: List[str]):
+    def __init__(self, model_path: Path, devices: list[str]):
         self.model_path = str(model_path)
         self.devices = devices
         self.ctx = mp.get_context("spawn")
         self.queue_in = self.ctx.Queue()
         self.queue_out = self.ctx.Queue()
-        self.workers: List[mp.Process] = []
+        self.workers: list[mp.Process] = []
         self._closed = False
         self._prev_signals = None
 
@@ -964,7 +946,9 @@ class EmbeddingPool:
             )
             p.start()
             self.workers.append(p)
-        print(f"[embed] multi-GPU pool started on {', '.join(self.devices)} ({len(self.workers)} workers)")
+        print(
+            f"[embed] multi-GPU pool started on {', '.join(self.devices)} ({len(self.workers)} workers)"
+        )
 
         # --- Safety hooks ---
         atexit.register(self.close)
@@ -980,8 +964,8 @@ class EmbeddingPool:
 
     @staticmethod
     def _worker_loop(rank, device, model_path, q_in, q_out):
-        import torch
         from sentence_transformers import SentenceTransformer
+
         model = SentenceTransformer(model_path, device=device)
         while True:
             task = q_in.get()
@@ -1017,12 +1001,16 @@ class EmbeddingPool:
         sys.exit(1)
 
     # def encode(self, texts: List[str], batch_size: int = 64) -> np.ndarray:
-    def encode(self, texts: List[str], progress_label: Optional[str] = None, batch_size: Optional[int] = None, progress_done_summary: bool = True) -> np.ndarray:
+    def encode(
+        self,
+        texts: list[str],
+        progress_label: str | None = None,
+        batch_size: int | None = None,
+        progress_done_summary: bool = True,
+    ) -> np.ndarray:
+        """Encode a list of texts into L2-normalized embeddings (float32, N x 768).
+        If progress_label is provided, render a single in-place line from 0 -> N, ending with a newline.
         """
-         Encode a list of texts into L2-normalized embeddings (float32, N x 768).
-         If progress_label is provided, render a single in-place line from 0 -> N, ending with a newline.
-        """
-                 
         if not texts:
             return np.zeros((0, 768), dtype="float32")
 
@@ -1045,8 +1033,10 @@ class EmbeddingPool:
             if isinstance(arr, Exception):
                 # Drain outstanding results and re-raise to avoid wedging workers
                 for _ in range(len(submitted) - received - 1):
-                    try: self.queue_out.get(timeout=0.1)
-                    except Exception: break
+                    try:
+                        self.queue_out.get(timeout=0.1)
+                    except Exception:
+                        break
                 raise arr
             results[task_id] = arr
             received += 1
@@ -1054,7 +1044,7 @@ class EmbeddingPool:
         # Reassemble in original order
         out = []
         for task_id, idxs in enumerate(splits):
-            if len(idxs) == 0: 
+            if len(idxs) == 0:
                 continue
             out.append(results[task_id])
         return np.vstack(out) if out else np.zeros((0, 768), dtype="float32")
@@ -1090,6 +1080,7 @@ class EmbeddingPool:
                     pass
         print("[embed] multi-GPU pool closed cleanly", flush=True)
 
+
 class PaperEmbedderSpecter2:
     """SPECTER2 encoder over concatenated title+abstract, fully offline.
 
@@ -1097,6 +1088,7 @@ class PaperEmbedderSpecter2:
     air-gapped snapshot, it heuristically falls back to BERT/Roberta/MPNet
     model+tokenizer classes using local files only.
     """
+
     def __init__(self):
         local_path = _local_snapshot_dir(SPECTER2_ID)
         self.dim = 768
@@ -1128,7 +1120,7 @@ class PaperEmbedderSpecter2:
                 arch = "bert"
             elif spiece is not None:
                 arch = "mpnet"
-            
+
             if arch == "bert":
                 cfg = BertConfig.from_pretrained(str(local_path), local_files_only=True)
                 tok_json = local_path / "tokenizer.json"
@@ -1136,7 +1128,9 @@ class PaperEmbedderSpecter2:
                     self.tok = BertTokenizerFast(tokenizer_file=str(tok_json))
                 else:
                     self.tok = BertTokenizerFast(vocab_file=str(vocab_txt))
-                self.model = BertModel.from_pretrained(str(local_path), config=cfg, local_files_only=True).to(DEVICE)
+                self.model = BertModel.from_pretrained(
+                    str(local_path), config=cfg, local_files_only=True
+                ).to(DEVICE)
 
             elif arch == "roberta":
                 cfg = RobertaConfig.from_pretrained(str(local_path), local_files_only=True)
@@ -1144,13 +1138,21 @@ class PaperEmbedderSpecter2:
                 if tok_json.exists():
                     self.tok = RobertaTokenizerFast(tokenizer_file=str(tok_json))
                 else:
-                    self.tok = RobertaTokenizerFast(vocab_file=str(roberta_vocab), merges_file=str(merges_txt))
-                self.model = RobertaModel.from_pretrained(str(local_path), config=cfg, local_files_only=True).to(DEVICE)
+                    self.tok = RobertaTokenizerFast(
+                        vocab_file=str(roberta_vocab), merges_file=str(merges_txt)
+                    )
+                self.model = RobertaModel.from_pretrained(
+                    str(local_path), config=cfg, local_files_only=True
+                ).to(DEVICE)
 
             elif arch == "mpnet":
                 cfg = MPNetConfig.from_pretrained(str(local_path), local_files_only=True)
-                self.tok = MPNetTokenizerFast.from_pretrained(str(local_path), local_files_only=True)
-                self.model = MPNetModel.from_pretrained(str(local_path), config=cfg, local_files_only=True).to(DEVICE)
+                self.tok = MPNetTokenizerFast.from_pretrained(
+                    str(local_path), local_files_only=True
+                )
+                self.model = MPNetModel.from_pretrained(
+                    str(local_path), config=cfg, local_files_only=True
+                ).to(DEVICE)
             else:
                 raise FileNotFoundError(
                     "[offline] Could not load SPECTER2 from local snapshots.\n"
@@ -1164,9 +1166,14 @@ class PaperEmbedderSpecter2:
             self.model.eval()
 
     # def encode(self, texts: List[str], progress_label: Optional[str] = None, batch_size: Optional[int] = None) -> np.ndarray:
-    def encode(self, texts: List[str], progress_label: Optional[str] = None, batch_size: Optional[int] = None, progress_done_summary: bool = True) -> np.ndarray:
-        """
-        Encode a list of texts into L2-normalized embeddings (float32, N x 768).
+    def encode(
+        self,
+        texts: list[str],
+        progress_label: str | None = None,
+        batch_size: int | None = None,
+        progress_done_summary: bool = True,
+    ) -> np.ndarray:
+        """Encode a list of texts into L2-normalized embeddings (float32, N x 768).
         If progress_label is provided, render a single in-place line from 0 -> N, ending with a newline.
         """
         if not texts:
@@ -1176,13 +1183,19 @@ class PaperEmbedderSpecter2:
         bs = int(batch_size or (16 if DEVICE == "cuda" else 8))
         total = len(texts)
 
-        render = _inline_progress_renderer(progress_label or "Embedding papers", total, done_summary=progress_done_summary) if progress_label else None
+        render = (
+            _inline_progress_renderer(
+                progress_label or "Embedding papers", total, done_summary=progress_done_summary
+            )
+            if progress_label
+            else None
+        )
         if render:
             render(0)
 
         with torch.no_grad():
             for i in range(0, total, bs):
-                batch = texts[i:i+bs]
+                batch = texts[i : i + bs]
                 toks = self.tok(
                     batch, padding=True, truncation=True, max_length=512, return_tensors="pt"
                 ).to(DEVICE)
@@ -1199,16 +1212,20 @@ class PaperEmbedderSpecter2:
 
         return np.vstack(embs) if embs else np.zeros((0, self.dim), dtype="float32")
 
+
 class ChunkEmbedderSBERT:
     """SentenceTransformers all-mpnet-base-v2, offline, returns normalized vectors."""
-    def __init__(self, devices: Optional[List[str]] = None, workers: int = 1):
+
+    def __init__(self, devices: list[str] | None = None, workers: int = 1):
         local_path = _local_snapshot_dir(SBERT_ID)
         self.devices = devices or [DEVICE]
         self.workers = int(workers)
         # Cap device fanout by embed_workers if > 0
         if self.workers > 0 and len(self.devices) > self.workers:
-            self.devices = self.devices[:self.workers]
-            print(f"[embed] limiting to {len(self.devices)} device(s) via --embed-workers={self.workers}")
+            self.devices = self.devices[: self.workers]
+            print(
+                f"[embed] limiting to {len(self.devices)} device(s) via --embed-workers={self.workers}"
+            )
 
         if len(self.devices) > 1 and self.devices[0].startswith("cuda"):
             self.pool = EmbeddingPool(local_path, self.devices)
@@ -1225,16 +1242,30 @@ class ChunkEmbedderSBERT:
 
         self.dim = 768
         tmp = self.encode(["dim-probe"])
-        self.dim = int(tmp.shape[1]) if (isinstance(tmp, np.ndarray) and tmp.ndim == 2 and tmp.size) else 768
+        self.dim = (
+            int(tmp.shape[1])
+            if (isinstance(tmp, np.ndarray) and tmp.ndim == 2 and tmp.size)
+            else 768
+        )
 
     # def encode(self, texts: List[str], progress_label: Optional[str] = None, batch_size: Optional[int] = None) -> np.ndarray:
-    def encode(self, texts: List[str], progress_label: Optional[str] = None, batch_size: Optional[int] = None, progress_done_summary: bool = True) -> np.ndarray:
+    def encode(
+        self,
+        texts: list[str],
+        progress_label: str | None = None,
+        batch_size: int | None = None,
+        progress_done_summary: bool = True,
+    ) -> np.ndarray:
         if not texts:
             return np.zeros((0, self.dim), dtype="float32")
 
         if self.pool:
             # Multi-GPU mode
-            render = _inline_progress_renderer(progress_label or "Embedding corpus chunks (multi-GPU)", len(texts), done_summary=progress_done_summary)
+            render = _inline_progress_renderer(
+                progress_label or "Embedding corpus chunks (multi-GPU)",
+                len(texts),
+                done_summary=progress_done_summary,
+            )
             render(0)
             X = self.pool.encode(texts, batch_size or 64)
             render(len(texts), final=True)
@@ -1244,18 +1275,26 @@ class ChunkEmbedderSBERT:
         bs = int(batch_size or (64 if DEVICE == "cuda" else 16))
         arrs = []
         total = len(texts)
-        render = _inline_progress_renderer(progress_label or "Embedding corpus chunks", total, done_summary=progress_done_summary) if progress_label else None
+        render = (
+            _inline_progress_renderer(
+                progress_label or "Embedding corpus chunks",
+                total,
+                done_summary=progress_done_summary,
+            )
+            if progress_label
+            else None
+        )
         if render:
             render(0)
 
         for i in range(0, total, bs):
-            chunk = texts[i:i+bs]
+            chunk = texts[i : i + bs]
             arr = self.model.encode(
                 chunk,
                 batch_size=bs,
                 show_progress_bar=False,
                 convert_to_numpy=True,
-                normalize_embeddings=True
+                normalize_embeddings=True,
             ).astype("float32")
             arrs.append(arr)
             if render:
@@ -1268,6 +1307,7 @@ class ChunkEmbedderSBERT:
     def close(self):
         if self.pool:
             self.pool.close()
+
 
 # -------------------- FAISS index helpers --------------------
 # Single source of truth for product-quantizer bits
@@ -1284,9 +1324,11 @@ USE_DOWNCAST_FALLBACK = os.environ.get("LITKIT_FAISS_NO_DOWNCAST", "") == ""
 # Producer-mode segment writer handle (set in main(); read elsewhere)
 # ------------------------------------------------------------------
 
-def _unwrap_core_and_kind(idx, max_depth: int = 12, allow_downcast_fallback: bool = USE_DOWNCAST_FALLBACK):
-    """
-    Return (kind, core, wrappers) where kind in {'ivf','hnsw','flat'}.
+
+def _unwrap_core_and_kind(
+    idx, max_depth: int = 12, allow_downcast_fallback: bool = USE_DOWNCAST_FALLBACK
+):
+    """Return (kind, core, wrappers) where kind in {'ivf','hnsw','flat'}.
     Unwraps common wrappers (.index/.base_index). Prefers duck-typing and
     faiss.extract_index_ivf; optionally falls back to downcast_index for read-only introspection.
     """
@@ -1332,9 +1374,11 @@ def _unwrap_core_and_kind(idx, max_depth: int = 12, allow_downcast_fallback: boo
 
     return "flat", base, wrappers
 
-def _add_ids_union_compat(index, ids_list: List[int], X: np.ndarray, *, table: str, cur, save_path: Path):
-    """
-    Fallback when IDSelectorArray/Batch is unavailable.
+
+def _add_ids_union_compat(
+    index, ids_list: list[int], X: np.ndarray, *, table: str, cur, save_path: Path
+):
+    """Fallback when IDSelectorArray/Batch is unavailable.
     - Compute present IDs from the IDMap2 wrapper
     - Filter out already-present IDs
     - Add only the new (ids, vectors)
@@ -1357,9 +1401,11 @@ def _add_ids_union_compat(index, ids_list: List[int], X: np.ndarray, *, table: s
     _mark_in_index(cur, table, [int(i) for i in ids_new])
     return int(ids_new.size)
 
+
 # Throttle index saves to reduce I/O on shared filesystems.
 _SAVE_MIN_SEC = int(os.environ.get("LITKIT_SAVE_EVERY_SEC", "120"))
 _last_save_ts = {"papers": 0.0, "chunks": 0.0}
+
 
 def _faiss_save(index, path: Path) -> bool:
     label = "papers" if Path(path).name.startswith("papers") else "chunks"
@@ -1370,8 +1416,10 @@ def _faiss_save(index, path: Path) -> bool:
     faiss.write_index(index, str(tmp))
     try:
         fd = os.open(str(tmp), os.O_RDONLY)
-        try: os.fsync(fd)
-        finally: os.close(fd)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
     except Exception:
         pass
     os.replace(tmp, path)
@@ -1379,13 +1427,16 @@ def _faiss_save(index, path: Path) -> bool:
     _last_save_ts[label] = now
     return True
 
+
 def _faiss_save_force(index, path: Path) -> bool:
     tmp = path.with_suffix(path.suffix + ".tmp")
     faiss.write_index(index, str(tmp))
     try:
         fd = os.open(str(tmp), os.O_RDONLY)
-        try: os.fsync(fd)
-        finally: os.close(fd)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
     except Exception:
         pass
     os.replace(tmp, path)
@@ -1394,23 +1445,27 @@ def _faiss_save_force(index, path: Path) -> bool:
     _last_save_ts[label] = time.time()
     return True
 
+
 from collections import defaultdict
+
 _PENDING_MARKS = defaultdict(list)
+
 
 def _flush_pending_marks(cur):
     for tbl, ids in list(_PENDING_MARKS.items()):
-        if not ids: 
+        if not ids:
             continue
         _mark_in_index(cur, tbl, ids)
         _PENDING_MARKS[tbl].clear()
 
+
 class _ChunkSegmentWriter:
-    """
-    Writes chunk embedding segments to a single .npz file per segment:
+    """Writes chunk embedding segments to a single .npz file per segment:
       keys: 'ids' (int64), 'vecs' (float16/float32), 'dim' (int32), 'count' (int32)
     File name format:
       chunks_sh{shard:02d}_{ts}_{seq:06d}.npz
     """
+
     def __init__(self, outdir: Path, segment_size: int, dtype: str, shard_id: int):
         self.outdir = Path(outdir)
         self.segment_size = int(segment_size)
@@ -1457,21 +1512,19 @@ class _ChunkSegmentWriter:
 
         N = ids.shape[0]
         for start in range(0, N, self.segment_size):
-            end    = min(N, start + self.segment_size)
-            ids_i  = np.ascontiguousarray(ids[start:end], dtype=np.int64)
+            end = min(N, start + self.segment_size)
+            ids_i = np.ascontiguousarray(ids[start:end], dtype=np.int64)
             vecs_i = np.ascontiguousarray(vecs[start:end])
-            dim    = vecs_i.shape[1]
+            dim = vecs_i.shape[1]
 
             final = self._next_path()  # e.g., chunks_shXX_<ts>_<seq>.npz
             tmp = final.with_suffix(final.suffix + ".tmp")
 
             final.parent.mkdir(parents=True, exist_ok=True)
             with open(tmp, "wb") as fh:
-                np.savez(fh,
-                         ids=ids_i,
-                         vecs=vecs_i,
-                         dim=np.int32(dim),
-                         count=np.int32(ids_i.shape[0]))
+                np.savez(
+                    fh, ids=ids_i, vecs=vecs_i, dim=np.int32(dim), count=np.int32(ids_i.shape[0])
+                )
                 try:
                     if os.environ.get("LITKIT_SEGMENT_FSYNC_FILE", "1") == "1":
                         fh.flush()
@@ -1479,8 +1532,9 @@ class _ChunkSegmentWriter:
                 except Exception:
                     pass
 
-            os.replace(tmp, final)   # atomic rename on same filesystem
+            os.replace(tmp, final)  # atomic rename on same filesystem
             _maybe_fsync_dir(final)
+
 
 def _clear_chunk_trained_flag():
     try:
@@ -1490,11 +1544,15 @@ def _clear_chunk_trained_flag():
     except Exception as e:
         print(f"[train] WARNING: could not remove {CHUNK_TRAINED_FLAG}: {e}")
 
+
 def _faiss_load(path: Path):
     """Load a FAISS index."""
     return faiss.read_index(str(path))
 
-def _hnsw_index(dim: int, M: int = 32, ef_construction: int = 200, ef_search: int = 128) -> faiss.Index:
+
+def _hnsw_index(
+    dim: int, M: int = 32, ef_construction: int = 200, ef_search: int = 128
+) -> faiss.Index:
     # 1) Prefer explicit IP ctor
     try:
         idx = faiss.IndexHNSWFlat(dim, M, faiss.METRIC_INNER_PRODUCT)
@@ -1502,7 +1560,7 @@ def _hnsw_index(dim: int, M: int = 32, ef_construction: int = 200, ef_search: in
         # 2) Older wheels: try factory with explicit metric
         try:
             idx = faiss.index_factory(dim, f"HNSW{M}", faiss.METRIC_INNER_PRODUCT)
-        except Exception:
+        except Exception as e:
             # 3) Last resort: 2-arg ctor + attribute (if available) else hard fail
             idx = faiss.IndexHNSWFlat(dim, M)
             if hasattr(idx, "metric_type"):
@@ -1511,19 +1569,20 @@ def _hnsw_index(dim: int, M: int = 32, ef_construction: int = 200, ef_search: in
                 raise RuntimeError(
                     "FAISS build does not support IP HNSW (metric_type unset and 3-arg ctor unavailable). "
                     "Install a newer faiss (>=1.7.4, CPU or GPU) or run with --papers-index flat."
-                )
+                ) from e
 
     idx.hnsw.efConstruction = int(ef_construction)
     idx.hnsw.efSearch = int(ef_search)
     return idx
 
+
 def _kind_and_core(idx):
     kind, core, _ = _unwrap_core_and_kind(idx)
     return kind, core
 
+
 def _report_faiss_index(label: str, path: Path):
-    """
-    Identify and print the FAISS core index type, robust to wrappers and SWIG base-class objects.
+    """Identify and print the FAISS core index type, robust to wrappers and SWIG base-class objects.
     Uses _unwrap_core_and_kind (duck-typing first, optional downcast fallback).
     """
     try:
@@ -1535,7 +1594,7 @@ def _report_faiss_index(label: str, path: Path):
     kind, core, wrappers = _unwrap_core_and_kind(idx)
 
     if kind == "ivf":
-        nlist  = getattr(core, "nlist", None)
+        nlist = getattr(core, "nlist", None)
         nprobe = getattr(core, "nprobe", None)
 
         # Detect IVFPQ via presence of .pq and pull subquantizer count robustly
@@ -1565,7 +1624,7 @@ def _report_faiss_index(label: str, path: Path):
         return
 
     if kind == "hnsw":
-        h  = getattr(core, "hnsw", None)
+        h = getattr(core, "hnsw", None)
         ef = getattr(h, "efSearch", None) if h is not None else None
 
         # Only include M if actually exposed/int-able on this wheel
@@ -1585,11 +1644,12 @@ def _report_faiss_index(label: str, path: Path):
             print(f"[faiss] {label}: HNSW efSearch={int(ef) if ef is not None else 'N/A'}")
 
         return
-    
-    # FLAT 
+
+    # FLAT
     print(f"[faiss] {label}: FLAT")
 
     return
+
 
 def _load_faiss_index(index_path, args, label):
     print("Loading index:", Path(index_path).resolve())
@@ -1601,7 +1661,7 @@ def _load_faiss_index(index_path, args, label):
         user = getattr(args, "nprobe", None)
         nlist = int(getattr(core, "nlist", 0) or 0)
         if user is None:
-            target = int(round(nlist ** 0.5)) if nlist > 0 else 8
+            target = int(round(nlist**0.5)) if nlist > 0 else 8
         else:
             target = int(user)
         min_floor = 32 if nlist >= 16384 else 8
@@ -1612,40 +1672,45 @@ def _load_faiss_index(index_path, args, label):
 
         m = getattr(getattr(core, "pq", None), "M", None)
 
-
         if m is not None:
-            print(f"[faiss] {label}: IVF-PQ nlist={getattr(core,'nlist',None)} m={m} nprobe={getattr(core,'nprobe',None)}")
+            print(
+                f"[faiss] {label}: IVF-PQ nlist={getattr(core,'nlist',None)} m={m} nprobe={getattr(core,'nprobe',None)}"
+            )
         else:
-            print(f"[faiss] {label}: IVF nlist={getattr(core,'nlist',None)} nprobe={getattr(core,'nprobe',None)}")
+            print(
+                f"[faiss] {label}: IVF nlist={getattr(core,'nlist',None)} nprobe={getattr(core,'nprobe',None)}"
+            )
 
     elif kind == "hnsw":
         ef = int(getattr(args, "efsearch", 128) or 128)
         if hasattr(core, "hnsw"):
             core.hnsw.efSearch = ef
-        print(f"[faiss] {label}: HNSW efSearch={getattr(getattr(core,'hnsw',None),'efSearch',None)}")
+        print(
+            f"[faiss] {label}: HNSW efSearch={getattr(getattr(core,'hnsw',None),'efSearch',None)}"
+        )
 
     else:
         print(f"[faiss] {label}: FLAT/unknown (no IVF/HNSW detected)")
 
     return idx
 
+
 def _flat_ip_index(dim: int) -> faiss.Index:
     """Create an exact inner-product (cosine when normalized) flat index."""
     return faiss.IndexFlatIP(dim)
 
+
 def _ivfpq_index(dim: int, nlist: int = 16384, m: int = 64, bits: int = PQ_BITS) -> faiss.Index:
-    """
-    Create IVF-PQ index (inner product). Code size = `m` bytes per vector (8 bits/subquantizer).
-    """
+    """Create IVF-PQ index (inner product). Code size = `m` bytes per vector (8 bits/subquantizer)."""
     quantizer = faiss.IndexFlatIP(dim)
     idx = faiss.IndexIVFPQ(quantizer, dim, nlist, m, bits)
     if hasattr(idx, "metric_type"):
         idx.metric_type = faiss.METRIC_INNER_PRODUCT
     return idx
 
+
 def _safe_pq_m(dim: int, requested_m: int) -> int:
-    """
-    Return the largest divisor of `dim` that is <= requested_m (and >=1).
+    """Return the largest divisor of `dim` that is <= requested_m (and >=1).
     Guarantees a valid FAISS IVFPQ `m` (subvector count).
     """
     if requested_m is None or requested_m <= 0:
@@ -1657,9 +1722,11 @@ def _safe_pq_m(dim: int, requested_m: int) -> int:
             return m
     return 1
 
+
 def _ensure_parent(path: Path):
     """Ensure parent directory of `path` exists."""
     path.parent.mkdir(parents=True, exist_ok=True)
+
 
 # -------------------- Embedding segment I/O (producer↔writer) --------------------
 def _segment_fname(kind: str, producer: str, seq: int) -> str:
@@ -1667,26 +1734,47 @@ def _segment_fname(kind: str, producer: str, seq: int) -> str:
     # producer: short id (e.g., hostname-pid)
     return f"{kind}.seg.{producer}.{seq:08d}.npz"
 
-def _segment_write(outdir: Path, kind: str, producer: str, seq: int,
-                   ids: np.ndarray, X: np.ndarray, on_disk_dtype: str = "fp16") -> Path:
+
+def _segment_write(
+    outdir: Path,
+    kind: str,
+    producer: str,
+    seq: int,
+    ids: np.ndarray,
+    X: np.ndarray,
+    on_disk_dtype: str = "fp16",
+) -> Path:
     outdir.mkdir(parents=True, exist_ok=True)
     fname = _segment_fname(kind, producer, seq)
     tmp = outdir / (fname + ".tmp")
     final = outdir / fname
 
-    X_store = X.astype(np.float16, copy=False) if on_disk_dtype == "fp16" else X.astype(np.float32, copy=False)
-    np.savez(tmp, kind=kind, dtype="fp16" if on_disk_dtype == "fp16" else "fp32",
-             dim=X.shape[1], n=X.shape[0],
-             ids=ids.astype(np.int64, copy=False), emb=X_store)
+    X_store = (
+        X.astype(np.float16, copy=False)
+        if on_disk_dtype == "fp16"
+        else X.astype(np.float32, copy=False)
+    )
+    np.savez(
+        tmp,
+        kind=kind,
+        dtype="fp16" if on_disk_dtype == "fp16" else "fp32",
+        dim=X.shape[1],
+        n=X.shape[0],
+        ids=ids.astype(np.int64, copy=False),
+        emb=X_store,
+    )
     try:
         fh = os.open(str(tmp), os.O_RDONLY)
-        try: os.fsync(fh)
-        finally: os.close(fh)
+        try:
+            os.fsync(fh)
+        finally:
+            os.close(fh)
     except Exception:
         pass
     os.replace(tmp, final)
     _maybe_fsync_dir(final)
     return final
+
 
 # def _segment_iter_ready(outdir: Path, kind: str):
 #     """
@@ -1697,10 +1785,9 @@ def _segment_write(outdir: Path, kind: str, producer: str, seq: int,
 #         if p.name.endswith(".npz"):
 #             yield p
 
-def _segment_read(path: Path) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Read a segment file and return (ids:int64, X:float32). Upcasts embeddings as needed.
-    """
+
+def _segment_read(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Read a segment file and return (ids:int64, X:float32). Upcasts embeddings as needed."""
     with np.load(path, mmap_mode="r") as z:
         ids = z["ids"].astype(np.int64, copy=False)
         emb = z["emb"]
@@ -1708,14 +1795,17 @@ def _segment_read(path: Path) -> Tuple[np.ndarray, np.ndarray]:
         X = emb.astype(np.float32, copy=False)
     return ids, X
 
+
 def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int = 2):
     outdir = Path(outdir)
     if not outdir.exists():
         return 0
-    cand = sorted(list(outdir.glob("papers_*.npz")) +                # new style
-                  list(outdir.glob("papers.seg.*.npz")) +            # old style
-                  list(outdir.glob("papers_.npz.ingesting")) +
-                  list(outdir.glob("papers.seg.*.npz.ingesting")))
+    cand = sorted(
+        list(outdir.glob("papers_*.npz"))  # new style
+        + list(outdir.glob("papers.seg.*.npz"))  # old style
+        + list(outdir.glob("papers_.npz.ingesting"))
+        + list(outdir.glob("papers.seg.*.npz.ingesting"))
+    )
     if not cand:
         return 0
     cur = conn.cursor()
@@ -1725,20 +1815,26 @@ def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int =
         is_ingesting = p.name.endswith(".npz.ingesting")
         tmp = p if is_ingesting else p.with_suffix(p.suffix + ".ingesting")
         if not is_ingesting:
-            try: os.replace(p, tmp)
-            except FileNotFoundError: continue
-            except Exception: continue
+            try:
+                os.replace(p, tmp)
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
         try:
             with np.load(tmp, mmap_mode="r") as z:
                 if "kind" in z.files and str(z["kind"]).strip() != "papers":
-                    raise ValueError("wrong segment kind for paper ingester")                
+                    raise ValueError("wrong segment kind for paper ingester")
                 if "ids" in z and ("vecs" in z or "emb" in z):
                     ids = np.ascontiguousarray(z["ids"].astype(np.int64))
-                    X   = np.ascontiguousarray((z["vecs"] if "vecs" in z else z["emb"]).astype(np.float32))
+                    X = np.ascontiguousarray(
+                        (z["vecs"] if "vecs" in z else z["emb"]).astype(np.float32)
+                    )
                 else:
                     raise ValueError(f"Segment missing ids/vecs in {p.name}")
             if ids.size == 0:
-                os.remove(tmp); continue
+                os.remove(tmp)
+                continue
 
             if not isinstance(paper_index, faiss.IndexIDMap2):
                 paper_index = faiss.IndexIDMap2(paper_index)
@@ -1777,14 +1873,16 @@ def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int =
                     conn.commit()
         except Exception as e:
             if not is_ingesting:
-                try: os.replace(tmp, p)
-                except Exception: pass
+                try:
+                    os.replace(tmp, p)
+                except Exception:
+                    pass
             print(f"[segments] ERROR ingesting {p.name}: {e.__class__.__name__}: {e}")
     return added_total
 
+
 def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int = 2):
-    """
-    Writer-only: scan `outdir` for chunk segment files and add them to FAISS.
+    """Writer-only: scan `outdir` for chunk segment files and add them to FAISS.
     Safe file-handling:
       - rename "<file>.npz" -> "<file>.npz.ingesting" before reading (atomic)
       - if already ".npz.ingesting", read in place
@@ -1804,10 +1902,10 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
     # Accept both our writer’s names and generic .npz containing {'ids','vecs'}.
     # Also consider files already in the ".ingesting" state.
     cand = sorted(
-        list(outdir.glob("chunks_*.npz")) +         # new style
-        list(outdir.glob("chunks.seg.*.npz")) +     # old style
-        list(outdir.glob("chunks_.npz.ingesting")) +
-        list(outdir.glob("chunks.seg.*.npz.ingesting"))
+        list(outdir.glob("chunks_*.npz"))  # new style
+        + list(outdir.glob("chunks.seg.*.npz"))  # old style
+        + list(outdir.glob("chunks_.npz.ingesting"))
+        + list(outdir.glob("chunks.seg.*.npz.ingesting"))
     )
     if not cand:
         return 0
@@ -1835,13 +1933,13 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
             with np.load(tmp, mmap_mode="r") as z:
                 # Reject wrong-kind files (old .seg has 'kind')
                 if "kind" in z.files and str(z["kind"]).strip() != "chunks":
-                    raise ValueError("wrong segment kind for chunk ingester")                
+                    raise ValueError("wrong segment kind for chunk ingester")
                 if "ids" in z and "vecs" in z:
                     ids = np.ascontiguousarray(z["ids"].astype(np.int64))
-                    X   = np.ascontiguousarray(z["vecs"].astype(np.float32))
+                    X = np.ascontiguousarray(z["vecs"].astype(np.float32))
                 elif set(z.files) >= {"ids", "emb"}:
                     ids = np.ascontiguousarray(z["ids"].astype(np.int64))
-                    X   = np.ascontiguousarray(z["emb"].astype(np.float32))
+                    X = np.ascontiguousarray(z["emb"].astype(np.float32))
                 else:
                     raise ValueError(f"Segment missing required keys: {z.files}")
 
@@ -1895,6 +1993,7 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
 
     return added_total
 
+
 def _extract_ivf(index):
     """Return IVF/IVFPQ core using the same unwrapping logic as reporting."""
     kind, core, _ = _unwrap_core_and_kind(index)
@@ -1902,12 +2001,12 @@ def _extract_ivf(index):
         return core
     return None
 
+
 def _auto_set_nprobe(index, user_nprobe=None, min_probe=8, max_probe=512):
-    """
-    Set `nprobe` on IVF indices. If `user_nprobe` is None, choose ≈ sqrt(nlist)
+    """Set `nprobe` on IVF indices. If `user_nprobe` is None, choose ≈ sqrt(nlist)
     clamped to [min_probe, max_probe] and ≤ nlist. No-op for non-IVF indices.
 
-    Returns
+    Returns:
     -------
     (nprobe, nlist) or None
     """
@@ -1917,13 +2016,22 @@ def _auto_set_nprobe(index, user_nprobe=None, min_probe=8, max_probe=512):
     nlist = int(getattr(ivf, "nlist", 0))
     if nlist <= 0:
         return  # untrained IVF
-    
+
     target = _pick_nprobe(nlist, user_nprobe)
     ivf.nprobe = target
     return target, nlist
 
-def backfill_unindexed_vectors(conn, paper_embedder, chunk_embedder, paper_index, chunk_index,
-                               batch=20000, paper_bs=None, chunk_bs=None):
+
+def backfill_unindexed_vectors(
+    conn,
+    paper_embedder,
+    chunk_embedder,
+    paper_index,
+    chunk_index,
+    batch=20000,
+    paper_bs=None,
+    chunk_bs=None,
+):
     """Embed and add any rows that exist in SQLite but were never added to FAISS (in_index=0)."""
     cur = conn.cursor()
 
@@ -1932,12 +2040,15 @@ def backfill_unindexed_vectors(conn, paper_embedder, chunk_embedder, paper_index
         rows = cur.execute(
             "SELECT id, (COALESCE(title,'') || ' ' || COALESCE(abstract,'')) AS txt "
             "FROM papers WHERE in_index=0 LIMIT ?",
-            (batch,)
+            (batch,),
         ).fetchall()
-        if not rows: break
+        if not rows:
+            break
         ids = [r[0] for r in rows]
         texts = [(r[1] or "untitled").strip() for r in rows]
-        Xp = paper_embedder.encode(texts, progress_label=f"Embedding papers (backfill, {len(texts)})", batch_size=paper_bs)
+        Xp = paper_embedder.encode(
+            texts, progress_label=f"Embedding papers (backfill, {len(texts)})", batch_size=paper_bs
+        )
 
         if not isinstance(paper_index, faiss.IndexIDMap2):
             paper_index = faiss.IndexIDMap2(paper_index)
@@ -1967,14 +2078,16 @@ def backfill_unindexed_vectors(conn, paper_embedder, chunk_embedder, paper_index
     # Chunks
     while True:
         rows = cur.execute(
-            "SELECT id, text FROM chunks WHERE in_index=0 LIMIT ?",
-            (batch,)
+            "SELECT id, text FROM chunks WHERE in_index=0 LIMIT ?", (batch,)
         ).fetchall()
-        if not rows: break
+        if not rows:
+            break
         ids = [r[0] for r in rows]
         texts = [r[1] for r in rows]
         # Xc = chunk_embedder.encode(texts)
-        Xc = chunk_embedder.encode(texts, progress_label=f"Embedding chunks (backfill, {len(texts)})", batch_size=chunk_bs)
+        Xc = chunk_embedder.encode(
+            texts, progress_label=f"Embedding chunks (backfill, {len(texts)})", batch_size=chunk_bs
+        )
         if not isinstance(chunk_index, faiss.IndexIDMap2):
             chunk_index = faiss.IndexIDMap2(chunk_index)
 
@@ -2000,9 +2113,9 @@ def backfill_unindexed_vectors(conn, paper_embedder, chunk_embedder, paper_index
                 )
         conn.commit()
 
+
 def _make_id_selector(ids_like):
-    """
-    Return a FAISS IDSelector compatible with faiss build, or the raw int64 array as a last resort.
+    """Return a FAISS IDSelector compatible with faiss build, or the raw int64 array as a last resort.
     Supports both IDSelectorArray (newer) and IDSelectorBatch (older) names.
     """
     arr = np.ascontiguousarray(ids_like, dtype=np.int64)
@@ -2017,9 +2130,9 @@ def _make_id_selector(ids_like):
         "FAISS build lacks IDSelectorArray/Batch; re-run with LITKIT_FAISS_COMPAT_REBUILD=1 to rebuild index without stale ids."
     )
 
+
 def _safe_remove_ids(index, sel) -> int:
-    """
-    Best-effort removal of ids irrespective of index family (IDMap2/HNSW/FLAT/IVF).
+    """Best-effort removal of ids irrespective of index family (IDMap2/HNSW/FLAT/IVF).
     Returns the number of vectors removed (0 if unsupported or none removed).
     """
     # 1) Try on the current object
@@ -2040,10 +2153,9 @@ def _safe_remove_ids(index, sel) -> int:
 
     return 0
 
+
 def _post_build_sanity_check(conn, args):
-    """
-    Sanity print after build: DB vs FAISS counts and index types (papers & chunks).
-    """
+    """Sanity print after build: DB vs FAISS counts and index types (papers & chunks)."""
     # ----- papers -----
     try:
         p_idx = faiss.read_index(str(PAPER_INDEX_PATH))
@@ -2069,11 +2181,51 @@ def _post_build_sanity_check(conn, args):
     n_faiss_c = int(getattr(c_idx, "ntotal", 0) or 0)
     print(f"[summary] chunks: db={n_db_c} in_index={n_in_c} faiss_ntotal={n_faiss_c}")
 
+
 _STOPWORDS = {
-    "the","and","for","with","that","this","from","into","your","about","does",
-    "what","when","where","which","who","whom","whose","why","how","are","is",
-    "was","were","be","been","being","of","on","in","to","a","an","as","by",
-    "at","it","its","their","them","we","you","i"
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "into",
+    "your",
+    "about",
+    "does",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "whom",
+    "whose",
+    "why",
+    "how",
+    "are",
+    "is",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "of",
+    "on",
+    "in",
+    "to",
+    "a",
+    "an",
+    "as",
+    "by",
+    "at",
+    "it",
+    "its",
+    "their",
+    "them",
+    "we",
+    "you",
+    "i",
 }
 
 # optional kill-switch for lexical prefilter on very large DBs
@@ -2082,7 +2234,8 @@ DISABLE_LEXICAL = os.environ.get("LITKIT_NO_LEXICAL", "") != ""
 # one-shot guard for noisy sqlite3.OperationalError logging in lexical prefilter
 _LEXICAL_WARN_ONCE = False
 
-def _query_terms(s: str) -> List[str]:
+
+def _query_terms(s: str) -> list[str]:
     # extract alnum/underscore/dash tokens, lowercase, drop short/common words
     words = re.findall(r"[A-Za-z0-9_-]{3,}", s.lower())
     # keep “rare-ish” tokens (>=5 chars OR has digits OR camel-ish separator)
@@ -2090,18 +2243,27 @@ def _query_terms(s: str) -> List[str]:
     for w in words:
         if w in _STOPWORDS:
             continue
-        if (len(w) >= 5 or (w.isupper() and len(w) >= 3)
-            or any(ch.isdigit() for ch in w) or "_" in w or "-" in w):
+        if (
+            len(w) >= 5
+            or (w.isupper() and len(w) >= 3)
+            or any(ch.isdigit() for ch in w)
+            or "_" in w
+            or "-" in w
+        ):
             out.append(w)
     # de-dup preserve order
-    seen = set(); uniq = []
+    seen = set()
+    uniq = []
     for w in out:
         if w not in seen:
-            seen.add(w); uniq.append(w)
+            seen.add(w)
+            uniq.append(w)
     return uniq
 
-def _mark_in_index(cur, table: str, ids: List[int]):
+
+def _mark_in_index(cur, table: str, ids: list[int]):
     cur.executemany(f"UPDATE {table} SET in_index=1 WHERE id=?", [(i,) for i in ids])
+
 
 def _auto_top_papers() -> int:
     try:
@@ -2111,47 +2273,66 @@ def _auto_top_papers() -> int:
     except Exception:
         n = 0
     # piecewise heuristic: stable and cheap
-    if n < 50_000:   return 500
-    if n < 500_000:  return 1000
-    if n < 2_000_000:return 2000
+    if n < 50_000:
+        return 500
+    if n < 500_000:
+        return 1000
+    if n < 2_000_000:
+        return 2000
     return 4000
 
+
 def _sqlite_norm_expr(field: str = "text") -> str:
-    """
-    Build a SQL expression that normalizes common unicode variants so LIKE patterns match:
+    """Build a SQL expression that normalizes common unicode variants so LIKE patterns match:
     - Map hyphen/minus variants to ASCII '-'
     - Map subscript digits to ASCII digits
     - Lowercase
     """
     f = f"lower({field})"
     # hyphen/minus variants: U+2010..U+2014, U+2212, plus soft hyphen U+00AD (strip)
-    for ch, repl in [("\u00AD", ""), ("\u2010", "-"), ("\u2011", "-"), ("\u2012", "-"),
-                     ("\u2013", "-"), ("\u2014", "-"), ("\u2212", "-")]:
+    for ch, repl in [
+        ("\u00ad", ""),
+        ("\u2010", "-"),
+        ("\u2011", "-"),
+        ("\u2012", "-"),
+        ("\u2013", "-"),
+        ("\u2014", "-"),
+        ("\u2212", "-"),
+    ]:
         f = f"replace({f}, '{ch}', '{repl}')"
     # subscript digits → ASCII
     subs = "₀₁₂₃₄₅₆₇₈₉"
-    for d_sub, d in zip(subs, "0123456789"):
+    for d_sub, d in zip(subs, "0123456789", strict=False):
         f = f"replace({f}, '{d_sub}', '{d}')"
     return f
 
-def _escape_like(s: str, esc: str = '\\') -> str:
+
+def _escape_like(s: str, esc: str = "\\") -> str:
     # Order matters: escape the escape char first, then the wildcards.
     s = s.replace(esc, esc + esc)
-    s = s.replace('%', esc + '%')
-    s = s.replace('_', esc + '_')
+    s = s.replace("%", esc + "%")
+    s = s.replace("_", esc + "_")
     return s
+
 
 def _normalize_for_search_py(s: str) -> str:
     # Keep SQL ↔ Python normalization identical: SQLite LOWER() ≈ Python .lower()
     s = unicodedata.normalize("NFKC", s).lower()
-    for ch, repl in [("\u00AD",""), ("\u2010","-"), ("\u2011","-"),
-                     ("\u2012","-"), ("\u2013","-"), ("\u2014","-"),
-                     ("\u2212","-")]:
+    for ch, repl in [
+        ("\u00ad", ""),
+        ("\u2010", "-"),
+        ("\u2011", "-"),
+        ("\u2012", "-"),
+        ("\u2013", "-"),
+        ("\u2014", "-"),
+        ("\u2212", "-"),
+    ]:
         s = s.replace(ch, repl)
     trans = str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789")
     return s.translate(trans)
 
-def _connect_db(busy_timeout_ms: Optional[int] = None, *, autocommit: bool = False):
+
+def _connect_db(busy_timeout_ms: int | None = None, *, autocommit: bool = False):
     if busy_timeout_ms is None:
         busy_timeout_ms = DEFAULT_BUSY_TIMEOUT_MS
     iso = None if autocommit else "DEFERRED"
@@ -2160,23 +2341,24 @@ def _connect_db(busy_timeout_ms: Optional[int] = None, *, autocommit: bool = Fal
     conn.execute("PRAGMA temp_store=MEMORY;")
     return conn
 
+
 # DB helper
 def _ensure_temp_candidates_table(conn):
     conn.execute("CREATE TEMP TABLE IF NOT EXISTS cand_papers (id INTEGER PRIMARY KEY)")
     conn.execute("DELETE FROM cand_papers")
 
+
 # DB helper
-def _load_temp_candidates(conn, pids: List[int]) -> None:
+def _load_temp_candidates(conn, pids: list[int]) -> None:
     _ensure_temp_candidates_table(conn)
     cur = conn.cursor()
     cur.execute("DELETE FROM cand_papers")
-    cur.executemany("INSERT OR IGNORE INTO cand_papers(id) VALUES (?)",
-                    [(int(x),) for x in pids])
+    cur.executemany("INSERT OR IGNORE INTO cand_papers(id) VALUES (?)", [(int(x),) for x in pids])
     conn.commit()
 
-def _resolve_model_alias(requested: str, available_ids: List[str]) -> Optional[str]:
-    """
-    Try to reconcile common naming mismatches:
+
+def _resolve_model_alias(requested: str, available_ids: list[str]) -> str | None:
+    """Try to reconcile common naming mismatches:
       - colon <-> hyphen
       - add/remove vendor prefixes like 'openai/'
       - case-insensitive match
@@ -2189,8 +2371,10 @@ def _resolve_model_alias(requested: str, available_ids: List[str]) -> Optional[s
 
     # Generate candidate spellings
     cands = set()
+
     def add(x: str):
-        if x: cands.add(x)
+        if x:
+            cands.add(x)
 
     add(req)
     add(req.replace(":", "-"))
@@ -2212,6 +2396,7 @@ def _resolve_model_alias(requested: str, available_ids: List[str]) -> Optional[s
 
     return None
 
+
 def load_checkpoint() -> dict:
     """Load JSON checkpoint (if exists) for resumable workflows; else {}."""
     if CKPT_PATH.exists():
@@ -2221,16 +2406,17 @@ def load_checkpoint() -> dict:
             return {}
     return {}
 
+
 def save_checkpoint(obj: dict):
     """Write JSON checkpoint atomically to disk."""
     with FileLock(CKPT_LOCK):
         tmp = CKPT_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(obj, indent=2))
-        os.replace(tmp, CKPT_PATH) 
+        os.replace(tmp, CKPT_PATH)
+
 
 def already_processed(cur, fpath: str, st) -> bool:
-    """
-    Check if file at `fpath` with current stat `st` was already ingested
+    """Check if file at `fpath` with current stat `st` was already ingested
     (size and mtime match a row in the files table).
     """
     cur.execute("SELECT size, mtime FROM files WHERE path=?", (fpath,))
@@ -2238,16 +2424,19 @@ def already_processed(cur, fpath: str, st) -> bool:
     if not row:
         return False
     size, mtime = row
-    return (size == st.st_size and abs(mtime - st.st_mtime) < 1e-6)
+    return size == st.st_size and abs(mtime - st.st_mtime) < 1e-6
+
 
 def register_file(cur, fpath: str, paper_id: int, st):
     """Insert/replace the (path, size, mtime, paper_id) record in files table."""
-    cur.execute("INSERT OR REPLACE INTO files(path, size, mtime, paper_id) VALUES (?,?,?,?)",
-                (fpath, st.st_size, st.st_mtime, paper_id))
+    cur.execute(
+        "INSERT OR REPLACE INTO files(path, size, mtime, paper_id) VALUES (?,?,?,?)",
+        (fpath, st.st_size, st.st_mtime, paper_id),
+    )
+
 
 def build_or_update_indices(args):
-    """
-    Build or update indices & DB depending on flags.
+    """Build or update indices & DB depending on flags.
 
     Modes
     -----
@@ -2261,7 +2450,9 @@ def build_or_update_indices(args):
     save indices. Other processes (possibly using --shard-id/--num-shards) only
     populate SQLite rows and commit; they do not mutate FAISS indices.
     """
-    need = args.rebuild or not (DB_PATH.exists() and PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists())
+    need = args.rebuild or not (
+        DB_PATH.exists() and PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists()
+    )
     if not need and not args.update and not args.build_only:
         # nothing to do
         return
@@ -2273,8 +2464,8 @@ def build_or_update_indices(args):
     # Embedders (lazy init later if training needs them)
     paper_embedder = PaperEmbedderSpecter2()
     chunk_embedder = ChunkEmbedderSBERT(
-        devices=_resolve_embed_devices(args.embed_devices, force=args.force_embed_devices),
-        workers=args.embed_workers
+        devices=resolve_embed_devices(args.embed_devices, force=args.force_embed_devices),
+        workers=args.embed_workers,
     )
 
     paper_dim = 768
@@ -2284,7 +2475,9 @@ def build_or_update_indices(args):
     if args.rebuild:
         # Confirm before destructive actions
         _confirm_rebuild(conn)
-        print("[rebuild] hard reset: deleting FAISS indices, clearing DB tables, removing checkpoint")
+        print(
+            "[rebuild] hard reset: deleting FAISS indices, clearing DB tables, removing checkpoint"
+        )
         for p in [PAPER_INDEX_PATH, CHUNK_INDEX_PATH, CHUNK_TRAINED_FLAG]:
             if p.exists():
                 p.unlink()
@@ -2308,21 +2501,25 @@ def build_or_update_indices(args):
             # Prove we can create IP HNSW, then require an assignable metric_type.
             try:
                 _ = faiss.IndexHNSWFlat(8, 16, faiss.METRIC_INNER_PRODUCT)
-            except TypeError:
-                raise RuntimeError("FAISS wheel lacks IP HNSW support.")
+            except TypeError as e:
+                raise RuntimeError("FAISS wheel lacks IP HNSW support.") from e
             if hasattr(_core, "metric_type"):
                 _core.metric_type = faiss.METRIC_INNER_PRODUCT
             else:
-                raise RuntimeError("Cannot verify/set HNSW metric to IP on existing papers index; refuse to proceed.")
+                raise RuntimeError(
+                    "Cannot verify/set HNSW metric to IP on existing papers index; refuse to proceed."
+                )
         elif mt != faiss.METRIC_INNER_PRODUCT:
-            raise RuntimeError("Papers HNSW index is L2; IP required for cosine-equivalent retrieval.")
+            raise RuntimeError(
+                "Papers HNSW index is L2; IP required for cosine-equivalent retrieval."
+            )
 
         # Ensure IDMap2 wrapper even for legacy files
         if not isinstance(paper_index, faiss.IndexIDMap2):
             paper_index = faiss.IndexIDMap2(paper_index)
             if args.faiss_writer:
                 with FileLock(FAISS_LOCK):
-                    _faiss_save(paper_index, PAPER_INDEX_PATH)      
+                    _faiss_save(paper_index, PAPER_INDEX_PATH)
     else:
         # Create base (HNSW or FLAT) and wrap in IDMap2
         if args.papers_index == "flat":
@@ -2332,11 +2529,13 @@ def build_or_update_indices(args):
                 paper_dim,
                 M=args.hnsw_m,
                 ef_construction=args.efconstruction,
-                ef_search=args.efsearch
+                ef_search=args.efsearch,
             )
             # Minimal, stable start signal for HNSW (one line; not a live progress bar)
-            print(f"[progress] Building HNSW (papers): started  M={args.hnsw_m}  "
-                  f"efConstruction={args.efconstruction}  efSearch={args.efsearch}")
+            print(
+                f"[progress] Building HNSW (papers): started  M={args.hnsw_m}  "
+                f"efConstruction={args.efconstruction}  efSearch={args.efsearch}"
+            )
 
         paper_index = faiss.IndexIDMap2(base)
         _ensure_parent(PAPER_INDEX_PATH)
@@ -2354,10 +2553,14 @@ def build_or_update_indices(args):
         _, core = _kind_and_core(chunk_index)
         mt = getattr(core, "metric_type", faiss.METRIC_INNER_PRODUCT)
         if mt != faiss.METRIC_INNER_PRODUCT:
-            raise RuntimeError("Chunks index metric is not IP; cosine/IP required for normalized SBERT.")
+            raise RuntimeError(
+                "Chunks index metric is not IP; cosine/IP required for normalized SBERT."
+            )
         ivf = _extract_ivf(chunk_index)
         if isinstance(ivf, faiss.IndexIVFPQ) and not getattr(ivf, "is_trained", False):
-            print("[train] WARNING: chunks index is IVFPQ but untrained; ignoring stale trained flag and retraining.")
+            print(
+                "[train] WARNING: chunks index is IVFPQ but untrained; ignoring stale trained flag and retraining."
+            )
             _clear_chunk_trained_flag()
     else:
         if args.chunks_index == "flat":
@@ -2375,7 +2578,9 @@ def build_or_update_indices(args):
         else:
             m_safe = _safe_pq_m(chunk_dim, args.pq_m)
             if m_safe != args.pq_m:
-                print(f"[train] note: adjusted pq_m {args.pq_m} -> {m_safe} to divide dim={chunk_dim}")
+                print(
+                    f"[train] note: adjusted pq_m {args.pq_m} -> {m_safe} to divide dim={chunk_dim}"
+                )
 
             # Placeholder IVFPQ (will be replaced after training)
             eff_nlist = 16
@@ -2389,22 +2594,30 @@ def build_or_update_indices(args):
 
     # If IVF-PQ and not trained, run training pass (one-time)
     ivf_core = _extract_ivf(chunk_index)  # unwrap common wrappers (e.g., IndexIDMap2)
-    if isinstance(ivf_core, faiss.IndexIVFPQ) and getattr(ivf_core, "ntotal", 0) == 0 and not getattr(ivf_core, "is_trained", False):
+    if (
+        isinstance(ivf_core, faiss.IndexIVFPQ)
+        and getattr(ivf_core, "ntotal", 0) == 0
+        and not getattr(ivf_core, "is_trained", False)
+    ):
         if not args.faiss_writer:
-            print("[train] ERROR: chunks index requires training; start a writer with --faiss-writer.", file=sys.stderr)
+            print(
+                "[train] ERROR: chunks index requires training; start a writer with --faiss-writer.",
+                file=sys.stderr,
+            )
             sys.exit(2)
         train_samples = TRAIN_CHUNK_SAMPLES
-        texts_buf: List[str] = []
+        texts_buf: list[str] = []
 
         # for tracking training progress
         samples_collected = 0
         _phase("IVF-PQ: learn IVF centroids and PQ codebooks")
-        samples_prog = _Progress(f"Current number of embeddings of randomly selected text chunks (desired number of vectors={train_samples})", 
-                                 total=train_samples,
-                                 emit_final_line=False,
+        samples_prog = _Progress(
+            f"Current number of embeddings of randomly selected text chunks (desired number of vectors={train_samples})",
+            total=train_samples,
+            emit_final_line=False,
         )
 
-        def _flush_train(buf: List[str]) -> np.ndarray:
+        def _flush_train(buf: list[str]) -> np.ndarray:
             """Embed buffered texts and return their embeddings; clear handled by caller."""
             nonlocal samples_collected, samples_prog
             if not buf:
@@ -2425,16 +2638,18 @@ def build_or_update_indices(args):
             return X
 
         # Stream text chunks from tar.gz files (randomly) -> embed in mini-batches -> accumulate until we hit budget / target
-        texts_buf: List[str] = []
-        X_train_list: List[np.ndarray] = []
-        use_tar = (getattr(args, "tar_dir", None) is not None) or (getattr(args, "tar_manifest", None) is not None)
+        texts_buf: list[str] = []
+        X_train_list: list[np.ndarray] = []
+        use_tar = (getattr(args, "tar_dir", None) is not None) or (
+            getattr(args, "tar_manifest", None) is not None
+        )
 
         if use_tar:
             tar_paths_list = list(iter_tar_paths(args.tar_dir, args.tar_manifest))
-            rng = random.Random(int(os.environ.get('LITKIT_TRAIN_SEED', '314159')))
+            rng = random.Random(int(os.environ.get("LITKIT_TRAIN_SEED", "314159")))
             rng.shuffle(tar_paths_list)
 
-            _env_cap = int(os.environ.get('LITKIT_TRAIN_PER_PAPER', '0'))
+            _env_cap = int(os.environ.get("LITKIT_TRAIN_PER_PAPER", "0"))
             if _env_cap > 0:
                 train_per_paper = _env_cap
             else:
@@ -2452,22 +2667,36 @@ def build_or_update_indices(args):
             train_total = sum(int(x.shape[0]) for x in X_train_list)  # likely 0 here, but robust
 
             for tpath in tar_paths_list:
-                for m, fobj in iter_tar_xml_streams(tpath):
+                for _member, fobj in iter_tar_xml_streams(tpath):
                     try:
                         meta = parse_xml_fileobj(fobj)
                         if not meta:
                             continue
-                        paras = meta["paragraphs"] or ([meta["abstract"]] if meta["abstract"] else [])
+                        paras = meta["paragraphs"] or (
+                            [meta["abstract"]] if meta["abstract"] else []
+                        )
 
-                        chunks = pack_paragraphs(
-                            paras,
-                            max_chars=int(getattr(args, "chunk_target_chars", CHUNK_TARGET_CHARS)),
-                            min_chars=int(getattr(args, "chunk_min_chars", BODY_MIN_CHARS)),
-                            overlap_chars=int(getattr(args, "chunk_overlap", CHUNK_OVERLAP_CHARS)),
-                        ) if paras else []
+                        chunks = (
+                            pack_paragraphs(
+                                paras,
+                                max_chars=int(
+                                    getattr(args, "chunk_target_chars", CHUNK_TARGET_CHARS)
+                                ),
+                                min_chars=int(getattr(args, "chunk_min_chars", BODY_MIN_CHARS)),
+                                overlap_chars=int(
+                                    getattr(args, "chunk_overlap", CHUNK_OVERLAP_CHARS)
+                                ),
+                            )
+                            if paras
+                            else []
+                        )
 
                         if chunks and papers_used < target_papers:
-                            sel = chunks if len(chunks) <= train_per_paper else rng.sample(chunks, train_per_paper)
+                            sel = (
+                                chunks
+                                if len(chunks) <= train_per_paper
+                                else rng.sample(chunks, train_per_paper)
+                            )
                             for ch in sel:
                                 texts_buf.append(ch)
                                 if len(texts_buf) >= BATCH_TRAIN_FLUSH:
@@ -2493,7 +2722,8 @@ def build_or_update_indices(args):
 
         if texts_buf and sum(x.shape[0] for x in X_train_list) < train_samples:
             Xb = _flush_train(texts_buf)
-            X_train_list.append(Xb); texts_buf.clear()
+            X_train_list.append(Xb)
+            texts_buf.clear()
 
         samples_prog.finish()
         if not X_train_list:
@@ -2516,9 +2746,11 @@ def build_or_update_indices(args):
             # 1 ) Hard floors: micro-corpora and under-sampled PQ codebooks -> FLAT
             pq_bits = PQ_BITS  # PQ_BITS is single source of truth
             min_for_micro = 256
-            min_for_pq = 39 * (1 << pq_bits) # ~39*k, matches FAISS warning
+            min_for_pq = 39 * (1 << pq_bits)  # ~39*k, matches FAISS warning
             if n_train < min_for_micro or n_train < min_for_pq:
-                print(f"[train] too few training points ({n_train}) for reliable IVF-PQ; using FLAT IP")
+                print(
+                    f"[train] too few training points ({n_train}) for reliable IVF-PQ; using FLAT IP"
+                )
                 base = _flat_ip_index(chunk_dim)
                 chunk_index = faiss.IndexIDMap2(base)
                 # chunk_index = _flat_ip_index(chunk_dim)
@@ -2531,7 +2763,9 @@ def build_or_update_indices(args):
                 eff_nlist = _effective_nlist(n_train, args.ivf_nlist)
                 max_by_samples = max(1, n_train // 40)  # ~40 samples per centroid
                 if eff_nlist > max_by_samples:
-                    print(f"[train] note: reducing nlist {eff_nlist} -> {max_by_samples} due to limited samples (n={n_train})")
+                    print(
+                        f"[train] note: reducing nlist {eff_nlist} -> {max_by_samples} due to limited samples (n={n_train})"
+                    )
                     eff_nlist = max_by_samples
 
                 # If the cap collapses nlist to a tiny value, FLAT is safer/faster.
@@ -2548,12 +2782,16 @@ def build_or_update_indices(args):
                     # 3) Train with safety checks; fall back if training fails or leaves index untrained
                     m = _safe_pq_m(chunk_dim, args.pq_m)
                     if m != args.pq_m:
-                        print(f"[train] note: adjusted pq_m {args.pq_m} -> {m} to divide dim={chunk_dim}")
+                        print(
+                            f"[train] note: adjusted pq_m {args.pq_m} -> {m} to divide dim={chunk_dim}"
+                        )
                     print(f"[train] training IVF-PQ: nlist={eff_nlist} m={m} (dim={chunk_dim})")
 
                     try:
                         # after successful training
-                        new_chunk_index = _ivfpq_index(chunk_dim, nlist=eff_nlist, m=m, bits=pq_bits)
+                        new_chunk_index = _ivfpq_index(
+                            chunk_dim, nlist=eff_nlist, m=m, bits=pq_bits
+                        )
                         # best-effort verbosity
                         try:
                             if hasattr(new_chunk_index, "verbose"):
@@ -2562,10 +2800,13 @@ def build_or_update_indices(args):
                                 faiss.cvar.verbose = False
                         except Exception:
                             pass
-                        _phase("IVF-PQ: train centroids and PQ codebooks using collected embeddings")
+                        _phase(
+                            "IVF-PQ: train centroids and PQ codebooks using collected embeddings"
+                        )
                         pulse = _Pulse(
                             f"[train] IVF-PQ (nlist={eff_nlist}, m={m}): k-means/codebook fitting",
-                            period=float(os.environ.get("LITKIT_TRAIN_HEARTBEAT_SEC", "0.5")))
+                            period=float(os.environ.get("LITKIT_TRAIN_HEARTBEAT_SEC", "0.5")),
+                        )
                         try:
                             new_chunk_index.train(X_train)
                         finally:
@@ -2585,17 +2826,24 @@ def build_or_update_indices(args):
                                 _faiss_save(chunk_index, CHUNK_INDEX_PATH)
                                 # Only now write the trained flag (we have valid nlist/m)
                                 _tf_tmp = CHUNK_TRAINED_FLAG.with_suffix(".tmp")
-                                _tf_tmp.write_text(json.dumps({
-                                    "trained_on": int(time.time()),
-                                    "n": n_train,
-                                    "nlist": eff_nlist,
-                                    "m": m
-                                }, indent=2))
+                                _tf_tmp.write_text(
+                                    json.dumps(
+                                        {
+                                            "trained_on": int(time.time()),
+                                            "n": n_train,
+                                            "nlist": eff_nlist,
+                                            "m": m,
+                                        },
+                                        indent=2,
+                                    )
+                                )
                                 os.replace(_tf_tmp, CHUNK_TRAINED_FLAG)
                                 _maybe_fsync_dir(CHUNK_TRAINED_FLAG)
 
                     except Exception as e:
-                        print(f"[train] WARNING: IVF-PQ training failed ({e}); falling back to FLAT")
+                        print(
+                            f"[train] WARNING: IVF-PQ training failed ({e}); falling back to FLAT"
+                        )
                         chunk_index = _flat_ip_index(chunk_dim)
                         if args.faiss_writer:
                             with FileLock(FAISS_LOCK):
@@ -2603,8 +2851,7 @@ def build_or_update_indices(args):
                         _clear_chunk_trained_flag()
 
     def _shard_filter(paths, shard_id, num_shards):
-        """
-        Deterministically assign files to a shard by hashing path (mod num_shards).
+        """Deterministically assign files to a shard by hashing path (mod num_shards).
         Streaming (no global sort/materialization here).
         """
         for p in paths:
@@ -2612,10 +2859,16 @@ def build_or_update_indices(args):
             if h % num_shards == shard_id:
                 yield p
 
-    use_tar = (getattr(args, "tar_dir", None) is not None) or (getattr(args, "tar_manifest", None) is not None)
+    use_tar = (getattr(args, "tar_dir", None) is not None) or (
+        getattr(args, "tar_manifest", None) is not None
+    )
 
     # ----- TAR SHARD PATH (NO EXTRACTION) -----
-    tar_paths = list(_shard_filter(iter_tar_paths(args.tar_dir, args.tar_manifest), args.shard_id, args.num_shards))
+    tar_paths = list(
+        _shard_filter(
+            iter_tar_paths(args.tar_dir, args.tar_manifest), args.shard_id, args.num_shards
+        )
+    )
     print(f"[scan] found {len(tar_paths)} tar shards in shard {args.shard_id}/{args.num_shards}")
 
     # NOTE: The global --rebuild handling already reset DB/indices/checkpoint
@@ -2632,14 +2885,20 @@ def build_or_update_indices(args):
     for tpath in tar_paths:
         # Number of *persisted* members previously processed for this tar shard
         start_persisted = int(ckpt_stream.get(str(tpath), 0))
-        processed_count = start_persisted   # increments after each successfully handled member
-        persisted_count = start_persisted   # last value safely fsynced via commit + checkpoint
+        processed_count = start_persisted  # increments after each successfully handled member
+        persisted_count = start_persisted  # last value safely fsynced via commit + checkpoint
 
         # Set LITKIT_TAR_PRESCAN=0 to skip counting members
-        total_members = count_tar_xml_members(tpath) if os.environ.get("LITKIT_TAR_PRESCAN", "1") == "1" else None
-        
+        total_members = (
+            count_tar_xml_members(tpath)
+            if os.environ.get("LITKIT_TAR_PRESCAN", "1") == "1"
+            else None
+        )
+
         if total_members is not None:
-            print(f"[scan] shard {tpath} (resume=#{start_persisted}{'' if total_members is None else f', total≈{total_members}'})")
+            print(
+                f"[scan] shard {tpath} (resume=#{start_persisted}{'' if total_members is None else f', total≈{total_members}'})"
+            )
         #     print(f"[scan] {tpath} (resume at processed_count #{start_persisted} / total ~{total_members})")
         # else:
         #     print(f"[scan] {tpath} (resume at processed_count #{start_persisted})")
@@ -2673,10 +2932,13 @@ def build_or_update_indices(args):
 
             elapsed = max(1e-3, now - start_ts)
             total_str = str(total_members) if total_members is not None else "?"
-            pct_str = (f"  ({100.0*done/total_members:.1f}%)" if total_members else "")
-            msg = f"[progress] [scan] {tpath.name}: {done}/{total_str}{pct_str}  {done/elapsed:.1f}/s"
+            pct_str = f"  ({100.0*done/total_members:.1f}%)" if total_members else ""
+            msg = (
+                f"[progress] [scan] {tpath.name}: {done}/{total_str}{pct_str}  {done/elapsed:.1f}/s"
+            )
             _progress_write(msg, sys.stderr)
             last_render = now
+
         # show initial 0/N state (or ? if unknown)
         _render(force=True)
 
@@ -2691,14 +2953,13 @@ def build_or_update_indices(args):
                 except Exception:
                     pass
                 if skipped == start_persisted:
-                    _render(force=True) # render resume point
+                    _render(force=True)  # render resume point
                 continue
 
             handled_ok = False
             f = f"tar://{tpath}!/{m.name}"
             st = SimpleNamespace(
-                st_size=int(getattr(m, 'size', 0)),
-                st_mtime=float(getattr(m, 'mtime', 0.0) or 0.0)
+                st_size=int(getattr(m, "size", 0)), st_mtime=float(getattr(m, "mtime", 0.0) or 0.0)
             )
 
             try:
@@ -2724,23 +2985,30 @@ def build_or_update_indices(args):
                     else:
                         # ---------- BEGIN INGEST BODY (same semantics; no member-based checkpointing here) ----------
                         pmcid = (meta["pmcid"] or "").strip()
-                        pmid  = (meta["pmid"]  or "").strip()
+                        pmid = (meta["pmid"] or "").strip()
 
                         pid_row = None
                         if pmcid:
-                            pid_row = cur.execute("SELECT id FROM papers WHERE pmcid=?", (pmcid,)).fetchone()
+                            pid_row = cur.execute(
+                                "SELECT id FROM papers WHERE pmcid=?", (pmcid,)
+                            ).fetchone()
                         if (pid_row is None) and pmid:
-                            pid_row = cur.execute("SELECT id FROM papers WHERE pmid=?", (pmid,)).fetchone()
+                            pid_row = cur.execute(
+                                "SELECT id FROM papers WHERE pmid=?", (pmid,)
+                            ).fetchone()
                         if pid_row:
                             pid = pid_row[0]
                         else:
                             cur.execute(
                                 "INSERT INTO papers(pmid, pmcid, title, abstract) VALUES (?,?,?,?)",
-                                (pmid, pmcid, meta["title"], meta["abstract"])
+                                (pmid, pmcid, meta["title"], meta["abstract"]),
                             )
                             pid = cur.lastrowid
 
-                        seen_this_path = cur.execute("SELECT 1 FROM files WHERE path=?", (str(f),)).fetchone() is not None
+                        seen_this_path = (
+                            cur.execute("SELECT 1 FROM files WHERE path=?", (str(f),)).fetchone()
+                            is not None
+                        )
                         if seen_this_path:
                             if args.faiss_writer:
                                 with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
@@ -2750,7 +3018,12 @@ def build_or_update_indices(args):
                                     _safe_remove_ids(paper_index, selp)
                                     _faiss_save_force(paper_index, PAPER_INDEX_PATH)
 
-                                old_ids = [row[0] for row in cur.execute("SELECT id FROM chunks WHERE paper_id=?", (pid,))]
+                                old_ids = [
+                                    row[0]
+                                    for row in cur.execute(
+                                        "SELECT id FROM chunks WHERE paper_id=?", (pid,)
+                                    )
+                                ]
                                 if old_ids:
                                     with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
                                         if not isinstance(chunk_index, faiss.IndexIDMap2):
@@ -2766,7 +3039,9 @@ def build_or_update_indices(args):
 
                         ta = (meta["title"] or "").strip()
                         ab = (meta["abstract"] or "").strip()
-                        ta_ab = (ta + " " + ab).strip() or (meta["paragraphs"][0][:800] if meta["paragraphs"] else "untitled")
+                        ta_ab = (ta + " " + ab).strip() or (
+                            meta["paragraphs"][0][:800] if meta["paragraphs"] else "untitled"
+                        )
                         paper_ids_buf.append(pid)
                         paper_texts_buf.append(ta_ab)
 
@@ -2776,17 +3051,28 @@ def build_or_update_indices(args):
 
                         paras = meta["paragraphs"] or ([ab] if ab else [])
                         # body_chunks = pack_paragraphs(paras, max_chars=CHUNK_TARGET_CHARS) if paras else []
-                        chunks = pack_paragraphs(
-                            paras,
-                            max_chars=int(getattr(args, "chunk_target_chars", CHUNK_TARGET_CHARS)),
-                            min_chars=int(getattr(args, "chunk_min_chars", BODY_MIN_CHARS)),
-                            overlap_chars=int(getattr(args, "chunk_overlap", CHUNK_OVERLAP_CHARS)),
-                        ) if paras else []
+                        chunks = (
+                            pack_paragraphs(
+                                paras,
+                                max_chars=int(
+                                    getattr(args, "chunk_target_chars", CHUNK_TARGET_CHARS)
+                                ),
+                                min_chars=int(getattr(args, "chunk_min_chars", BODY_MIN_CHARS)),
+                                overlap_chars=int(
+                                    getattr(args, "chunk_overlap", CHUNK_OVERLAP_CHARS)
+                                ),
+                            )
+                            if paras
+                            else []
+                        )
                         for ord_i, ch in enumerate(chunks):
                             proposed_chunks.append((ord_i, ch))
 
                         for ord_i, text_i in proposed_chunks:
-                            cur.execute("INSERT INTO chunks(paper_id, ord, text) VALUES (?,?,?)", (pid, ord_i, text_i))
+                            cur.execute(
+                                "INSERT INTO chunks(paper_id, ord, text) VALUES (?,?,?)",
+                                (pid, ord_i, text_i),
+                            )
                             cid = cur.lastrowid
                             chunk_ids_buf.append(cid)
                             chunk_texts_buf.append(text_i)
@@ -2800,7 +3086,9 @@ def build_or_update_indices(args):
                                     progress_label=f"Embedding papers (producer, {len(u_texts)})",
                                     batch_size=args.paper_embed_bs,
                                 )
-                                paper_seg_writer.write(ids=np.asarray(u_ids, dtype=np.int64), vecs=Xp)
+                                paper_seg_writer.write(
+                                    ids=np.asarray(u_ids, dtype=np.int64), vecs=Xp
+                                )
                                 with FileLock(DB_LOCK):
                                     conn.commit()
                                 papers_added_total += len(u_ids)
@@ -2819,13 +3107,19 @@ def build_or_update_indices(args):
                                     if added:
                                         if prior_ntotal == 0:
                                             _faiss_save_force(paper_index, PAPER_INDEX_PATH)
-                                            _mark_in_index(cur, "papers", [int(i) for i in ids_added])
+                                            _mark_in_index(
+                                                cur, "papers", [int(i) for i in ids_added]
+                                            )
                                         else:
                                             if _faiss_save(paper_index, PAPER_INDEX_PATH):
-                                                _mark_in_index(cur, "papers", [int(i) for i in ids_added])
+                                                _mark_in_index(
+                                                    cur, "papers", [int(i) for i in ids_added]
+                                                )
                                                 _flush_pending_marks(cur)
                                             else:
-                                                _PENDING_MARKS["papers"].extend([int(i) for i in ids_added])
+                                                _PENDING_MARKS["papers"].extend(
+                                                    [int(i) for i in ids_added]
+                                                )
                                 papers_added_total += len(u_ids)
 
                             else:
@@ -2845,7 +3139,9 @@ def build_or_update_indices(args):
                                     progress_label=f"Embedding chunks (producer, {len(u_texts)})",
                                     batch_size=args.chunk_embed_bs,
                                 )
-                                chunk_seg_writer.write(ids=np.asarray(u_ids, dtype=np.int64), vecs=Xc)
+                                chunk_seg_writer.write(
+                                    ids=np.asarray(u_ids, dtype=np.int64), vecs=Xc
+                                )
                                 with FileLock(DB_LOCK):
                                     conn.commit()
                                 chunks_added_total += len(u_ids)
@@ -2864,13 +3160,19 @@ def build_or_update_indices(args):
                                     if added:
                                         if prior_ntotal == 0:
                                             _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
-                                            _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
+                                            _mark_in_index(
+                                                cur, "chunks", [int(i) for i in ids_added]
+                                            )
                                         else:
                                             if _faiss_save(chunk_index, CHUNK_INDEX_PATH):
-                                                _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
+                                                _mark_in_index(
+                                                    cur, "chunks", [int(i) for i in ids_added]
+                                                )
                                                 _flush_pending_marks(cur)
                                             else:
-                                                _PENDING_MARKS["chunks"].extend([int(i) for i in ids_added])
+                                                _PENDING_MARKS["chunks"].extend(
+                                                    [int(i) for i in ids_added]
+                                                )
                                 chunks_added_total += len(u_ids)
 
                             else:
@@ -2918,7 +3220,6 @@ def build_or_update_indices(args):
         ckpt["build_stream"] = ckpt_stream
         save_checkpoint(ckpt)
 
-
     if args.faiss_writer:
 
         if paper_ids_buf:
@@ -2926,7 +3227,7 @@ def build_or_update_indices(args):
             Xp = paper_embedder.encode(
                 u_texts,
                 progress_label=f"Embedding papers (batch of {len(u_texts)})",
-                batch_size=args.paper_embed_bs
+                batch_size=args.paper_embed_bs,
             )
             if not isinstance(paper_index, faiss.IndexIDMap2):
                 paper_index = faiss.IndexIDMap2(paper_index)
@@ -2943,20 +3244,20 @@ def build_or_update_indices(args):
                     _mark_in_index(cur, "papers", u_ids)
                 except RuntimeError:
                     _add_ids_union_compat(
-                        paper_index, u_ids, Xp,
-                        table="papers", cur=cur, save_path=PAPER_INDEX_PATH
+                        paper_index, u_ids, Xp, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
                     )
                 conn.commit()
             papers_added_total += len(u_ids)
 
-        paper_ids_buf.clear(); paper_texts_buf.clear()
+        paper_ids_buf.clear()
+        paper_texts_buf.clear()
 
         if chunk_ids_buf:
             u_ids, u_texts = _dedupe_ids_and_texts(chunk_ids_buf, chunk_texts_buf)
             Xc = chunk_embedder.encode(
                 u_texts,
                 progress_label=f"Embedding chunks (batch of {len(u_texts)})",
-                batch_size=args.chunk_embed_bs
+                batch_size=args.chunk_embed_bs,
             )
             if not isinstance(chunk_index, faiss.IndexIDMap2):
                 chunk_index = faiss.IndexIDMap2(chunk_index)
@@ -2973,13 +3274,13 @@ def build_or_update_indices(args):
                     _mark_in_index(cur, "chunks", u_ids)
                 except RuntimeError:
                     _add_ids_union_compat(
-                        chunk_index, u_ids, Xc,
-                        table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
+                        chunk_index, u_ids, Xc, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
                     )
                 conn.commit()
             chunks_added_total += len(u_ids)
 
-        chunk_ids_buf.clear(); chunk_texts_buf.clear()
+        chunk_ids_buf.clear()
+        chunk_texts_buf.clear()
 
     elif getattr(args, "embed_producer", False) and not getattr(args, "faiss_writer", False):
         # ---- producer: DO NOT touch FAISS, DO NOT set in_index=1 ----
@@ -2990,14 +3291,15 @@ def build_or_update_indices(args):
             Xp = paper_embedder.encode(
                 u_texts,
                 progress_label=f"Embedding papers (producer, {len(u_texts)})",
-                batch_size=args.paper_embed_bs
+                batch_size=args.paper_embed_bs,
             )
             assert paper_seg_writer is not None, "producer mode requires paper_seg_writer"
             paper_seg_writer.write(ids=np.asarray(u_ids, dtype=np.int64), vecs=Xp)
             with FileLock(DB_LOCK):
                 conn.commit()
             papers_added_total += len(u_ids)
-        paper_ids_buf.clear(); paper_texts_buf.clear()
+        paper_ids_buf.clear()
+        paper_texts_buf.clear()
 
         # chunks: embed and write segment file(s)
         if chunk_ids_buf:
@@ -3005,26 +3307,26 @@ def build_or_update_indices(args):
             Xc = chunk_embedder.encode(
                 u_texts,
                 progress_label=f"Embedding chunks (producer, {len(u_texts)})",
-                batch_size=args.chunk_embed_bs
+                batch_size=args.chunk_embed_bs,
             )
             assert chunk_seg_writer is not None, "producer mode requires chunk_seg_writer"
             chunk_seg_writer.write(ids=np.asarray(u_ids, dtype=np.int64), vecs=Xc)
             with FileLock(DB_LOCK):
                 conn.commit()
             chunks_added_total += len(u_ids)
-        chunk_ids_buf.clear(); chunk_texts_buf.clear()
+        chunk_ids_buf.clear()
+        chunk_texts_buf.clear()
 
     else:
         # ---- plain reader: DB only ----
         with FileLock(DB_LOCK):
             conn.commit()
         papers_added_total += len(paper_ids_buf)
-        paper_ids_buf.clear(); paper_texts_buf.clear()
+        paper_ids_buf.clear()
+        paper_texts_buf.clear()
         chunks_added_total += len(chunk_ids_buf)
-        chunk_ids_buf.clear(); chunk_texts_buf.clear()
-
-
-
+        chunk_ids_buf.clear()
+        chunk_texts_buf.clear()
 
     # Final commit + ensure on-disk indices are current *before* sanity
     conn.commit()
@@ -3040,15 +3342,26 @@ def build_or_update_indices(args):
                 paper_index = faiss.IndexIDMap2(paper_index)
             p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
             if c_added or p_added:
-                print(f"[segments] ingested {p_added} paper vectors and {c_added} chunk vectors from segments")
+                print(
+                    f"[segments] ingested {p_added} paper vectors and {c_added} chunk vectors from segments"
+                )
 
         # Reset any rows marked in_index=1 that are missing from FAISS
         p_reset, c_reset = reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index)
         if p_reset or c_reset:
-            print(f"[reconcile] reset flags for missing vectors — papers={p_reset} chunks={c_reset}")
+            print(
+                f"[reconcile] reset flags for missing vectors — papers={p_reset} chunks={c_reset}"
+            )
 
-        backfill_unindexed_vectors(conn, paper_embedder, chunk_embedder, paper_index, chunk_index,
-                                paper_bs=args.paper_embed_bs, chunk_bs=args.chunk_embed_bs)
+        backfill_unindexed_vectors(
+            conn,
+            paper_embedder,
+            chunk_embedder,
+            paper_index,
+            chunk_index,
+            paper_bs=args.paper_embed_bs,
+            chunk_bs=args.chunk_embed_bs,
+        )
 
         # Respect lock order while forcing saves and flushing marks
         with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
@@ -3060,7 +3373,9 @@ def build_or_update_indices(args):
         try:
             k, _ = _kind_and_core(paper_index)
             if k == "hnsw":
-                print(f"[done] HNSW (papers): build complete — ntotal={int(getattr(paper_index, 'ntotal', 0) or 0)}")
+                print(
+                    f"[done] HNSW (papers): build complete — ntotal={int(getattr(paper_index, 'ntotal', 0) or 0)}"
+                )
         except Exception:
             pass
 
@@ -3080,11 +3395,12 @@ def build_or_update_indices(args):
     conn.close()
     return
 
+
 # -------------------- Retrieval helpers --------------------
 
-def _faiss_present_ids(index) -> Optional[set]:
-    """
-    Return the set of external IDs present in an IndexIDMap2-wrapped index.
+
+def _faiss_present_ids(index) -> set | None:
+    """Return the set of external IDs present in an IndexIDMap2-wrapped index.
     Returns None if we cannot enumerate (e.g., not IDMap2).
     """
     try:
@@ -3099,9 +3415,9 @@ def _faiss_present_ids(index) -> Optional[set]:
         pass
     return None
 
-def reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index) -> Tuple[int,int]:
-    """
-    For each table, if FAISS lacks some IDs that SQLite thinks are in the index,
+
+def reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index) -> tuple[int, int]:
+    """For each table, if FAISS lacks some IDs that SQLite thinks are in the index,
     reset those rows to in_index=0 so the normal backfill can re-add them.
     Returns (papers_reset, chunks_reset).
     """
@@ -3129,8 +3445,10 @@ def reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index) -> Tuple[i
     conn.commit()
     return reset_p, reset_c
 
+
 # In-memory FAISS index cache keyed by (path, mtime)
 _FAISS_CACHE = {}
+
 
 def _faiss_load_cached(path: Path):
     p = Path(path)
@@ -3148,15 +3466,15 @@ def _faiss_load_cached(path: Path):
         idx = _FAISS_CACHE[key]
     return idx
 
-def _add_with_ids_dedup(index, ids: List[int], X: np.ndarray) -> Tuple[int, np.ndarray]:
-    """
-    Add (ids, X) to a possibly-wrapped FAISS index, removing stale ids first
+
+def _add_with_ids_dedup(index, ids: list[int], X: np.ndarray) -> tuple[int, np.ndarray]:
+    """Add (ids, X) to a possibly-wrapped FAISS index, removing stale ids first
     when supported. Falls back to union-dedup when IDSelector is missing.
     Returns (added_count, ids_added_array).
     """
     ids_arr = np.ascontiguousarray(ids, dtype=np.int64)
     X = np.ascontiguousarray(X.astype("float32"))
-    faiss.normalize_L2(X) # unit norm docs for IP == cosine
+    faiss.normalize_L2(X)  # unit norm docs for IP == cosine
     # Ensure IDMap2 for safe external id semantics everywhere
     if not isinstance(index, faiss.IndexIDMap2):
         index = faiss.IndexIDMap2(index)
@@ -3176,10 +3494,11 @@ def _add_with_ids_dedup(index, ids: List[int], X: np.ndarray) -> Tuple[int, np.n
         index.add_with_ids(X_new, ids_new)
         return int(ids_new.size), ids_new
 
+
 def _faiss_search(index_path: Path, qvec: np.ndarray, k: int, **kwargs):
+    """Load index, downcast, set family-specific search params on the CORE, then search.
+    #
     """
-    Load index, downcast, set family-specific search params on the CORE, then search.
-    # """
     # index = _faiss_load(index_path)
     index = _faiss_load_cached(index_path)
     kind, core = _kind_and_core(index)
@@ -3198,18 +3517,24 @@ def _faiss_search(index_path: Path, qvec: np.ndarray, k: int, **kwargs):
         target = _pick_nprobe(int(core.nlist), kwargs.get("nprobe", None))
         core.nprobe = target
         info["nprobe"] = target
-        info["nlist"]  = int(core.nlist)
+        info["nlist"] = int(core.nlist)
 
     # FLAT/unknown: nothing to set
 
-    D, I = index.search(qvec.astype("float32"), k)
-    ids = [int(x) for x in I[0] if x != -1]
-    ds  = [float(d) for (d, x) in zip(D[0], I[0]) if x != -1]
+    D, indices = index.search(qvec.astype("float32"), k)
+    ids = [int(x) for x in indices[0] if x != -1]
+    ds = [float(d) for (d, x) in zip(D[0], indices[0], strict=False) if x != -1]
     return ids, ds, info
 
-def shortlist_papers(question: str, k: int, efsearch: int = 128, *, embedder: Optional["PaperEmbedderSpecter2"] = None) -> List[int]:
-    """
-    Stage 1: encode the question with SPECTER2 and retrieve top-k paper IDs
+
+def shortlist_papers(
+    question: str,
+    k: int,
+    efsearch: int = 128,
+    *,
+    embedder: Optional["PaperEmbedderSpecter2"] = None,
+) -> list[int]:
+    """Stage 1: encode the question with SPECTER2 and retrieve top-k paper IDs
     from the paper index (HNSW by default). Returns a list of paper ids.
     """
     enc = embedder or PaperEmbedderSpecter2()
@@ -3223,38 +3548,39 @@ def shortlist_papers(question: str, k: int, efsearch: int = 128, *, embedder: Op
         pass
     return ids
 
-def chunk_ids_to_paper_ids(conn, chunk_ids: List[int]) -> Dict[int, int]:
-    """
-    Resolve chunk_id → paper_id mapping for a given set of chunk IDs.
+
+def chunk_ids_to_paper_ids(conn, chunk_ids: list[int]) -> dict[int, int]:
+    """Resolve chunk_id → paper_id mapping for a given set of chunk IDs.
     Preserves no particular order; caller maps back as needed.
     """
-    if not chunk_ids: return {}
+    if not chunk_ids:
+        return {}
     marks = ",".join("?" for _ in chunk_ids)
     cur = conn.cursor()
     cur.execute(f"SELECT id, paper_id FROM chunks WHERE id IN ({marks})", chunk_ids)
     return {row[0]: row[1] for row in cur.fetchall()}
 
+
 def search_chunks_constrained(
     question: str,
-    candidate_papers: List[int],
+    candidate_papers: list[int],
     k: int,
     overshoot: int = 20,
-    nprobe: Optional[int] = None,
-    min_chunks_per_paper: Optional[float] = None,
-    lexical_cap: Optional[int] = None,
+    nprobe: int | None = None,
+    min_chunks_per_paper: float | None = None,
+    lexical_cap: int | None = None,
     lexical_limit: int = 200,
-    allow_global_lexical: Optional[bool] = None,
+    allow_global_lexical: bool | None = None,
     embedder: Optional["ChunkEmbedderSBERT"] = None,
-    per_paper_cap: int = 0
-    ) -> Tuple[List[int], Dict[str, int]]:
-    """
-    Stage 2: SBERT ANN + lexical front-loading.
+    per_paper_cap: int = 0,
+) -> tuple[list[int], dict[str, int]]:
+    """Stage 2: SBERT ANN + lexical front-loading.
     1) Wide ANN search (K = max(k*overshoot, 100)).
     2) Optional filter to candidate_papers.
     3) ALWAYS front-load chunks that lexically match rare query terms (e.g., 'rulemonkey').
     4) Return top-k ids (lexical-first, de-duped, then ANN order).
 
-    Returns
+    Returns:
     -------
     (chunk_ids, meta) : Tuple[List[int], Dict[str, int]]
         chunk_ids: top-k ranked chunk IDs (lexical-first, de-duped, then ANN order).
@@ -3262,7 +3588,7 @@ def search_chunks_constrained(
     """
     enc = embedder or ChunkEmbedderSBERT()
     q = enc.encode([question])
-    did_fallback = False # always define; set True only when we drop the shortlist
+    did_fallback = False  # always define; set True only when we drop the shortlist
 
     K = max(k * overshoot, 100)
     ids, dists, meta = _faiss_search(CHUNK_INDEX_PATH, q, K, nprobe=nprobe)
@@ -3270,12 +3596,12 @@ def search_chunks_constrained(
         return [], meta
 
     # Step 2: candidate-paper filter (if any)
-    ranked = list(zip(ids, dists))
+    ranked = list(zip(ids, dists, strict=False))
 
     db_conn = _connect_db()
 
     try:
-        cand: Optional[set] = None
+        cand: set | None = None
         did_fallback = False  # default when no candidate_papers
 
         env_thr = float(os.environ.get("LITKIT_MIN_CHUNKS_PER_PAPER", "2.0"))
@@ -3288,8 +3614,10 @@ def search_chunks_constrained(
                 # Fallback: global Stage-2 search (no candidate paper filter)
                 src = "param" if (min_chunks_per_paper is not None) else "env"
                 thr_val = thr  # from the AFTER patch above
-                print(f"[retrieve] global Stage-2 fallback: def shortlist/paper={avg_c:.2f} (<{thr_val} via {src}), "
-                    f"shortlist_papers={len(candidate_papers)}, K={K}, nprobe={meta.get('nprobe','?')}")
+                print(
+                    f"[retrieve] global Stage-2 fallback: def shortlist/paper={avg_c:.2f} (<{thr_val} via {src}), "
+                    f"shortlist_papers={len(candidate_papers)}, K={K}, nprobe={meta.get('nprobe','?')}"
+                )
                 cand = None
             did_fallback = cand is None
 
@@ -3299,24 +3627,30 @@ def search_chunks_constrained(
 
         # Step 3: lexical front-loading  (LIKE + ESCAPE ? + normalization + guard)
         ALLOW_GLOBAL_LEXICAL = (
-            (allow_global_lexical if allow_global_lexical is not None
-                else os.environ.get("LITKIT_ALLOW_GLOBAL_LEXICAL", "0") == "1")
-            or did_fallback  # force global lexical on Stage-2 fallback
-        )
+            allow_global_lexical
+            if allow_global_lexical is not None
+            else os.environ.get("LITKIT_ALLOW_GLOBAL_LEXICAL", "0") == "1"
+        ) or did_fallback  # force global lexical on Stage-2 fallback
         if did_fallback:
             print("[lexical] enabling global lexical front-load (Stage-2 fallback).")
 
         terms = _query_terms(question)
         # Extend the trigger to catch LIKE-sensitive chars too: %, \
-        rare_terms = [t for t in terms if any(ch.isdigit() for ch in t) or any(ch in "-_%\\" for ch in t)]
+        rare_terms = [
+            t for t in terms if any(ch.isdigit() for ch in t) or any(ch in "-_%\\" for ch in t)
+        ]
         if not rare_terms:
             rare_terms = [t for t in terms if len(t) >= 9]  # long alpha tokens
 
         # Choose a title “hint” token (prefer a rare term)
-        title_hint = _normalize_for_search_py(rare_terms[0] if rare_terms else (terms[0] if terms else ""))
-        title_like_param = f"%{_escape_like(title_hint)}%" if title_hint else "%"   # always bind something
+        title_hint = _normalize_for_search_py(
+            rare_terms[0] if rare_terms else (terms[0] if terms else "")
+        )
+        title_like_param = (
+            f"%{_escape_like(title_hint)}%" if title_hint else "%"
+        )  # always bind something
 
-        lexical_ids: List[int] = []
+        lexical_ids: list[int] = []
         # if rare_terms and not DISABLE_LEXICAL:
         if rare_terms and not DISABLE_LEXICAL and ((cand is not None) or ALLOW_GLOBAL_LEXICAL):
             norm = _sqlite_norm_expr("text")
@@ -3326,8 +3660,7 @@ def search_chunks_constrained(
             like_clause = " OR ".join(like_parts)
 
             # Normalize + escape once per term; no ESCAPE param bindings needed.
-            params = [f"%{_escape_like(_normalize_for_search_py(t))}%"
-                    for t in rare_terms]
+            params = [f"%{_escape_like(_normalize_for_search_py(t))}%" for t in rare_terms]
 
             cur = db_conn.cursor()
             scope_is_global = bool(ALLOW_GLOBAL_LEXICAL or did_fallback)
@@ -3374,31 +3707,42 @@ def search_chunks_constrained(
                 msg = f"[lexical] disabled: {e.__class__.__name__}: {e}"
                 if not _LEXICAL_WARN_ONCE:
                     _LEXICAL_WARN_ONCE = True
-                    where = "candidate papers only" if (cand is not None and not scope_is_global) else "global"
+                    where = (
+                        "candidate papers only"
+                        if (cand is not None and not scope_is_global)
+                        else "global"
+                    )
                     logging.warning(
                         "%s (scope=%s). Tip: set --allow-global-lexical to widen matches if your shortlist is sparse.",
-                        msg, where
+                        msg,
+                        where,
                     )
                 lexical_ids = []
 
         # Merge with a cap + interleave so lexical can't swamp ANN
-        LEX_CAP = lexical_cap if lexical_cap is not None else max(5, k // 3)  # at most ~1/3 from lexical
+        LEX_CAP = (
+            lexical_cap if lexical_cap is not None else max(5, k // 3)
+        )  # at most ~1/3 from lexical
         lexical_ids = lexical_ids[:LEX_CAP]
 
         seen = set()
-        merged: List[int] = []
+        merged: list[int] = []
         i = j = 0
         while len(merged) < k and (i < len(lexical_ids) or j < len(ranked)):
             if i < len(lexical_ids):
-                cid = lexical_ids[i]; i += 1
+                cid = lexical_ids[i]
+                i += 1
                 if cid not in seen:
-                    seen.add(cid); merged.append(cid)
+                    seen.add(cid)
+                    merged.append(cid)
             if len(merged) >= k:
                 break
             if j < len(ranked):
-                cid, _ = ranked[j]; j += 1
+                cid, _ = ranked[j]
+                j += 1
                 if cid not in seen:
-                    seen.add(cid); merged.append(cid)
+                    seen.add(cid)
+                    merged.append(cid)
 
         out = merged[:k]
 
@@ -3410,8 +3754,7 @@ def search_chunks_constrained(
                 conn2 = _connect_db()
                 try:
                     rows = conn2.execute(
-                        f"SELECT id AS chunk_id, paper_id FROM chunks WHERE id IN ({qmarks})",
-                        out
+                        f"SELECT id AS chunk_id, paper_id FROM chunks WHERE id IN ({qmarks})", out
                     ).fetchall()
                 finally:
                     conn2.close()
@@ -3424,49 +3767,64 @@ def search_chunks_constrained(
 
     return out, meta
 
-def get_chunks(conn, ids: List[int]) -> List[Dict[str, str]]:
-    """
-    Retrieve chunk rows joined with paper metadata, preserving input `ids` order.
+
+def get_chunks(conn, ids: list[int]) -> list[dict[str, str]]:
+    """Retrieve chunk rows joined with paper metadata, preserving input `ids` order.
 
     Returns a list of dicts containing:
       id, paper_id, ord, text, paper_title, pmid, pmcid
     """
-    if not ids: return []
+    if not ids:
+        return []
     marks = ",".join("?" for _ in ids)
     cur = conn.cursor()
-    cur.execute(f"""SELECT c.id, c.paper_id, c.ord, c.text, p.title, p.pmid, p.pmcid
+    cur.execute(
+        f"""SELECT c.id, c.paper_id, c.ord, c.text, p.title, p.pmid, p.pmcid
                     FROM chunks c JOIN papers p ON p.id=c.paper_id
-                    WHERE c.id IN ({marks})""", ids)
+                    WHERE c.id IN ({marks})""",
+        ids,
+    )
     rows = cur.fetchall()
     rowmap = {row[0]: row for row in rows}
     out = []
     for cid in ids:  # preserve ranking order
         row = rowmap.get(cid)
-        if not row: continue
-        out.append({
-            "id": row[0], "paper_id": row[1], "ord": row[2],
-            "text": row[3], "paper_title": row[4] or "",
-            "pmid": row[5] or "", "pmcid": row[6] or ""
-        })
+        if not row:
+            continue
+        out.append(
+            {
+                "id": row[0],
+                "paper_id": row[1],
+                "ord": row[2],
+                "text": row[3],
+                "paper_title": row[4] or "",
+                "pmid": row[5] or "",
+                "pmcid": row[6] or "",
+            }
+        )
     return out
 
-def _avg_chunks_for_papers(pids: List[int]) -> float:
+
+def _avg_chunks_for_papers(pids: list[int]) -> float:
     """Average number of chunks across the requested paper ids (zeros included)."""
     if not pids:
         return 0.0
     conn = _connect_db()
     try:
         _load_temp_candidates(conn, pids)
-        rows = conn.execute("""
+        rows = conn.execute(
+            """
             SELECT cp.id, COUNT(c.id)
             FROM cand_papers cp
             LEFT JOIN chunks c ON c.paper_id = cp.id
             GROUP BY cp.id
-        """).fetchall()
+        """
+        ).fetchall()
         # rows length equals len(pids), with zero-count rows for papers with no chunks
         return 0.0 if not rows else (sum(n for _, n in rows) / float(len(pids)))
     finally:
         conn.close()
+
 
 # -------------------- LLM + token-budgeting --------------------
 # OpenAI client is imported lazily inside LLM paths to keep build-only runs offline-safe.
@@ -3478,26 +3836,23 @@ SYS_PROMPT = (
     "to the provided chunks. Incorporate citations to all context chunks in your answer. "
     "If context is insufficient, say so briefly."
 )
+
+
 def approx_tokens(s: str) -> int:
-    """
-    Very rough char→token approximation used to enforce context budgets.
+    """Very rough char→token approximation used to enforce context budgets.
     Uses ≈4 chars per token, returns at least 1.
     """
     return max(1, len(s) // 4)
 
+
 def pack_context(
-    chunks: List[Dict[str, str]],
-    question: str,
-    model_name: str,
-    *,
-    sys_prompt: str = SYS_PROMPT
-) -> Tuple[str, List[int]]:
-    """
-    Assemble a model-aware context window from ranked chunks, respecting an approximate
+    chunks: list[dict[str, str]], question: str, model_name: str, *, sys_prompt: str = SYS_PROMPT
+) -> tuple[str, list[int]]:
+    """Assemble a model-aware context window from ranked chunks, respecting an approximate
     token budget determined by the target model. Uses the *actual* system prompt for
     budgeting to avoid drift.
 
-    Returns
+    Returns:
     -------
     (context_text, used_indices)
       context_text : str
@@ -3518,8 +3873,8 @@ def pack_context(
     )
     remain = max(0, budget - base_cost)
 
-    blocks: List[str] = []
-    used: List[int] = []
+    blocks: list[str] = []
+    used: list[int] = []
 
     for i, ch in enumerate(chunks, 1):
         meta = []
@@ -3542,9 +3897,11 @@ def pack_context(
     ctx_text = "\n\n".join(blocks) if blocks else "(no context)"
     return ctx_text, used
 
-def answer_with_llm(question, chunks, model, base_url, api_key, max_out_tokens=None, *, sys_prompt: str = SYS_PROMPT):
-    """
-    Call an OpenAI-compatible endpoint to answer using ONLY the provided context.
+
+def answer_with_llm(
+    question, chunks, model, base_url, api_key, max_out_tokens=None, *, sys_prompt: str = SYS_PROMPT
+):
+    """Call an OpenAI-compatible endpoint to answer using ONLY the provided context.
 
     Policy:
       - "o3*" -> Responses API with reasoning.
@@ -3557,10 +3914,12 @@ def answer_with_llm(question, chunks, model, base_url, api_key, max_out_tokens=N
     """
     # Lazy import to avoid hard dependency during build-only runs.
     try:
-        from openai import OpenAI
         import openai
+        from openai import OpenAI
     except Exception as e:
-        raise RuntimeError("[llm] OpenAI client not installed; use --build-only or install 'openai'.") from e
+        raise RuntimeError(
+            "[llm] OpenAI client not installed; use --build-only or install 'openai'."
+        ) from e
 
     client = OpenAI(base_url=base_url, api_key=api_key, timeout=OPENAI_TIMEOUT_SEC)
     m = (model or "").lower()
@@ -3603,13 +3962,24 @@ def answer_with_llm(question, chunks, model, base_url, api_key, max_out_tokens=N
                 except Exception as ee:
                     # If the endpoint doesn't support Responses, surface a clear error.
                     msg = (str(ee) or "").lower()
-                    if any(s in msg for s in (
-                        "404", "not found", "405", "method not allowed",
-                        "responses.create",
-                        "unknown parameter", "unexpected argument", "unrecognized field",
-                        "invalid request body", "schema validation", "unsupported field",
-                        "does not support reasoning", "unsupported parameter 'reasoning'"
-                    )):
+                    if any(
+                        s in msg
+                        for s in (
+                            "404",
+                            "not found",
+                            "405",
+                            "method not allowed",
+                            "responses.create",
+                            "unknown parameter",
+                            "unexpected argument",
+                            "unrecognized field",
+                            "invalid request body",
+                            "schema validation",
+                            "unsupported field",
+                            "does not support reasoning",
+                            "unsupported parameter 'reasoning'",
+                        )
+                    ):
                         raise RuntimeError(
                             f"[llm] The endpoint at {base_url!r} does not support the Responses API "
                             f"for model {model!r}. Use an OpenAI endpoint for o-series (Responses-only), "
@@ -3625,7 +3995,10 @@ def answer_with_llm(question, chunks, model, base_url, api_key, max_out_tokens=N
                     model=model,
                     messages=[
                         {"role": "system", "content": sys_msg},
-                        {"role": "user",   "content": f"QUESTION:\n{question}\n\nCONTEXT:\n{ctx_text}"},
+                        {
+                            "role": "user",
+                            "content": f"QUESTION:\n{question}\n\nCONTEXT:\n{ctx_text}",
+                        },
                     ],
                     temperature=0.2,
                     max_tokens=max_out,
@@ -3638,18 +4011,18 @@ def answer_with_llm(question, chunks, model, base_url, api_key, max_out_tokens=N
             msg = (str(e) or "").lower()
 
             is_overflow = (
-                isinstance(e, getattr(openai, "BadRequestError", tuple())) or
-                "context length" in msg or
-                "maximum context length" in msg or
-                "exceeds context window" in msg or
-                "token limit" in msg or
-                "too many tokens" in msg or
-                "reduce the length of the messages" in msg or
-                "max tokens" in msg or
-                "prompt too long" in msg or
-                "input too long" in msg or
-                "payload too large" in msg or
-                "413" in msg
+                isinstance(e, getattr(openai, "BadRequestError", tuple()))
+                or "context length" in msg
+                or "maximum context length" in msg
+                or "exceeds context window" in msg
+                or "token limit" in msg
+                or "too many tokens" in msg
+                or "reduce the length of the messages" in msg
+                or "max tokens" in msg
+                or "prompt too long" in msg
+                or "input too long" in msg
+                or "payload too large" in msg
+                or "413" in msg
             )
 
             if is_overflow and attempt < 3:
@@ -3667,36 +4040,45 @@ def answer_with_llm(question, chunks, model, base_url, api_key, max_out_tokens=N
             # Not an overflow, or no sensible retry left
             raise
 
+
 # -------------------- Citations: normalize + print only cited --------------------
 # drop-in replacement for renumber_citations()
 _CITATION_BR = re.compile(
-    r"(\[(?:\s*\d+(?:\s*,\s*\d+)*\s*)\])"           # [1] or [1, 3]
+    r"(\[(?:\s*\d+(?:\s*,\s*\d+)*\s*)\])"  # [1] or [1, 3]
     r"|"
-    r"(【(?:\s*\d+(?:\s*[,、，]\s*\d+)*\s*)】)"       # 【2】 or 【1, 3】
+    r"(【(?:\s*\d+(?:\s*[,、，]\s*\d+)*\s*)】)"  # 【2】 or 【1, 3】
 )
+
 
 # -------------------- Main --------------------
 def main():
-    """
-    CLI entry point.
-    """
+    """CLI entry point."""
     # declare BEFORE any references to these names in this function (to satisfy Python rule)
     global PAPER_BATCH, CHUNK_BATCH, CKPT_EVERY
     global DEFAULT_BUSY_TIMEOUT_MS
     global paper_seg_writer, chunk_seg_writer
 
-    ap = argparse.ArgumentParser(description="An air-gapped HPC two-stage RAG pipeline for the PMC-OA corpus")
+    ap = argparse.ArgumentParser(
+        description="An air-gapped HPC two-stage RAG pipeline for the PMC-OA corpus"
+    )
 
-    ap.add_argument("--quiet", action="store_true",
-                    help="Squelch startup banners and section headers for batch logs. "
-                         "Tip: set LITKIT_QUIET=1 to also silence earliest pre-arg prints.")
+    ap.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Squelch startup banners and section headers for batch logs. "
+        "Tip: set LITKIT_QUIET=1 to also silence earliest pre-arg prints.",
+    )
 
     # Allow fractional threshold and honor env if provided
     min_cpp_env = os.environ.get("LITKIT_MIN_CHUNKS_PER_PAPER")
     MIN_CPP_DEFAULT = float(min_cpp_env) if min_cpp_env is not None else 2.0
-    ap.add_argument("--min-chunks-per-paper", type=float, default=MIN_CPP_DEFAULT,
-                     help="If the Stage-1 shortlist is too sparse (avg chunks/paper below this), "
-                         "Stage-2 falls back to global chunk search. Default: env LITKIT_MIN_CHUNKS_PER_PAPER or 2.")
+    ap.add_argument(
+        "--min-chunks-per-paper",
+        type=float,
+        default=MIN_CPP_DEFAULT,
+        help="If the Stage-1 shortlist is too sparse (avg chunks/paper below this), "
+        "Stage-2 falls back to global chunk search. Default: env LITKIT_MIN_CHUNKS_PER_PAPER or 2.",
+    )
 
     ap.add_argument(
         "--version",
@@ -3709,74 +4091,137 @@ def main():
     ap.add_argument(
         "--question-file",
         type=Path,
-        help="Read the question from a text file; use '-' to read from stdin."
+        help="Read the question from a text file; use '-' to read from stdin.",
     )
 
-    ap.add_argument("--hnsw-recall", choices=["normal","high"], default="normal",
-                    help="Preset to bump HNSW recall: 'high' sets M=48, efConstruction=300, efSearch=256.")
+    ap.add_argument(
+        "--hnsw-recall",
+        choices=["normal", "high"],
+        default="normal",
+        help="Preset to bump HNSW recall: 'high' sets M=48, efConstruction=300, efSearch=256.",
+    )
 
-    ap.add_argument("--chunk-target-chars", type=int, default=CHUNK_TARGET_CHARS,
-                    help="Approx target characters per chunk (default 1200).")
-    ap.add_argument("--chunk-min-chars", type=int, default=BODY_MIN_CHARS,
-                    help="Minimum characters per chunk (default 300).")
-    ap.add_argument("--chunk-overlap", type=int, default=CHUNK_OVERLAP_CHARS,
-                    help="Character overlap between consecutive chunks (default 200).")
+    ap.add_argument(
+        "--chunk-target-chars",
+        type=int,
+        default=CHUNK_TARGET_CHARS,
+        help="Approx target characters per chunk (default 1200).",
+    )
+    ap.add_argument(
+        "--chunk-min-chars",
+        type=int,
+        default=BODY_MIN_CHARS,
+        help="Minimum characters per chunk (default 300).",
+    )
+    ap.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=CHUNK_OVERLAP_CHARS,
+        help="Character overlap between consecutive chunks (default 200).",
+    )
 
     ap.add_argument(
         "--max-out-tokens",
         type=int,
         default=None,
-        help="Cap on LLM output tokens. If omitted, defaults to 3000."
+        help="Cap on LLM output tokens. If omitted, defaults to 3000.",
     )
 
-    ap.add_argument("--per-paper-cap", type=int, default=3,
-        help="Max number of chunks per paper in the final context (default: 3)")
+    ap.add_argument(
+        "--per-paper-cap",
+        type=int,
+        default=3,
+        help="Max number of chunks per paper in the final context (default: 3)",
+    )
 
-    ap.add_argument("--reconcile-only", action="store_true",
-        help="Do not scan corpus; only reconcile SQLite in_index flags with FAISS and backfill any missing vectors.")
+    ap.add_argument(
+        "--reconcile-only",
+        action="store_true",
+        help="Do not scan corpus; only reconcile SQLite in_index flags with FAISS and backfill any missing vectors.",
+    )
 
-    ap.add_argument("--lexical-cap", type=int, default=None,
-        help="Max lexical-boost items to interleave into top-k (default = max(5, k//3)).")
-    ap.add_argument("--allow-global-lexical", action="store_true",
-        help="Allow lexical boost without a candidate-paper filter (also respects LITKIT_ALLOW_GLOBAL_LEXICAL=1).")
-    ap.add_argument("--lexical-limit", type=int, default=200,
-        help="SQL LIMIT for lexical candidate scan (default 200).")
+    ap.add_argument(
+        "--lexical-cap",
+        type=int,
+        default=None,
+        help="Max lexical-boost items to interleave into top-k (default = max(5, k//3)).",
+    )
+    ap.add_argument(
+        "--allow-global-lexical",
+        action="store_true",
+        help="Allow lexical boost without a candidate-paper filter (also respects LITKIT_ALLOW_GLOBAL_LEXICAL=1).",
+    )
+    ap.add_argument(
+        "--lexical-limit",
+        type=int,
+        default=200,
+        help="SQL LIMIT for lexical candidate scan (default 200).",
+    )
 
     # stream NXMLs from tar shards (without extraction)
-    ap.add_argument("--tar-dir", type=Path, default=None,
+    ap.add_argument(
+        "--tar-dir",
+        type=Path,
+        default=None,
         help="Directory containing .tar/.tar.gz/.tgz/.tar.bz2/.tar.xz shards; stream without extracting. "
-            "If omitted, uses DEFAULT_TAR_DIR if that directory exists.")
-    ap.add_argument("--tar-manifest", type=Path, default=None,
-        help="Optional newline file of absolute tar paths (one per line). Overrides --tar-dir.")
+        "If omitted, uses DEFAULT_TAR_DIR if that directory exists.",
+    )
+    ap.add_argument(
+        "--tar-manifest",
+        type=Path,
+        default=None,
+        help="Optional newline file of absolute tar paths (one per line). Overrides --tar-dir.",
+    )
 
     # run fully offline for HuggingFace (sets HF_HUB_OFFLINE=1 and TRANSFORMERS_OFFLINE=1 for this process)
-    ap.add_argument("--offline", action="store_true",
-        help="Run in offline mode for HuggingFace (no network); equivalent to HF_HUB_OFFLINE=1 and TRANSFORMERS_OFFLINE=1.")
+    ap.add_argument(
+        "--offline",
+        action="store_true",
+        help="Run in offline mode for HuggingFace (no network); equivalent to HF_HUB_OFFLINE=1 and TRANSFORMERS_OFFLINE=1.",
+    )
 
     # control SQLite journal mode explicitly (TRUNCATE is best on Lustre/NFS)
-    ap.add_argument("--sqlite-journal-mode",
+    ap.add_argument(
+        "--sqlite-journal-mode",
         choices=["TRUNCATE", "WAL"],
         default="TRUNCATE",
-        help="SQLite journal mode; TRUNCATE recommended for shared filesystems.")
-    
-    ap.add_argument("--sqlite-busy-timeout-ms",
-    type=int,
-    default=DEFAULT_BUSY_TIMEOUT_MS,
-    help="SQLite busy timeout in milliseconds (both Python connect() and PRAGMA busy_timeout). "
-         "Use higher values (e.g., 120000–300000) on NFS/Lustre with shared writers.")
+        help="SQLite journal mode; TRUNCATE recommended for shared filesystems.",
+    )
 
-    ap.add_argument("--build-only", action="store_true", help="Only (re)build indexes; do not run a query")
+    ap.add_argument(
+        "--sqlite-busy-timeout-ms",
+        type=int,
+        default=DEFAULT_BUSY_TIMEOUT_MS,
+        help="SQLite busy timeout in milliseconds (both Python connect() and PRAGMA busy_timeout). "
+        "Use higher values (e.g., 120000–300000) on NFS/Lustre with shared writers.",
+    )
+
+    ap.add_argument(
+        "--build-only", action="store_true", help="Only (re)build indexes; do not run a query"
+    )
     ap.add_argument("--update", action="store_true", help="Append-only update (skip seen files)")
-    ap.add_argument("--rebuild", action="store_true", help="Wipe DB & indices; full rebuild (asks for confirmation in TTY)")
-    ap.add_argument("-y", "--yes", action="store_true",
-                    help="Skip confirmation prompts (for automation). Equivalent to LITKIT_ASSUME_YES=1.")
+    ap.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Wipe DB & indices; full rebuild (asks for confirmation in TTY)",
+    )
+    ap.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Skip confirmation prompts (for automation). Equivalent to LITKIT_ASSUME_YES=1.",
+    )
 
     # index types / params
     ap.add_argument("--papers-index", choices=["hnsw", "flat"], default="hnsw")
     ap.add_argument("--hnsw-m", type=int, default=32)
     ap.add_argument("--efsearch", type=int, default=128)
-    ap.add_argument("--efconstruction", type=int, default=200,
-                help="HNSW build-time efConstruction (higher improves recall at build time)")
+    ap.add_argument(
+        "--efconstruction",
+        type=int,
+        default=200,
+        help="HNSW build-time efConstruction (higher improves recall at build time)",
+    )
 
     ap.add_argument("--chunks-index", choices=["ivfpq", "flat"], default="ivfpq")
     ap.add_argument("--ivf-nlist", type=int, default=16384)
@@ -3784,36 +4229,41 @@ def main():
     ap.add_argument(
         "--nprobe",
         type=int,
-        default=None, # None means: auto = ~sqrt(nlist) at search-time
-        help="IVF probe count. If omitted, set dynamically to ~sqrt(nlist) (clamped to [8,512])."
+        default=None,  # None means: auto = ~sqrt(nlist) at search-time
+        help="IVF probe count. If omitted, set dynamically to ~sqrt(nlist) (clamped to [8,512]).",
     )
 
     # batching / limits
     ap.add_argument("--paper-batch", type=int, default=PAPER_BATCH)
     ap.add_argument("--chunk-batch", type=int, default=CHUNK_BATCH)
-    ap.add_argument("--ckpt-every", type=int, default=CKPT_EVERY, help="Checkpoint scan progress every N files")
+    ap.add_argument(
+        "--ckpt-every", type=int, default=CKPT_EVERY, help="Checkpoint scan progress every N files"
+    )
 
-    ap.add_argument("--force-embed-devices", action="store_true",
-        help="Allow loose device tokens (e.g., 'cuda:1'); otherwise invalid tokens error out.")
+    ap.add_argument(
+        "--force-embed-devices",
+        action="store_true",
+        help="Allow loose device tokens (e.g., 'cuda:1'); otherwise invalid tokens error out.",
+    )
 
     # retrieval sizes
     ap.add_argument(
         "--top-papers",
         type=int,
         default=None,  # adaptive if not provided
-        help=f"Stage-1 shortlist size (papers). Default {TOP_PAPERS_DEFAULT} if omitted."
+        help=f"Stage-1 shortlist size (papers). Default {TOP_PAPERS_DEFAULT} if omitted.",
     )
     ap.add_argument(
         "--top-chunks",
         type=int,
         default=TOP_CHUNKS_DEFAULT,
-        help=f"Stage-2 final chunk count passed to LLM (default {TOP_CHUNKS_DEFAULT})."
+        help=f"Stage-2 final chunk count passed to LLM (default {TOP_CHUNKS_DEFAULT}).",
     )
     ap.add_argument(
         "--overshoot",
         type=int,
         default=OVERSHOOT_DEFAULT,
-        help=f"Stage-2 ANN overshoot multiplier before filtering by candidate papers (default {OVERSHOOT_DEFAULT})."
+        help=f"Stage-2 ANN overshoot multiplier before filtering by candidate papers (default {OVERSHOOT_DEFAULT}).",
     )
 
     # shard fanout (for builders/readers)
@@ -3821,35 +4271,68 @@ def main():
     ap.add_argument("--num-shards", type=int, default=1, help="Total number of shards.")
 
     # writer / producer role
-    ap.add_argument("--faiss-writer", action="store_true",
-                    help="This process is allowed to mutate and save FAISS indices.")
-    ap.add_argument("--embed-producer", action="store_true",
-                    help="Producer mode: embed chunks to on-disk segments instead of mutating FAISS.")
-    ap.add_argument("--consume-segments", action="store_true",
-                    help="Writer: also consume any pending segment files at the end of a build.")
-    ap.add_argument("--embed-outdir", type=Path, default=None,
-                    help="Directory for chunk embedding segments (producer output / writer input). "
-                         "Defaults to LITKIT_HOME/emb_segments if omitted.")
+    ap.add_argument(
+        "--faiss-writer",
+        action="store_true",
+        help="This process is allowed to mutate and save FAISS indices.",
+    )
+    ap.add_argument(
+        "--embed-producer",
+        action="store_true",
+        help="Producer mode: embed chunks to on-disk segments instead of mutating FAISS.",
+    )
+    ap.add_argument(
+        "--consume-segments",
+        action="store_true",
+        help="Writer: also consume any pending segment files at the end of a build.",
+    )
+    ap.add_argument(
+        "--embed-outdir",
+        type=Path,
+        default=None,
+        help="Directory for chunk embedding segments (producer output / writer input). "
+        "Defaults to LITKIT_HOME/emb_segments if omitted.",
+    )
 
     # embedder knobs
-    ap.add_argument("--embed-devices", type=str, default="auto",
-                    help='Devices for SBERT (e.g. "auto", "cpu", "mps", "cuda:0,cuda:1").')
-    ap.add_argument("--embed-workers", type=int, default=1,
-                    help="Number of worker processes for multi-GPU SBERT (one typically per CUDA device).")
-    ap.add_argument("--paper-embed-bs", type=int, default=16,
-                    help="Batch size for SPECTER2 (papers).")
-    ap.add_argument("--chunk-embed-bs", type=int, default=64,
-                    help="Batch size for SBERT (chunks).")
+    ap.add_argument(
+        "--embed-devices",
+        type=str,
+        default="auto",
+        help='Devices for SBERT (e.g. "auto", "cpu", "mps", "cuda:0,cuda:1").',
+    )
+    ap.add_argument(
+        "--embed-workers",
+        type=int,
+        default=1,
+        help="Number of worker processes for multi-GPU SBERT (one typically per CUDA device).",
+    )
+    ap.add_argument(
+        "--paper-embed-bs", type=int, default=16, help="Batch size for SPECTER2 (papers)."
+    )
+    ap.add_argument("--chunk-embed-bs", type=int, default=64, help="Batch size for SBERT (chunks).")
 
     # LLM options
-    ap.add_argument("--llm-model", type=str, default=DEFAULT_LLM_MODEL,
-                    help=f"LLM to use (default {DEFAULT_LLM_MODEL}).")
-    ap.add_argument("--openai-base-url", type=str, default=None,
-                    help="Override OpenAI-compatible base URL.")
-    ap.add_argument("--openai-api-key", type=str, default=None,
-                    help="Override OpenAI API key (or local endpoint token).")
-    ap.add_argument("--no-llm", action="store_true",
-                    help="Run retrieval only and print selected context; do not call an LLM.")
+    ap.add_argument(
+        "--llm-model",
+        type=str,
+        default=DEFAULT_LLM_MODEL,
+        help=f"LLM to use (default {DEFAULT_LLM_MODEL}).",
+    )
+    ap.add_argument(
+        "--openai-base-url", type=str, default=None, help="Override OpenAI-compatible base URL."
+    )
+    ap.add_argument(
+        "--openai-api-key",
+        type=str,
+        default=None,
+        help="Override OpenAI API key (or local endpoint token).",
+    )
+    ap.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Run retrieval only and print selected context; do not call an LLM.",
+    )
 
     args = ap.parse_args()
 
@@ -3863,7 +4346,7 @@ def main():
 
     PAPER_BATCH = int(args.paper_batch)
     CHUNK_BATCH = int(args.chunk_batch)
-    CKPT_EVERY  = int(args.ckpt_every)
+    CKPT_EVERY = int(args.ckpt_every)
 
     # Windows gating
     if not FLOCK_AVAILABLE and sys.platform.startswith("win"):
@@ -3883,7 +4366,10 @@ def main():
     if (not FLOCK_AVAILABLE and sys.platform.startswith("win")) or _ADVISORY_LOCK_DISABLED:
         global _ADVISORY_LOCK_NOTICE_PRINTED
         if not _ADVISORY_LOCK_NOTICE_PRINTED:
-            print("[lock] advisory locking disabled on this filesystem; proceeding best-effort", flush=True)
+            print(
+                "[lock] advisory locking disabled on this filesystem; proceeding best-effort",
+                flush=True,
+            )
             _ADVISORY_LOCK_NOTICE_PRINTED = True
 
     _create_writer_guard_or_exit(args)
@@ -3905,19 +4391,28 @@ def main():
                 paper_index = _faiss_load(PAPER_INDEX_PATH)
                 chunk_index = _faiss_load(CHUNK_INDEX_PATH)
             except FileNotFoundError:
-                sys.stderr.write("[reconcile] FAISS index files not found; run a build first (e.g., --faiss-writer --build-only)\n")
+                sys.stderr.write(
+                    "[reconcile] FAISS index files not found; run a build first (e.g., --faiss-writer --build-only)\n"
+                )
                 return
             p_reset, c_reset = reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index)
             if p_reset or c_reset:
                 print(f"[reconcile] reset flags — papers={p_reset} chunks={c_reset}")
             # backfill (uses current embedders)
-            paper_embedder = PaperEmbedderSpecter2()            
+            paper_embedder = PaperEmbedderSpecter2()
             chunk_embedder = ChunkEmbedderSBERT(
-                devices=_resolve_embed_devices(args.embed_devices, force=args.force_embed_devices),
-                workers=args.embed_workers
+                devices=resolve_embed_devices(args.embed_devices, force=args.force_embed_devices),
+                workers=args.embed_workers,
             )
-            backfill_unindexed_vectors(conn, paper_embedder, chunk_embedder, paper_index, chunk_index,
-                                    paper_bs=args.paper_embed_bs, chunk_bs=args.chunk_embed_bs)
+            backfill_unindexed_vectors(
+                conn,
+                paper_embedder,
+                chunk_embedder,
+                paper_index,
+                chunk_index,
+                paper_bs=args.paper_embed_bs,
+                chunk_bs=args.chunk_embed_bs,
+            )
             with FileLock(FAISS_LOCK):
                 _faiss_save_force(paper_index, PAPER_INDEX_PATH)
                 _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
@@ -3927,7 +4422,7 @@ def main():
 
     if args.embed_producer:
         outdir = args.embed_outdir or EMBED_SEGMENTS_DIR
-        producer_id = f"{socket.gethostname()}-{os.getpid()}"
+        # producer_id = f"{socket.gethostname()}-{os.getpid()}"
 
         paper_seg_writer = _SegmentWriter(
             outdir=outdir,
@@ -3968,7 +4463,7 @@ def main():
         # No query: we're done if this was build-only, else print a hint
         if args.build_only or args.update or args.rebuild:
             return
-        print("No question provided. Example:\n  python -m litkit \"What is BioNetGen?\"")
+        print('No question provided. Example:\n  python -m litkit "What is BioNetGen?"')
         return
 
     # -------- Retrieval pipeline --------
@@ -3978,11 +4473,13 @@ def main():
         question=question,
         k=int(k_papers),
         efsearch=int(args.efsearch or 128),
-        embedder=None  # constructed lazily inside
+        embedder=None,  # constructed lazily inside
     )
 
     if not papers:
-        print("[info] no candidate papers found; consider enabling --allow-global-lexical or lowering --min-chunks-per-paper")
+        print(
+            "[info] no candidate papers found; consider enabling --allow-global-lexical or lowering --min-chunks-per-paper"
+        )
         return
 
     chunk_ids, meta = search_chunks_constrained(
@@ -3999,7 +4496,9 @@ def main():
     )
 
     if not chunk_ids:
-        print("[info] no chunks found; consider lowering --min-chunks-per-paper or enabling --allow-global-lexical")
+        print(
+            "[info] no chunks found; consider lowering --min-chunks-per-paper or enabling --allow-global-lexical"
+        )
         return
 
     conn = _connect_db()
@@ -4020,7 +4519,7 @@ def main():
 
     # -------- LLM call (strict RAG prompt) --------
     base_url = args.openai_base_url or _default_base_url_for(args.llm_model)
-    api_key  = args.openai_api_key  or _default_api_key_for(args.llm_model)
+    api_key = args.openai_api_key or _default_api_key_for(args.llm_model)
 
     ctx_text, used_idx = pack_context(chunks, question, args.llm_model)
     selected_chunks = [chunks[i - 1] for i in used_idx]  # 0-based indexing
@@ -4032,7 +4531,7 @@ def main():
             base_url=base_url,
             api_key=api_key,
             max_out_tokens=args.max_out_tokens,
-            sys_prompt=SYS_PROMPT
+            sys_prompt=SYS_PROMPT,
         )
     except Exception as e:
         sys.stderr.write(f"[llm] ERROR: {e}\n")
@@ -4046,7 +4545,7 @@ def main():
         print(answer)
         print()
         print(render_references(doc_refs))
-        print()  
+        print()
     else:
         # No model output -> print the context
         print("CONTEXT")
@@ -4054,6 +4553,7 @@ def main():
         print(ctx_text)
         print("=" * 80)
         print(f"[info] used {len(used_idx)} chunks; meta={meta}")
+
 
 if __name__ == "__main__":
     main()
