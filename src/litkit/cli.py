@@ -54,6 +54,12 @@ from litkit.ingest.ingest import (
     iter_tar_xml_streams,
     parse_xml_fileobj,
 )
+from litkit.embeddings.hf_local import (
+    ensure_offline_env,
+    local_snapshot_dir,
+    find_any,
+    load_auto_or_fallback,
+)
 
 configure_threads()
 DEVICE = detect_device()
@@ -120,23 +126,69 @@ def _create_writer_guard_or_exit(args):
         sys.exit(2)
 
 
-# -------------------- Paths & offline env --------------------
-SCRIPT_DIR = Path(__file__).resolve().parent
-# Allow override of working root (for writes) to a writable shared path.
-# All writable artifacts (sqlite/, indices/, hf_cache/, checkpoints/locks)
-# will go under this root if LITKIT_HOME is set.
-ROOT = Path(os.environ.get("LITKIT_HOME", str(SCRIPT_DIR))).resolve()
+# -- Paths / offline env --
 
-# Location for tar/tar.gz shards (streamed, no extraction).
-DEFAULT_TAR_DIR = SCRIPT_DIR / "tar_shards"
+def _find_root() -> Path:
+    """Return path to the repository root directory."""
+    here = Path(__file__).resolve().parent
+    for p in [here] + list(here.parents):
+        if (p / ".git").exists() or (p / "pyproject.toml").exists():
+            return p
+    # Expected package layout: <repo>/src/litkit/cli.py
+    try:
+        return here.parents[1]  # fallback is <repo> (based on expected package layout)
+    except IndexError:
+        return here
 
-HF_HOME = ROOT / "hf_cache"
-SQLITE_DIR = ROOT / "sqlite"
-INDICES_DIR = ROOT / "indices"
 
-# ---- Embedding segment pipeline (producer→writer) ----
-# Default outdir for embedding segments (only used if --embed-outdir is set or this dir exists).
-EMBED_SEGMENTS_DIR = ROOT / "emb_segments"
+def _resolve_input_dir(root: Path) -> Path | None:
+    """Return path to the input directory."""
+    env = os.getenv("LITKIT_INPUT")
+    if env:
+        return Path(env).expanduser()
+    sib = root.parent / "litkit_input"  # in the same directory as the repo
+    return sib if sib.exists() else None
+
+
+def _resolve_workspace(root: Path) -> Path:
+    """Return path to the workspace directory."""
+    ws = os.getenv("LITKIT_WORKSPACE")
+    return Path(ws).expanduser() if ws else (root / "workspace")
+
+
+ROOT = _find_root()
+INPUT_DIR = _resolve_input_dir(ROOT)
+WORKSPACE = _resolve_workspace(ROOT)
+
+# Report path to input directory
+if (os.environ.get("LITKIT_INPUT") and not QUIET:
+    print(f"[paths] using env (LITKIT_INPUT) path -> {INPUT_DIR} for source of .tar.gz files")
+elif not QUIET:
+    print(f"[paths] using default path -> {INPUT_DIR} for source of .tar.gz files")
+
+# Report path to workspace
+if (os.environ.get("LITKIT_WORKSPACE") and not QUIET:
+    print(f"[paths] using env (LITKIT_WORKSPACE) path -> {WORKSPACE} for artifacts")
+elif not QUIET:
+    print(f"[paths] using default path -> {WORKSPACE} for artifacts")
+
+HF_HOME = WORKSPACE / "hf_cache"        # location of HF models
+SQLITE_DIR = WORKSPACE / "sqlite"       # location of SQLite DB
+INDICES_DIR = WORKSPACE / "indices"     # location of FAISS indices for papers and chunks
+
+# Where to look for .tar/.tar.gz shards
+#   If user provided a litkit_input, use that.
+#   Otherwise, fall back to <workspace>/tar_shards.
+TAR_DIR = INPUT_DIR if INPUT_DIR else (WORKSPACE / "tar_shards")
+
+# Temporary storage for embedding segments from producers
+#   This setting is only used if --embed-dir is set.
+EMBED_SEGMENTS_DIR = WORKSPACE / "emb_segments"
+
+os.environ.setdefault("HF_HOME", str(HF_HOME))
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # Reasonable defaults for large Lustre/NFS runs:
 # ~131,072 vectors/segment ≈ 0.4 GB per file (fp32, dim=768). Half that if stored as fp16.
@@ -152,16 +204,12 @@ try:
 except Exception as e:
     sys.stderr.write(
         f"[paths] ERROR: cannot create {SQLITE_DIR} or {INDICES_DIR}: {e}\n"
-        "[paths] Set LITKIT_HOME to a writable Lustre/NFS path and re-run.\n"
+        "[paths] Set LITKIT_WORKSPACE to a writable Lustre/NFS path and re-run.\n"
     )
     sys.exit(2)
 
 DB_PATH = SQLITE_DIR / "brag.sqlite3"
 CKPT_PATH = SQLITE_DIR / "build_checkpoint.json"
-
-# Optional: friendly notice when LITKIT_HOME is in use
-if os.environ.get("LITKIT_HOME") and not QUIET:
-    print(f"[paths] LITKIT_HOME set → using {ROOT} for sqlite/, indices/, hf_cache/")
 
 
 class FileLock:
@@ -207,12 +255,6 @@ WRITER_GUARD = SQLITE_DIR / "faiss_writer.guard"
 _ADVISORY_LOCK_DISABLED = False
 _ADVISORY_LOCK_NOTICE_PRINTED = False
 
-# Offline and tokenizer behavior defaults (quiet & no hub access).
-os.environ.setdefault("HF_HOME", str(HF_HOME))
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
 # Producer-mode segment writers (set in main)
 chunk_seg_writer = None
 paper_seg_writer = None
@@ -231,9 +273,9 @@ OPENAI_TIMEOUT_SEC = int(os.environ.get("LITKIT_OPENAI_TIMEOUT_SEC", "15"))
 def _default_base_url_for(model: str) -> str:
     """Resolve a sensible default OpenAI-compatible base URL based on model name.
 
-    - "gpt-oss:*" → local endpoints (e.g., LM Studio) at http://localhost:1234/v1
-    - "o3*"       → official OpenAI endpoint
-    - otherwise   → default to local endpoint to keep offline-friendly behavior
+    - "gpt-oss:*" -> local endpoints (e.g., LM Studio) at http://localhost:1234/v1
+    - "o3*"       -> official OpenAI endpoint
+    - otherwise   -> default to local endpoint to keep offline-friendly behavior
     """
     m = model.lower()
     if m.startswith("gpt-oss"):  # LM Studio local OpenAI-compatible
@@ -526,52 +568,6 @@ def _dedupe_ids_and_texts(ids: list[int], texts: list[str]) -> tuple[list[int], 
         out_ids.append(i)
         out_texts.append(t)
     return out_ids, out_texts
-
-
-# -------------------- HF local snapshot helpers --------------------
-
-
-def _hf_repo_root(repo_id: str) -> Path:
-    """Return the preferred local HF root; fall back to script-local cache."""
-    sub = f"models--{repo_id.replace('/', '--')}"
-    # prefer HF_HOME from env if set; else fall back to the Path-valued HF_HOME constant
-    hf_home = Path(os.getenv("HF_HOME", str(HF_HOME)))
-    primary = hf_home / "hub" / sub
-    if (primary / "snapshots").exists() or (primary / "refs").exists():
-        return primary
-    # fallback: script-local ./hf_cache/hub
-    return SCRIPT_DIR / "hf_cache" / "hub" / sub
-
-
-def _local_snapshot_dir(repo_id: str) -> Path:
-    root = _hf_repo_root(repo_id)
-    snaps = root / "snapshots"
-    refs = root / "refs" / "main"
-    if refs.exists():
-        commit = refs.read_text().strip()
-        p = snaps / commit
-        if p.exists():
-            return p
-        raise FileNotFoundError(f"refs/main points to {commit} but snapshot missing under {snaps}")
-    if snaps.exists():
-        candidates = [d for d in snaps.iterdir() if d.is_dir()]
-        if len(candidates) == 1:
-            return candidates[0]
-        # Multiple snapshots and no ref: do not guess by mtime across nodes
-        raise FileNotFoundError(
-            f"Multiple snapshots for {repo_id} but no refs/main."
-            f"Create refs/main or delete stale snapshots under {snaps}."
-        )
-    raise FileNotFoundError(f"No local snapshot found for {repo_id} under {root}")
-
-
-def _find_any(root: Path, names: list[str]) -> Path | None:
-    """Return the first existing file among `names` under `root`, else None."""
-    for n in names:
-        p = root / n
-        if p.exists():
-            return p
-    return None
 
 
 # -------------------- Embedders --------------------
@@ -1082,142 +1078,18 @@ class EmbeddingPool:
 
 
 class PaperEmbedderSpecter2:
-    """SPECTER2 encoder over concatenated title+abstract, fully offline.
-
-    The constructor prefers the standard Auto* loader; if that fails in an
-    air-gapped snapshot, it heuristically falls back to BERT/Roberta/MPNet
-    model+tokenizer classes using local files only.
-    """
-
     def __init__(self):
-        local_path = _local_snapshot_dir(SPECTER2_ID)
+        local_path = local_snapshot_dir(SPECTER2_ID)
         self.dim = 768
-        self.ok = False
-        try:
-            self.tok = AutoTokenizer.from_pretrained(
-                str(local_path), local_files_only=True, trust_remote_code=False
-            )
-            self.model = AutoModel.from_pretrained(
-                str(local_path), local_files_only=True, trust_remote_code=False
-            ).to(DEVICE)
-            self.model.eval()
-            self.ok = True
-        except Exception:
-            # Fallback: manually detect architecture by available local files.
-            pass
-        if not self.ok:
-            tok_json = local_path / "tokenizer.json"
-            vocab_txt = local_path / "vocab.txt"
-            merges_txt = local_path / "merges.txt"
-            roberta_vocab = local_path / "vocab.json"
-            spiece = _find_any(local_path, ["spiece.model", "sentencepiece.bpe.model"])
-            arch = None
-            if tok_json.exists() and roberta_vocab.exists() and merges_txt.exists():
-                arch = "roberta"
-            elif roberta_vocab.exists() and merges_txt.exists():
-                arch = "roberta"
-            elif vocab_txt.exists():
-                arch = "bert"
-            elif spiece is not None:
-                arch = "mpnet"
-
-            if arch == "bert":
-                cfg = BertConfig.from_pretrained(str(local_path), local_files_only=True)
-                tok_json = local_path / "tokenizer.json"
-                if tok_json.exists():
-                    self.tok = BertTokenizerFast(tokenizer_file=str(tok_json))
-                else:
-                    self.tok = BertTokenizerFast(vocab_file=str(vocab_txt))
-                self.model = BertModel.from_pretrained(
-                    str(local_path), config=cfg, local_files_only=True
-                ).to(DEVICE)
-
-            elif arch == "roberta":
-                cfg = RobertaConfig.from_pretrained(str(local_path), local_files_only=True)
-                tok_json = local_path / "tokenizer.json"
-                if tok_json.exists():
-                    self.tok = RobertaTokenizerFast(tokenizer_file=str(tok_json))
-                else:
-                    self.tok = RobertaTokenizerFast(
-                        vocab_file=str(roberta_vocab), merges_file=str(merges_txt)
-                    )
-                self.model = RobertaModel.from_pretrained(
-                    str(local_path), config=cfg, local_files_only=True
-                ).to(DEVICE)
-
-            elif arch == "mpnet":
-                cfg = MPNetConfig.from_pretrained(str(local_path), local_files_only=True)
-                self.tok = MPNetTokenizerFast.from_pretrained(
-                    str(local_path), local_files_only=True
-                )
-                self.model = MPNetModel.from_pretrained(
-                    str(local_path), config=cfg, local_files_only=True
-                ).to(DEVICE)
-            else:
-                raise FileNotFoundError(
-                    "[offline] Could not load SPECTER2 from local snapshots.\n"
-                    f"Checked: {local_path}\n"
-                    "Expected to find one of: tokenizer.json, vocab.txt (BERT), "
-                    "vocab.json + merges.txt (RoBERTa), or sentencepiece model (MPNet).\n"
-                    "Fix: place a complete offline snapshot at HF_HOME/hub/models--allenai--specter2_base/"
-                    "snapshots/<commit>/ and re-run with HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1."
-                )
-
-            self.model.eval()
-
-    # def encode(self, texts: List[str], progress_label: Optional[str] = None, batch_size: Optional[int] = None) -> np.ndarray:
-    def encode(
-        self,
-        texts: list[str],
-        progress_label: str | None = None,
-        batch_size: int | None = None,
-        progress_done_summary: bool = True,
-    ) -> np.ndarray:
-        """Encode a list of texts into L2-normalized embeddings (float32, N x 768).
-        If progress_label is provided, render a single in-place line from 0 -> N, ending with a newline.
-        """
-        if not texts:
-            return np.zeros((0, self.dim), dtype="float32")
-
-        embs = []
-        bs = int(batch_size or (16 if DEVICE == "cuda" else 8))
-        total = len(texts)
-
-        render = (
-            _inline_progress_renderer(
-                progress_label or "Embedding papers", total, done_summary=progress_done_summary
-            )
-            if progress_label
-            else None
-        )
-        if render:
-            render(0)
-
-        with torch.no_grad():
-            for i in range(0, total, bs):
-                batch = texts[i : i + bs]
-                toks = self.tok(
-                    batch, padding=True, truncation=True, max_length=512, return_tensors="pt"
-                ).to(DEVICE)
-                out = self.model(**toks)
-                cls = out.last_hidden_state[:, 0, :]
-                cls = torch.nn.functional.normalize(cls, p=2, dim=1)
-                embs.append(cls.detach().cpu().numpy().astype("float32"))
-
-                if render:
-                    render(min(total, i + len(batch)))
-
-        if render:
-            render(total, final=True)
-
-        return np.vstack(embs) if embs else np.zeros((0, self.dim), dtype="float32")
+        self.tok, self.model = load_auto_or_fallback(local_path, device=DEVICE)
+        self.model.eval()
 
 
 class ChunkEmbedderSBERT:
     """SentenceTransformers all-mpnet-base-v2, offline, returns normalized vectors."""
 
     def __init__(self, devices: list[str] | None = None, workers: int = 1):
-        local_path = _local_snapshot_dir(SBERT_ID)
+        local_path = local_snapshot_dir(SBERT_ID)
         self.devices = devices or [DEVICE]
         self.workers = int(workers)
         # Cap device fanout by embed_workers if > 0
@@ -4163,8 +4035,8 @@ def main():
         "--tar-dir",
         type=Path,
         default=None,
-        help="Directory containing .tar/.tar.gz/.tgz/.tar.bz2/.tar.xz shards; stream without extracting. "
-        "If omitted, uses DEFAULT_TAR_DIR if that directory exists.",
+        help="Directory containing .tar/.tar.gz shards; stream without extracting. "
+        "If omitted, uses TAR_DIR if that directory exists.",
     )
     ap.add_argument(
         "--tar-manifest",
@@ -4291,7 +4163,7 @@ def main():
         type=Path,
         default=None,
         help="Directory for chunk embedding segments (producer output / writer input). "
-        "Defaults to LITKIT_HOME/emb_segments if omitted.",
+        "Defaults to WORKSPACE/emb_segments if omitted.",
     )
 
     # embedder knobs
@@ -4438,14 +4310,14 @@ def main():
             shard_id=args.shard_id,
         )
 
-    # abort if there is no setting for --tar-dir or --tar-manifest and DEFAULT_TAR_DIR is absent
-    if args.tar_dir is None and DEFAULT_TAR_DIR.exists():
-        args.tar_dir = DEFAULT_TAR_DIR
+    # abort if there is no setting for --tar-dir or --tar-manifest and TAR_DIR is absent
+    if args.tar_dir is None and TAR_DIR.exists():
+        args.tar_dir = TAR_DIR
 
     if args.tar_dir is None and args.tar_manifest is None:
         raise SystemExit(
             "tar-only mode: please provide --tar-dir (or --tar-manifest). "
-            "You can also create ./tar_shards to use the default."
+            "You can also create ./workspace/tar_shards or set LITKIT_INPUT."
         )
 
     # If user asked to build (explicitly) or a rebuild/update is needed, do that first

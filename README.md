@@ -202,7 +202,7 @@ Notes:
 
 ```bash
 # Writable base (shared or node-local). All sqlite/, indices/, hf_cache/ go here.
-export LITKIT_HOME=/lustre/$USER/brag
+export LITKIT_WORKSPACE=/lustre/$USER/litkit
 
 # Optional: make logs quieter on giant tar.gz shards
 export LITKIT_TAR_RENDER_SEC=30      # progress refresh every N seconds (default: 5)
@@ -284,24 +284,25 @@ python -m litkit   --offline   --llm-model gpt-oss:20b   --openai-base-url http:
 
 ---
 
-## Writable work directory (`LITKIT_HOME`)
+## Writable work directory (`LITKIT_WORKSPACE`)
 
 By default, the script writes to folders next to the script (`sqlite/`, `indices/`, `hf_cache/`).  
-On HPC or shared environments, you can redirect these writable artifacts by setting:
+On HPC, you specify the destintion of writable artifacts by setting:
 
 ```bash
-export LITKIT_HOME=/lustre/$USER/brag   # or any writable Lustre/NFS path
+export LITKIT_WORKSPACE=/lustre/$USER/litkit   # or any writable Lustre/NFS path
 ```
 
-When set, the following directories are created under `$LITKIT_HOME`:
+When set, the following directories are created under `$LITKIT_WORKSPACE`:
 
 - `sqlite/`   (SQLite DB, checkpoints, locks)  
 - `indices/`  (FAISS indices)  
-- `hf_cache/` (optional local HF snapshots for offline runs)
+- `hf_cache/` (local HF snapshots for offline runs)
+- `emb_segments/` (embedding segments)
 
 **Important:**
 
-- `LITKIT_HOME` should point to a writable Lustre/NFS (shared) or node‑local path.
+- `LITKIT_WORKSPACE` should point to a writable Lustre/NFS (shared) or node‑local path.
 - On shared filesystems, prefer `--sqlite-journal-mode TRUNCATE` (see SQLite guidance).
 
 ---
