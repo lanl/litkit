@@ -55,9 +55,7 @@ from litkit.ingest.ingest import (
     parse_xml_fileobj,
 )
 from litkit.embeddings.hf_local import (
-    ensure_offline_env,
     local_snapshot_dir,
-    find_any,
     load_auto_or_fallback,
 )
 
@@ -79,13 +77,13 @@ except ModuleNotFoundError:
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
 
-def main(argv=None) -> int:
-    # parse args, do work, return 0/1
-    return 0
+# def main(argv=None) -> int:
+#     # parse args, do work, return 0/1
+#     return 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+# if __name__ == "__main__":
+#     raise SystemExit(main())
 
 
 def _effective_nlist(n_train: int, requested_nlist: int, min_nlist: int = 16) -> int:
@@ -161,13 +159,13 @@ INPUT_DIR = _resolve_input_dir(ROOT)
 WORKSPACE = _resolve_workspace(ROOT)
 
 # Report path to input directory
-if (os.environ.get("LITKIT_INPUT") and not QUIET:
+if os.environ.get("LITKIT_INPUT") and not QUIET:
     print(f"[paths] using env (LITKIT_INPUT) path -> {INPUT_DIR} for source of .tar.gz files")
 elif not QUIET:
     print(f"[paths] using default path -> {INPUT_DIR} for source of .tar.gz files")
 
 # Report path to workspace
-if (os.environ.get("LITKIT_WORKSPACE") and not QUIET:
+if os.environ.get("LITKIT_WORKSPACE") and not QUIET:
     print(f"[paths] using env (LITKIT_WORKSPACE) path -> {WORKSPACE} for artifacts")
 elif not QUIET:
     print(f"[paths] using default path -> {WORKSPACE} for artifacts")
