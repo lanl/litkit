@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional, Tuple
 
 
 def ensure_offline_env(hf_home: str | Path | None = None) -> Path:
@@ -80,7 +79,7 @@ def local_snapshot_dir(
     raise FileNotFoundError(f"No local snapshot found for {repo_id} under {root}")
 
 
-def find_any(root: Path, names: list[str]) -> Optional[Path]:
+def find_any(root: Path, names: list[str]) -> Path | None:
     """Return the first existing file among `names` under `root`, else None."""
     for n in names:
         p = root / n
@@ -89,7 +88,7 @@ def find_any(root: Path, names: list[str]) -> Optional[Path]:
     return None
 
 
-def _detect_arch(local_path: Path) -> Optional[str]:
+def _detect_arch(local_path: Path) -> str | None:
     """Infer BERT / RoBERTa / MPNet by files present in `local_path`."""
     tok_json = local_path / "tokenizer.json"
     vocab_txt = local_path / "vocab.txt"
@@ -108,7 +107,7 @@ def _detect_arch(local_path: Path) -> Optional[str]:
     return None
 
 
-def load_auto_or_fallback(local_path: Path, device: str = "cpu") -> Tuple[object, object]:
+def load_auto_or_fallback(local_path: Path, device: str = "cpu") -> tuple[object, object]:
     """Load (tokenizer, model) from a local snapshot directory.
 
     Strategy:

@@ -42,9 +42,30 @@ from pathlib import Path
 # Third-party import used early in XML parsing utilities.
 # from lxml import etree
 from types import SimpleNamespace
-from typing import Optional
 
+from litkit.embeddings.base import (
+    _PROGRESS_LOCK as _PROGRESS_LOCK,  # reuse the shared lock
+)
+from litkit.embeddings.base import (
+    Embedder,  # protocol for type hints
+    )
+from litkit.embeddings.base import (
+    inline_progress_renderer as _inline_progress_renderer,
+)
+from litkit.embeddings.base import (
+    progress_is_append as _progress_is_append,
+)
+from litkit.embeddings.base import (
+    progress_newline as _progress_newline,
+)
+from litkit.embeddings.base import (
+    progress_write as _progress_write,
+)
 from litkit.embeddings.devices import configure_threads, detect_device, resolve_embed_devices
+from litkit.embeddings.hf_local import (
+    load_auto_or_fallback,
+    local_snapshot_dir,
+)
 from litkit.formatting.answers import (
     normalize_answer_and_build_refs,
     render_references,
@@ -55,10 +76,6 @@ from litkit.ingest.ingest import (
     iter_tar_paths,
     iter_tar_xml_streams,
     parse_xml_fileobj,
-)
-from litkit.embeddings.hf_local import (
-    local_snapshot_dir,
-    load_auto_or_fallback,
 )
 
 configure_threads()
@@ -160,7 +177,7 @@ def _find_root() -> Path:
 
 def _resolve_workspace(root: Path) -> Path:
     """Return path to the workspace directory."""
-    ws = os.getenv("LITKIT_WORKSPACE") 
+    ws = os.getenv("LITKIT_WORKSPACE")
     return Path(ws).expanduser().resolve() if ws else (root / "workspace").resolve()
 
 
@@ -592,70 +609,8 @@ except Exception:
 
 import torch
 from sentence_transformers import SentenceTransformer
-from transformers import (
-    AutoModel,
-    AutoTokenizer,
-    BertConfig,
-    BertModel,
-    BertTokenizerFast,
-    MPNetConfig,
-    MPNetModel,
-    MPNetTokenizerFast,
-    RobertaConfig,
-    RobertaModel,
-    RobertaTokenizerFast,
-)
 
 # --- shared progress line state (prevents line collisions) ---
-
-_PROGRESS_LOCK = threading.Lock()
-_PROGRESS_LAST_LEN = 0
-PROGRESS_MODE = os.environ.get("LITKIT_PROGRESS_MODE", "auto").lower()  # use "auto" not "append"
-
-
-def _progress_is_append():
-    # TTY-aware: default 'auto' rewrites in-place on terminals.
-    if PROGRESS_MODE == "tty":
-        return False
-    if PROGRESS_MODE == "append":
-        return True
-    try:
-        if hasattr(sys.stderr, "isatty") and sys.stderr.isatty():
-            return False
-    except Exception:
-        pass
-    try:
-        if hasattr(sys.stdout, "isatty") and sys.stdout.isatty():
-            return False
-    except Exception:
-        pass
-    return True
-
-
-def _progress_write(s: str, stream):
-    """Render a single-line progress message, erasing any longer prior line."""
-    global _PROGRESS_LAST_LEN
-    with _PROGRESS_LOCK:
-        if _progress_is_append():
-            stream.write(s + "\n")
-            stream.flush()
-            _PROGRESS_LAST_LEN = 0
-        else:
-            pad = max(0, _PROGRESS_LAST_LEN - len(s))
-            stream.write("\r" + s + (" " * pad))
-            stream.flush()
-            _PROGRESS_LAST_LEN = len(s)
-
-
-def _progress_newline(stream):
-    """Commit the current line (newline) and reset shared width."""
-    global _PROGRESS_LAST_LEN
-    with _PROGRESS_LOCK:
-        if not _progress_is_append():
-            stream.write("\n")
-            stream.flush()
-        _PROGRESS_LAST_LEN = 0
-
 
 def _phase(name: str, stream=None):
     """Print a simple phase banner (operator log only)."""
@@ -874,57 +829,6 @@ def _idmap_bloom(index, bits_per_key=8):
     return contains
 
 
-def _inline_progress_renderer(label: str, total: int, stream=None, done_summary: bool = True):
-    """Render a compact progress line. Honors LITKIT_PROGRESS_MODE:
-      - "tty": single-line in-place updates via carriage return
-      - others: appended lines (no carriage returns in logs)
-    Always prints a final newline when final=True, and emits a [done] line with duration.
-    """
-    stream = stream or sys.stderr
-    prev_len = 0
-    t0 = time.time()
-
-    def _render(done: int, final: bool = False):
-        nonlocal prev_len
-        elapsed = max(1e-3, time.time() - t0)
-        rate = done / elapsed if elapsed > 0 else 0.0
-        s = f"[progress] {label}: {done}/{total}"
-        with _PROGRESS_LOCK:
-            if _progress_is_append():
-                # Append-only mode: write a fresh line each time
-                stream.write(s + ("\n"))
-                stream.flush()
-                prev_len = 0
-                if final:
-                    stream.write(
-                        f"[done] {label}: completed in {int(elapsed)}s — {done}/{total}  ({(100.0*done/max(1,total)):.1f}%)  {rate:.1f}/s\n"
-                    )
-                    stream.flush()
-            else:
-                # TTY mode: single-line rewrite
-                pad = max(0, prev_len - len(s))
-                stream.write("\r" + s + (" " * pad))
-                stream.flush()
-                prev_len = len(s)
-                # if final:
-                #     stream.write("\n")
-                #     # Also emit a durable [done] summary line
-                #     stream.write(f"[done] {label}: completed in {int(elapsed)}s — {done}/{total}  ({(100.0*done/max(1,total)):.1f}%)  {rate:.1f}/s\n")
-                #     stream.flush()
-                #     prev_len = 0
-                if final:
-                    stream.write("\n")
-                    if done_summary:
-                        stream.write(
-                            f"[done] {label}: completed in {int(elapsed)}s — {done}/{total}  "
-                            f"({(100.0*done/max(1,total)):.1f}%)  {rate:.1f}/s\n"
-                        )
-                        stream.flush()
-                    prev_len = 0
-
-    return _render
-
-
 class EmbeddingPool:
     """Simple multi-GPU embedding pool for SentenceTransformers.
     Spawns one subprocess per CUDA device and runs encode() on its GPU.
@@ -1097,8 +1001,8 @@ class PaperEmbedderSpecter2:
     def encode(
         self,
         texts: list[str],
-        progress_label: Optional[str] = None,
-        batch_size: Optional[int] = None,
+        progress_label: str | None = None,
+        batch_size: int | None = None,
         progress_done_summary: bool = True,
     ) -> np.ndarray:
         """
@@ -3463,7 +3367,7 @@ def shortlist_papers(
     k: int,
     efsearch: int = 128,
     *,
-    embedder: Optional["PaperEmbedderSpecter2"] = None,
+    embedder: Embedder | None = None,
 ) -> list[int]:
     """Stage 1: encode the question with SPECTER2 and retrieve top-k paper IDs
     from the paper index (HNSW by default). Returns a list of paper ids.
@@ -3502,7 +3406,7 @@ def search_chunks_constrained(
     lexical_cap: int | None = None,
     lexical_limit: int = 200,
     allow_global_lexical: bool | None = None,
-    embedder: Optional["ChunkEmbedderSBERT"] = None,
+    embedder: Embedder | None = None,
     per_paper_cap: int = 0,
 ) -> tuple[list[int], dict[str, int]]:
     """Stage 2: SBERT ANN + lexical front-loading.
@@ -4016,7 +3920,7 @@ def answer_with_llm(
                 continue
 
             # Not an overflow, or no sensible retry left
-            raise RuntimeError(_clarify_llm_error(model, base_url, str(e)))
+            raise RuntimeError(_clarify_llm_error(model, base_url, str(e))) from e
 
 
 # -------------------- Citations: normalize + print only cited --------------------
