@@ -28,10 +28,8 @@ import hashlib
 import json
 import logging
 import math
-import multiprocessing as mp
 import random
 import re
-import signal
 import socket
 import sqlite3
 import threading
@@ -50,9 +48,6 @@ from litkit.embeddings.base import (
     Embedder,  # protocol for type hints
 )
 from litkit.embeddings.base import (
-    inline_progress_renderer as _inline_progress_renderer,
-)
-from litkit.embeddings.base import (
     progress_is_append as _progress_is_append,
 )
 from litkit.embeddings.base import (
@@ -62,9 +57,7 @@ from litkit.embeddings.base import (
     progress_write as _progress_write,
 )
 from litkit.embeddings.devices import configure_threads, detect_device, resolve_embed_devices
-from litkit.embeddings.hf_local import (
-    local_snapshot_dir,
-)
+from litkit.embeddings.sbert_mpnet import ChunkEmbedderSBERT
 from litkit.embeddings.specter2 import PaperEmbedderSpecter2
 from litkit.formatting.answers import (
     normalize_answer_and_build_refs,
@@ -145,6 +138,7 @@ def _create_writer_guard_or_exit(args):
 
 # -- Paths / offline env --
 
+
 def _find_root() -> Path:
     """Return repo root.
     Preference:
@@ -195,8 +189,7 @@ def _report_paths(
     if QUIET:
         return
     if tar_manifest:
-        print(f"[paths] using manifest -> "
-              f"{tar_manifest} for paths to tar shards")
+        print(f"[paths] using manifest -> " f"{tar_manifest} for paths to tar shards")
     else:
         src = str(tar_dir) if tar_dir else "(unset)"
         origin = f" {tar_dir_origin}" if tar_dir_origin else ""
@@ -204,9 +197,9 @@ def _report_paths(
     print(f"[paths] using {workspace} as writable directory for job artifacts/outputs")
 
 
-HF_HOME = WORKSPACE / "hf_cache"        # location of HF models
-SQLITE_DIR = WORKSPACE / "sqlite"       # location of SQLite DB
-INDICES_DIR = WORKSPACE / "indices"     # location of FAISS indices for papers and chunks
+HF_HOME = WORKSPACE / "hf_cache"  # location of HF models
+SQLITE_DIR = WORKSPACE / "sqlite"  # location of SQLite DB
+INDICES_DIR = WORKSPACE / "indices"  # location of FAISS indices for papers and chunks
 
 # Temporary storage for embedding segments from producers
 #   This setting is only used if --embed-dir is set.
@@ -286,8 +279,6 @@ _ADVISORY_LOCK_NOTICE_PRINTED = False
 chunk_seg_writer = None
 paper_seg_writer = None
 
-# -------------------- Model IDs --------------------
-SBERT_ID = "sentence-transformers/all-mpnet-base-v2"  # chunk-level
 
 # -------------------- LLM defaults --------------------
 # (HPC) production: o3; laptop testing: gpt-oss:20b
@@ -606,9 +597,9 @@ try:
 except Exception:
     pass
 
-from sentence_transformers import SentenceTransformer
 
 # --- shared progress line state (prevents line collisions) ---
+
 
 def _phase(name: str, stream=None):
     """Print a simple phase banner (operator log only)."""
@@ -746,7 +737,6 @@ class _Pulse:
         self._t0 = time.time()
         self._thr = threading.Thread(target=self._run, daemon=True)
 
-
     def _print_line(self, s: str):
         _progress_write(s, self.stream)
 
@@ -816,264 +806,6 @@ def _idmap_bloom(index, bits_per_key=8):
         return True
 
     return contains
-
-
-class EmbeddingPool:
-    """Simple multi-GPU embedding pool for SentenceTransformers.
-    Spawns one subprocess per CUDA device and runs encode() on its GPU.
-
-    • Uses spawn() context for CUDA safety.
-    • Safe on air-gapped systems (no sockets or NCCL).
-    • Shuts down gracefully on normal exit or SIGINT/SIGTERM.
-    """
-
-    def __init__(self, model_path: Path, devices: list[str]):
-        self.model_path = str(model_path)
-        self.devices = devices
-        self.ctx = mp.get_context("spawn")
-        self.queue_in = self.ctx.Queue()
-        self.queue_out = self.ctx.Queue()
-        self.workers: list[mp.Process] = []
-        self._closed = False
-        self._prev_signals = None
-
-        for rank, dev in enumerate(self.devices):
-            p = self.ctx.Process(
-                target=self._worker_loop,
-                args=(rank, dev, self.model_path, self.queue_in, self.queue_out),
-                daemon=True,
-            )
-            p.start()
-            self.workers.append(p)
-        print(
-            f"[embed] multi-GPU pool started on {', '.join(self.devices)} ({len(self.workers)} workers)"
-        )
-
-        # --- Safety hooks ---
-        atexit.register(self.close)
-        if threading.current_thread() is threading.main_thread():
-            try:
-                prev_int = signal.getsignal(signal.SIGINT)
-                prev_term = signal.getsignal(signal.SIGTERM)
-                signal.signal(signal.SIGINT, self._handle_signal)
-                signal.signal(signal.SIGTERM, self._handle_signal)
-                self._prev_signals = (prev_int, prev_term)
-            except Exception:
-                pass
-
-    @staticmethod
-    def _worker_loop(rank, device, model_path, q_in, q_out):
-        from sentence_transformers import SentenceTransformer
-
-        model = SentenceTransformer(model_path, device=device)
-        while True:
-            task = q_in.get()
-            if task is None:
-                break
-            if isinstance(task, tuple) and len(task) == 3:
-                task_id, texts, bs = task
-            else:
-                task_id, texts = task
-                bs = 64
-
-            try:
-                arr = model.encode(
-                    texts,
-                    batch_size=bs,
-                    show_progress_bar=False,
-                    convert_to_numpy=True,
-                    normalize_embeddings=True,
-                ).astype("float32")
-                q_out.put((task_id, arr))
-            except Exception as e:
-                q_out.put((task_id, e))
-        try:
-            q_out.close()
-            q_in.close()
-        except Exception:
-            pass
-
-    def _handle_signal(self, signum, frame):
-        """Handle SIGINT/SIGTERM: terminate workers quickly."""
-        print(f"\n[embed] caught signal {signum}, terminating worker pool...", flush=True)
-        self.close(force=True)
-        sys.exit(1)
-
-    # def encode(self, texts: List[str], batch_size: int = 64) -> np.ndarray:
-    def encode(
-        self,
-        texts: list[str],
-        progress_label: str | None = None,
-        batch_size: int | None = None,
-        progress_done_summary: bool = True,
-    ) -> np.ndarray:
-        """Encode a list of texts into L2-normalized embeddings (float32, N x 768).
-        If progress_label is provided, render a single in-place line from 0 -> N, ending with a newline.
-        """
-        if not texts:
-            return np.zeros((0, 768), dtype="float32")
-
-        n = len(texts)
-        ndev = len(self.devices)
-        splits = np.array_split(np.arange(n), ndev)
-
-        submitted = []
-        for task_id, idxs in enumerate(splits):
-            if len(idxs) == 0:
-                continue
-            shard_texts = [texts[i] for i in idxs]
-            self.queue_in.put((task_id, shard_texts, int(batch_size or 64)))
-            submitted.append(task_id)
-
-        results = {tid: None for tid in submitted}
-        received = 0
-        while received < len(submitted):
-            task_id, arr = self.queue_out.get()
-            if isinstance(arr, Exception):
-                # Drain outstanding results and re-raise to avoid wedging workers
-                for _ in range(len(submitted) - received - 1):
-                    try:
-                        self.queue_out.get(timeout=0.1)
-                    except Exception:
-                        break
-                raise arr
-            results[task_id] = arr
-            received += 1
-
-        # Reassemble in original order
-        out = []
-        for task_id, idxs in enumerate(splits):
-            if len(idxs) == 0:
-                continue
-            out.append(results[task_id])
-        return np.vstack(out) if out else np.zeros((0, 768), dtype="float32")
-
-    def close(self, force: bool = False):
-        """Gracefully stop all workers; safe to call multiple times."""
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            for _ in self.workers:
-                self.queue_in.put(None)
-            if force:
-                for p in self.workers:
-                    if p.is_alive():
-                        p.terminate()
-            for p in self.workers:
-                p.join(timeout=2.0)
-        except Exception:
-            pass
-        finally:
-            try:
-                self.queue_in.close()
-                self.queue_out.close()
-            except Exception:
-                pass
-            # restore previous signal handlers if we set them
-            if self._prev_signals and threading.current_thread() is threading.main_thread():
-                try:
-                    signal.signal(signal.SIGINT, self._prev_signals[0])
-                    signal.signal(signal.SIGTERM, self._prev_signals[1])
-                except Exception:
-                    pass
-        print("[embed] multi-GPU pool closed cleanly", flush=True)
-
-
-class ChunkEmbedderSBERT:
-    """SentenceTransformers all-mpnet-base-v2, offline, returns normalized vectors."""
-
-    def __init__(self, devices: list[str] | None = None, workers: int = 1):
-        local_path = local_snapshot_dir(SBERT_ID)
-        self.devices = devices or [DEVICE]
-        self.workers = int(workers)
-        # Cap device fanout by embed_workers if > 0
-        if self.workers > 0 and len(self.devices) > self.workers:
-            self.devices = self.devices[: self.workers]
-            print(
-                f"[embed] limiting to {len(self.devices)} device(s) via --embed-workers={self.workers}"
-            )
-
-        if len(self.devices) > 1 and self.devices[0].startswith("cuda"):
-            self.pool = EmbeddingPool(local_path, self.devices)
-            self.model = None
-        else:
-            self.pool = None
-            try:
-                self.model = SentenceTransformer(str(local_path), device=self.devices[0])
-            except Exception as e:
-                raise FileNotFoundError(
-                    f"[offline] SBERT snapshot missing at {local_path}. "
-                    f"Place 'sentence-transformers/all-mpnet-base-v2' under {HF_HOME}/hub/"
-                ) from e
-
-        self.dim = 768
-        tmp = self.encode(["dim-probe"])
-        self.dim = (
-            int(tmp.shape[1])
-            if (isinstance(tmp, np.ndarray) and tmp.ndim == 2 and tmp.size)
-            else 768
-        )
-
-    # def encode(self, texts: List[str], progress_label: Optional[str] = None, batch_size: Optional[int] = None) -> np.ndarray:
-    def encode(
-        self,
-        texts: list[str],
-        progress_label: str | None = None,
-        batch_size: int | None = None,
-        progress_done_summary: bool = True,
-    ) -> np.ndarray:
-        if not texts:
-            return np.zeros((0, self.dim), dtype="float32")
-
-        if self.pool:
-            # Multi-GPU mode
-            render = _inline_progress_renderer(
-                progress_label or "Embedding corpus chunks (multi-GPU)",
-                len(texts),
-                done_summary=progress_done_summary,
-            )
-            render(0)
-            X = self.pool.encode(texts, batch_size or 64)
-            render(len(texts), final=True)
-            return X
-
-        # --- single-device fallback ---
-        bs = int(batch_size or (64 if DEVICE == "cuda" else 16))
-        arrs = []
-        total = len(texts)
-        render = (
-            _inline_progress_renderer(
-                progress_label or "Embedding corpus chunks",
-                total,
-                done_summary=progress_done_summary,
-            )
-            if progress_label
-            else None
-        )
-        if render:
-            render(0)
-
-        for i in range(0, total, bs):
-            chunk = texts[i : i + bs]
-            arr = self.model.encode(
-                chunk,
-                batch_size=bs,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-            ).astype("float32")
-            arrs.append(arr)
-            if render:
-                render(min(total, i + len(chunk)))
-
-        if render:
-            render(total, final=True)
-        return np.vstack(arrs) if arrs else np.zeros((0, self.dim), dtype="float32")
-
-    def close(self):
-        if self.pool:
-            self.pool.close()
 
 
 # -------------------- FAISS index helpers --------------------
@@ -1246,7 +978,6 @@ class _ChunkSegmentWriter:
         p = self.outdir / f"chunks_sh{self.shard_id:02d}_{ts}_{self.seq:06d}.npz"
         self.seq += 1
         return p
-
 
     def write(self, ids: np.ndarray, vecs: np.ndarray):
         if ids.size == 0:
@@ -2569,10 +2300,11 @@ def build_or_update_indices(args):
     )
 
     # ----- TAR SHARD PATH (NO EXTRACTION) -----
-    tar_paths = list(_shard_filter(
-        iter_tar_paths(args.tar_dir, args.tar_manifest),
-        args.shard_id, args.num_shards
-    ))
+    tar_paths = list(
+        _shard_filter(
+            iter_tar_paths(args.tar_dir, args.tar_manifest), args.shard_id, args.num_shards
+        )
+    )
 
     print(f"[scan] found {len(tar_paths)} tar shards in shard {args.shard_id}/{args.num_shards}")
 
@@ -3619,7 +3351,11 @@ def answer_with_llm(
         msg = (raw or "").strip()
         low = msg.lower()
         # Common local/LM Studio cases
-        if ("no models loaded" in low) or ("model_not_found" in low) or ("404" in low and "model" in low):
+        if (
+            ("no models loaded" in low)
+            or ("model_not_found" in low)
+            or ("404" in low and "model" in low)
+        ):
             return (
                 "[llm] ERROR: The endpoint is up but has no model loaded (or does not recognize "
                 f"{model!r}).\n"
@@ -3664,11 +3400,19 @@ def answer_with_llm(
     # If it returns empty, surface a clear error before the main call.
     try:
         models_resp = client.models.list()
-        available = [getattr(x, "id", str(x)) for x in getattr(models_resp, "data", list(models_resp) or [])]
+        available = [
+            getattr(x, "id", str(x)) for x in getattr(models_resp, "data", list(models_resp) or [])
+        ]
         if ("localhost" in base_url or "127.0.0.1" in base_url) and not available:
             raise RuntimeError("No models loaded. Please load an LLM.")
-        if available and (model not in available) and ("localhost" in base_url or "127.0.0.1" in base_url):
-            raise RuntimeError(f"Model {model!r} not found on the local endpoint. Available: {', '.join(available[:8])}{' …' if len(available) > 8 else ''}")
+        if (
+            available
+            and (model not in available)
+            and ("localhost" in base_url or "127.0.0.1" in base_url)
+        ):
+            raise RuntimeError(
+                f"Model {model!r} not found on the local endpoint. Available: {', '.join(available[:8])}{' …' if len(available) > 8 else ''}"
+            )
     except Exception:
         # Not fatal: some providers don’t implement models.list; proceed to the main call.
         pass
@@ -3912,7 +3656,7 @@ def main():
         "--tar-dir",
         type=Path,
         default=None,
-        help="Directory containing tar shards; streamed without extracting. "
+        help="Directory containing tar shards; streamed without extracting. ",
     )
     ap.add_argument(
         "--tar-manifest",
@@ -4084,18 +3828,18 @@ def main():
 
     args = ap.parse_args()
 
-    #--- helper: determine if a directory contains .tar.gz files ---
+    # --- helper: determine if a directory contains .tar.gz files ---
     def _has_tars(p: Path) -> bool:
         try:
             return p.exists() and (
                 any(p.glob("*.tar"))
-                or any(p.glob("*.tar.*"))   # catches .tar.gz, .tar.bz2, etc.
+                or any(p.glob("*.tar.*"))  # catches .tar.gz, .tar.bz2, etc.
                 or any(p.glob("*.tgz"))
             )
         except Exception:
             return False
 
-    #--- resolve path to tar shards (CLI > ENV > defaults) ---
+    # --- resolve path to tar shards (CLI > ENV > defaults) ---
     env_tar = os.getenv("LITKIT_TAR_DIR")
 
     # Track provenance of tar shard source setting for clarity in logs.

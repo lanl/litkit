@@ -158,9 +158,9 @@ def load_auto_or_fallback(local_path: Path, device: str = "cpu") -> tuple[object
             tok = BertTokenizerFast(tokenizer_file=str(tok_json))
         else:
             tok = BertTokenizerFast(vocab_file=str(local_path / "vocab.txt"))
-        model = BertModel.from_pretrained(
-            str(local_path), config=cfg, local_files_only=True
-        ).to(device)
+        model = BertModel.from_pretrained(str(local_path), config=cfg, local_files_only=True).to(
+            device
+        )
         model.eval()
         return tok, model
 
@@ -174,18 +174,18 @@ def load_auto_or_fallback(local_path: Path, device: str = "cpu") -> tuple[object
                 vocab_file=str(local_path / "vocab.json"),
                 merges_file=str(local_path / "merges.txt"),
             )
-        model = RobertaModel.from_pretrained(
-            str(local_path), config=cfg, local_files_only=True
-        ).to(device)
+        model = RobertaModel.from_pretrained(str(local_path), config=cfg, local_files_only=True).to(
+            device
+        )
         model.eval()
         return tok, model
 
     if arch == "mpnet":
         cfg = MPNetConfig.from_pretrained(str(local_path), local_files_only=True)
         tok = MPNetTokenizerFast.from_pretrained(str(local_path), local_files_only=True)
-        model = MPNetModel.from_pretrained(
-            str(local_path), config=cfg, local_files_only=True
-        ).to(device)
+        model = MPNetModel.from_pretrained(str(local_path), config=cfg, local_files_only=True).to(
+            device
+        )
         model.eval()
         return tok, model
 
@@ -195,6 +195,7 @@ def load_auto_or_fallback(local_path: Path, device: str = "cpu") -> tuple[object
         "Expected one of: tokenizer.json, vocab.txt (BERT), "
         "vocab.json + merges.txt (RoBERTa), or a sentencepiece model (MPNet)."
     )
+
 
 __all__ = [
     "ensure_offline_env",

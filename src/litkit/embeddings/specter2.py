@@ -44,8 +44,9 @@ class PaperEmbedderSpecter2(Embedder):
         self.dim = 768
         try:
             with torch.no_grad():
-                toks = self.tok(["__probe__"], padding=True, truncation=True,
-                                max_length=8, return_tensors="pt")
+                toks = self.tok(
+                    ["__probe__"], padding=True, truncation=True, max_length=8, return_tensors="pt"
+                )
                 toks = toks.to(next(self.model.parameters()).device)
                 out = self.model(**toks)
                 d = int(out.last_hidden_state.shape[-1])

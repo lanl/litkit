@@ -15,20 +15,22 @@ import numpy as np
 
 # -------------------- Public config & typing --------------------
 
+
 @dataclass(slots=True)
 class EmbedderConfig:
     """
     Minimal, backend-agnostic embedder configuration.
     """
+
     model_id: str
     dim: int = 768
     max_length: int = 512
     batch_size_cpu: int = 8
     batch_size_accel: int = 16
-    normalize: bool = True          # return L2-normalized vectors
-    return_dtype: str = "float32"   # always float32 for FAISS; keep configurable
-    device: str | None = None    # e.g. "cpu", "mps", "cuda:0"
-    offline: bool = True            # HF offline / air-gapped default
+    normalize: bool = True  # return L2-normalized vectors
+    return_dtype: str = "float32"  # always float32 for FAISS; keep configurable
+    device: str | None = None  # e.g. "cpu", "mps", "cuda:0"
+    offline: bool = True  # HF offline / air-gapped default
 
     def effective_batch_size(self, device: str | None, override: int | None) -> int:
         if override is not None:
@@ -42,6 +44,7 @@ class Embedder(Protocol):
     """
     Structural type that any embedder must satisfy.
     """
+
     dim: int
 
     def encode(
@@ -57,6 +60,7 @@ class BaseEmbedder(ABC):
     """
     Optional ABC base with a shared config and a no-op close().
     """
+
     def __init__(self, config: EmbedderConfig):
         self.config = config
         self.dim = int(config.dim)
@@ -77,6 +81,7 @@ class BaseEmbedder(ABC):
 
 
 # -------------------- Small, backend-agnostic utils --------------------
+
 
 def l2_normalize_np(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     """
@@ -149,9 +154,7 @@ def progress_newline(stream) -> None:
         _PROGRESS_LAST_LEN = 0
 
 
-def inline_progress_renderer(
-    label: str, total: int, stream=None, done_summary: bool = True
-):
+def inline_progress_renderer(label: str, total: int, stream=None, done_summary: bool = True):
     """
     Return a closure `render(done, final=False)` that updates a single progress line.
     On `final=True`, always prints a newline and, if enabled, a one-line [done] summary.
@@ -189,4 +192,5 @@ def inline_progress_renderer(
                             f"{done}/{total}  ({(100.0*done/max(1,total)):.1f}%)  {rate:.1f}/s\n"
                         )
                         stream.flush()
+
     return _render
