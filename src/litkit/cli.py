@@ -127,31 +127,50 @@ def _create_writer_guard_or_exit(args):
 # -- Paths / offline env --
 
 def _find_root() -> Path:
-    """Return path to the repository root directory."""
+    """Return repo root when running from source; sensible fallback when installed.
+    Preference:
+    1) LITKIT_ROOT
+    2) CWD or its parents containing .git or pyproject.toml
+    3) Package path or its parents containing .git or pyproject.toml
+    4) CWD if it has src/litkit
+    5) site-packages parent (last resort)
+    """
+    env = os.getenv("LITKIT_ROOT")
+    if env:
+        return Path(env).expanduser().resolve()
+
     here = Path(__file__).resolve().parent
+    cwd = Path.cwd().resolve()
+
+    for p in [cwd] + list(cwd.parents):
+        if (p / ".git").exists() or (p / "pyproject.toml").exists():
+            return p
     for p in [here] + list(here.parents):
         if (p / ".git").exists() or (p / "pyproject.toml").exists():
             return p
-    # Expected package layout: <repo>/src/litkit/cli.py
+    if (cwd / "src" / "litkit").exists():
+        return cwd
     try:
-        return here.parents[1]  # fallback is <repo> (based on expected package layout)
+        return here.parents[1]
     except IndexError:
         return here
 
 
 def _resolve_input_dir(root: Path) -> Path | None:
-    """Return path to the input directory."""
-    env = os.getenv("LITKIT_INPUT")
+    """Return path to the input directory.
+    Order: env(LITKIT_INPUT/LITKIT_INPUT_DIR) → <repo parent>/litkit_input.
+    Return the path even if it doesn't exist; callers can check existence.
+    """
+    env = os.getenv("LITKIT_INPUT") or os.getenv("LITKIT_INPUT_DIR")
     if env:
-        return Path(env).expanduser()
-    sib = root.parent / "litkit_input"  # in the same directory as the repo
-    return sib if sib.exists() else None
+        return Path(env).expanduser().resolve()
+    return (root.parent / "litkit_input").resolve()
 
 
 def _resolve_workspace(root: Path) -> Path:
     """Return path to the workspace directory."""
-    ws = os.getenv("LITKIT_WORKSPACE")
-    return Path(ws).expanduser() if ws else (root / "workspace")
+    ws = os.getenv("LITKIT_WORKSPACE") or os.getenv("LITKIT_WORKSPACE_DIR")
+    return Path(ws).expanduser().resolve() if ws else (root / "workspace").resolve()
 
 
 ROOT = _find_root()
@@ -175,8 +194,7 @@ SQLITE_DIR = WORKSPACE / "sqlite"       # location of SQLite DB
 INDICES_DIR = WORKSPACE / "indices"     # location of FAISS indices for papers and chunks
 
 # Where to look for .tar/.tar.gz shards
-#   If user provided a litkit_input, use that.
-#   Otherwise, fall back to <workspace>/tar_shards.
+#   Prefer INPUT_DIR. Otherwise, use WORKSPACE/tar_shards.
 TAR_DIR = INPUT_DIR if INPUT_DIR else (WORKSPACE / "tar_shards")
 
 # Temporary storage for embedding segments from producers
@@ -4308,7 +4326,7 @@ def main():
             shard_id=args.shard_id,
         )
 
-    # abort if there is no setting for --tar-dir or --tar-manifest and TAR_DIR is absent
+    # If --tar-dir is not provided, adopt TAR_DIR (if env setting is present).
     if args.tar_dir is None and TAR_DIR.exists():
         args.tar_dir = TAR_DIR
 
