@@ -8,6 +8,8 @@ from . import __version__ as LITKIT_VERSION
 # -------- simple early quieting (env), used before argparse exists ----------
 # Set LITKIT_QUIET=1 to squelch startup banners that print before args are parsed.
 QUIET = os.environ.get("LITKIT_QUIET", "0") == "1"
+# Suppress early banners for --version/--help
+_SUPPRESS_EARLY = any(x in sys.argv for x in ("--version", "-h", "--help"))
 
 
 def _version_banner() -> str:
@@ -61,7 +63,7 @@ from litkit.embeddings.hf_local import (
 
 configure_threads()
 DEVICE = detect_device()
-if not QUIET:
+if not QUIET and not _SUPPRESS_EARLY:
     print(f"[version] {_version_banner()}")
     print(f"[device] using {DEVICE}")
 
@@ -127,7 +129,7 @@ def _create_writer_guard_or_exit(args):
 # -- Paths / offline env --
 
 def _find_root() -> Path:
-    """Return repo root when running from source; sensible fallback when installed.
+    """Return repo root.
     Preference:
     1) LITKIT_ROOT
     2) CWD or its parents containing .git or pyproject.toml
@@ -158,10 +160,10 @@ def _find_root() -> Path:
 
 def _resolve_input_dir(root: Path) -> Path | None:
     """Return path to the input directory.
-    Order: env(LITKIT_INPUT/LITKIT_INPUT_DIR) → <repo parent>/litkit_input.
+    Order: env(LITKIT_INPUT) -> <repo parent>/litkit_input.
     Return the path even if it doesn't exist; callers can check existence.
     """
-    env = os.getenv("LITKIT_INPUT") or os.getenv("LITKIT_INPUT_DIR")
+    env = os.getenv("LITKIT_INPUT")
     if env:
         return Path(env).expanduser().resolve()
     return (root.parent / "litkit_input").resolve()
@@ -169,7 +171,7 @@ def _resolve_input_dir(root: Path) -> Path | None:
 
 def _resolve_workspace(root: Path) -> Path:
     """Return path to the workspace directory."""
-    ws = os.getenv("LITKIT_WORKSPACE") or os.getenv("LITKIT_WORKSPACE_DIR")
+    ws = os.getenv("LITKIT_WORKSPACE") 
     return Path(ws).expanduser().resolve() if ws else (root / "workspace").resolve()
 
 
@@ -177,17 +179,21 @@ ROOT = _find_root()
 INPUT_DIR = _resolve_input_dir(ROOT)
 WORKSPACE = _resolve_workspace(ROOT)
 
-# Report path to input directory
-if os.environ.get("LITKIT_INPUT") and not QUIET:
-    print(f"[paths] using env (LITKIT_INPUT) path -> {INPUT_DIR} for source of .tar.gz files")
-elif not QUIET:
-    print(f"[paths] using default path -> {INPUT_DIR} for source of .tar.gz files")
 
-# Report path to workspace
-if os.environ.get("LITKIT_WORKSPACE") and not QUIET:
-    print(f"[paths] using env (LITKIT_WORKSPACE) path -> {WORKSPACE} for artifacts")
-elif not QUIET:
-    print(f"[paths] using default path -> {WORKSPACE} for artifacts")
+def _report_paths():
+    """Print resolved paths once we know the user isn't just asking for help/version."""
+    # Report path to input directory
+    if os.environ.get("LITKIT_INPUT") and not QUIET:
+        print(f"[paths] using env (LITKIT_INPUT) path -> {INPUT_DIR} for source of .tar.gz files")
+    elif not QUIET:
+        print(f"[paths] using default path -> {INPUT_DIR} for source of .tar.gz files")
+    # Report path to writable workspace directory
+    if os.environ.get("LITKIT_WORKSPACE") and not QUIET:
+        print(f"[paths] using env (LITKIT_WORKSPACE) path -> {WORKSPACE} for artifacts")
+    elif not QUIET:
+        print(f"[paths] using default path -> {WORKSPACE} for artifacts")
+    return
+
 
 HF_HOME = WORKSPACE / "hf_cache"        # location of HF models
 SQLITE_DIR = WORKSPACE / "sqlite"       # location of SQLite DB
@@ -4223,6 +4229,10 @@ def main():
     )
 
     args = ap.parse_args()
+
+    # Print paths
+    if not args.quiet:
+        _report_paths()
 
     # Wire CLI --quiet into the early env-based guard for the rest of the run
     if args.quiet:
