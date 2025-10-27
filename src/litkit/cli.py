@@ -48,7 +48,7 @@ from litkit.embeddings.base import (
 )
 from litkit.embeddings.base import (
     Embedder,  # protocol for type hints
-    )
+)
 from litkit.embeddings.base import (
     inline_progress_renderer as _inline_progress_renderer,
 )
@@ -63,9 +63,9 @@ from litkit.embeddings.base import (
 )
 from litkit.embeddings.devices import configure_threads, detect_device, resolve_embed_devices
 from litkit.embeddings.hf_local import (
-    load_auto_or_fallback,
     local_snapshot_dir,
 )
+from litkit.embeddings.specter2 import PaperEmbedderSpecter2
 from litkit.formatting.answers import (
     normalize_answer_and_build_refs,
     render_references,
@@ -287,7 +287,6 @@ chunk_seg_writer = None
 paper_seg_writer = None
 
 # -------------------- Model IDs --------------------
-SPECTER2_ID = "allenai/specter2_base"  # paper-level (title+abstract)
 SBERT_ID = "sentence-transformers/all-mpnet-base-v2"  # chunk-level
 
 # -------------------- LLM defaults --------------------
@@ -607,7 +606,6 @@ try:
 except Exception:
     pass
 
-import torch
 from sentence_transformers import SentenceTransformer
 
 # --- shared progress line state (prevents line collisions) ---
@@ -748,15 +746,6 @@ class _Pulse:
         self._t0 = time.time()
         self._thr = threading.Thread(target=self._run, daemon=True)
 
-    # def stop(self):
-    #     self._stop.set()
-    #     try:
-    #         self._thr.join(timeout=2.0)
-    #     except Exception:
-    #         pass
-    #     elapsed = int(time.time() - self._t0)
-    #     _progress_write(f"[done] {self.label}: completed in {elapsed}s", self.stream)
-    #     _progress_newline(self.stream)
 
     def _print_line(self, s: str):
         _progress_write(s, self.stream)
@@ -989,63 +978,6 @@ class EmbeddingPool:
                 except Exception:
                     pass
         print("[embed] multi-GPU pool closed cleanly", flush=True)
-
-
-class PaperEmbedderSpecter2:
-    def __init__(self):
-        local_path = local_snapshot_dir(SPECTER2_ID)
-        self.dim = 768
-        self.tok, self.model = load_auto_or_fallback(local_path, device=DEVICE)
-        self.model.eval()
-
-    def encode(
-        self,
-        texts: list[str],
-        progress_label: str | None = None,
-        batch_size: int | None = None,
-        progress_done_summary: bool = True,
-    ) -> np.ndarray:
-        """
-        Encode a list of texts into L2-normalized embeddings (float32, N x 768).
-        If progress_label is provided, render a single in-place line from 0 -> N, ending with a newline.
-        """
-        if not texts:
-            return np.zeros((0, self.dim), dtype="float32")
-
-        embs = []
-        bs = int(batch_size or (16 if DEVICE == "cuda" else 8))
-        total = len(texts)
-
-        render = (
-            _inline_progress_renderer(
-                progress_label or "Embedding papers", total, done_summary=progress_done_summary
-            )
-            if progress_label
-            else None
-        )
-        if render:
-            render(0)
-
-        # Resolve the model's actual device robustly
-        model_device = next(self.model.parameters()).device
-
-        with torch.no_grad():
-            for i in range(0, total, bs):
-                batch = texts[i : i + bs]
-                toks = self.tok(
-                    batch, padding=True, truncation=True, max_length=512, return_tensors="pt"
-                ).to(model_device)
-                out = self.model(**toks)
-                cls = out.last_hidden_state[:, 0, :]  # CLS/<s> token
-                cls = torch.nn.functional.normalize(cls, p=2, dim=1)
-                embs.append(cls.detach().cpu().numpy().astype("float32"))
-                if render:
-                    render(min(total, i + len(batch)))
-
-        if render:
-            render(total, final=True)
-
-        return np.vstack(embs) if embs else np.zeros((0, self.dim), dtype="float32")
 
 
 class ChunkEmbedderSBERT:
@@ -1315,29 +1247,7 @@ class _ChunkSegmentWriter:
         self.seq += 1
         return p
 
-    # def write(self, ids: np.ndarray, vecs: np.ndarray):
-    #     """
-    #     ids: (N,) int64
-    #     vecs: (N, D) float32/float16
-    #     Splits into <= segment_size chunks and writes each to disk.
-    #     """
-    #     if ids.size == 0:
-    #         return
-    #     assert ids.shape[0] == vecs.shape[0], "ids/vecs length mismatch"
-    #     # Convert dtype once
-    #     if vecs.dtype != self.dtype:
-    #         vecs = vecs.astype(self.dtype, copy=False)
 
-    #     N = ids.shape[0]
-    #     for start in range(0, N, self.segment_size):
-    #         end = min(N, start + self.segment_size)
-    #         ids_i = np.ascontiguousarray(ids[start:end], dtype=np.int64)
-    #         vecs_i = np.ascontiguousarray(vecs[start:end])
-    #         dim = vecs_i.shape[1]
-    #         path = self._next_path()
-    #         # Use uncompressed .npz to avoid CPU burn & FS chatter; large, few files.
-    #         np.savez(path, ids=ids_i, vecs=vecs_i, dim=np.int32(dim), count=np.int32(ids_i.shape[0]))
-    #         # Single fsync-ish behavior not strictly needed on Lustre; rely on flush by OS.
     def write(self, ids: np.ndarray, vecs: np.ndarray):
         if ids.size == 0:
             return
@@ -2192,46 +2102,6 @@ def _load_temp_candidates(conn, pids: list[int]) -> None:
     conn.commit()
 
 
-# def _resolve_model_alias(requested: str, available_ids: list[str]) -> str | None:
-#     """Try to reconcile common naming mismatches:
-#       - colon <-> hyphen
-#       - add/remove vendor prefixes like 'openai/'
-#       - case-insensitive match
-
-#     Returns the canonical available id if a match is found; else None.
-#     """
-#     req = (requested or "").strip()
-#     if not req or not available_ids:
-#         return None
-
-#     # Generate candidate spellings
-#     cands = set()
-
-#     def add(x: str):
-#         if x:
-#             cands.add(x)
-
-#     add(req)
-#     add(req.replace(":", "-"))
-#     add(req.replace("-", ":"))
-
-#     # Handle vendor prefixes
-#     for v in list(cands):
-#         add("openai/" + v)
-#         if "/" in v:
-#             add(v.split("/", 1)[1])
-
-#     # Case-insensitive lookup table of available ids
-#     lower_map = {a.lower(): a for a in available_ids}
-
-#     # Try direct case-insensitive matches over candidates
-#     for c in {x.lower() for x in cands}:
-#         if c in lower_map:
-#             return lower_map[c]
-
-#     return None
-
-
 def load_checkpoint() -> dict:
     """Load JSON checkpoint (if exists) for resumable workflows; else {}."""
     if CKPT_PATH.exists():
@@ -2734,9 +2604,6 @@ def build_or_update_indices(args):
             print(
                 f"[scan] shard {tpath} (resume=#{start_persisted}{'' if total_members is None else f', total≈{total_members}'})"
             )
-        #     print(f"[scan] {tpath} (resume at processed_count #{start_persisted} / total ~{total_members})")
-        # else:
-        #     print(f"[scan] {tpath} (resume at processed_count #{start_persisted})")
 
         # ---- compact single-line progress for large shards ----
         start_ts = time.time()
@@ -4385,13 +4252,6 @@ def main():
             dtype=DEFAULT_EMBED_SEGMENT_DTYPE,
             shard_id=args.shard_id,
         )
-
-    # if args.tar_dir is None and args.tar_manifest is None:
-    #     raise SystemExit(
-    #         "No source specified for .tar.gz files. " \
-    #         f"Provide --tar-dir or set env LITKIT_TAR_DIR." \
-    #         f"You can also pass a file with paths to .tar.gz files via --tar-manifest."
-    #     )
 
     # If user asked to build (explicitly) or a rebuild/update is needed, do that first
     # Honor --yes by setting the env so _confirm_rebuild doesn't prompt.
