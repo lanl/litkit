@@ -158,17 +158,6 @@ def _find_root() -> Path:
         return here
 
 
-def _resolve_input_dir(root: Path) -> Path | None:
-    """Return path to the input directory.
-    Order: env(LITKIT_INPUT) -> <repo parent>/litkit_input.
-    Return the path even if it doesn't exist; callers can check existence.
-    """
-    env = os.getenv("LITKIT_INPUT")
-    if env:
-        return Path(env).expanduser().resolve()
-    return (root.parent / "litkit_input").resolve()
-
-
 def _resolve_workspace(root: Path) -> Path:
     """Return path to the workspace directory."""
     ws = os.getenv("LITKIT_WORKSPACE") 
@@ -176,32 +165,31 @@ def _resolve_workspace(root: Path) -> Path:
 
 
 ROOT = _find_root()
-INPUT_DIR = _resolve_input_dir(ROOT)
 WORKSPACE = _resolve_workspace(ROOT)
 
 
-def _report_paths():
-    """Print resolved paths once we know the user isn't just asking for help/version."""
-    # Report path to input directory
-    if os.environ.get("LITKIT_INPUT") and not QUIET:
-        print(f"[paths] using env (LITKIT_INPUT) path -> {INPUT_DIR} for source of .tar.gz files")
-    elif not QUIET:
-        print(f"[paths] using default path -> {INPUT_DIR} for source of .tar.gz files")
-    # Report path to writable workspace directory
-    if os.environ.get("LITKIT_WORKSPACE") and not QUIET:
-        print(f"[paths] using env (LITKIT_WORKSPACE) path -> {WORKSPACE} for artifacts")
-    elif not QUIET:
-        print(f"[paths] using default path -> {WORKSPACE} for artifacts")
-    return
+def _report_paths(
+    tar_dir: Path | None,
+    workspace: Path,
+    tar_manifest: Path | None,
+    tar_dir_origin: str | None = None,  # "(from LITKIT_TAR_DIR)" or "(default)"
+):
+    """Print paths once args are parsed, so banners reflect reality."""
+    if QUIET:
+        return
+    if tar_manifest:
+        print(f"[paths] using manifest -> "
+              f"{tar_manifest} for paths to tar shards")
+    else:
+        src = str(tar_dir) if tar_dir else "(unset)"
+        origin = f" {tar_dir_origin}" if tar_dir_origin else ""
+        print(f"[paths] using {src} as source directory for tar shards{origin}")
+    print(f"[paths] using {workspace} as writable directory for job artifacts/outputs")
 
 
 HF_HOME = WORKSPACE / "hf_cache"        # location of HF models
 SQLITE_DIR = WORKSPACE / "sqlite"       # location of SQLite DB
 INDICES_DIR = WORKSPACE / "indices"     # location of FAISS indices for papers and chunks
-
-# Where to look for .tar/.tar.gz shards
-#   Prefer INPUT_DIR. Otherwise, use WORKSPACE/tar_shards.
-TAR_DIR = INPUT_DIR if INPUT_DIR else (WORKSPACE / "tar_shards")
 
 # Temporary storage for embedding segments from producers
 #   This setting is only used if --embed-dir is set.
@@ -1105,6 +1093,55 @@ class PaperEmbedderSpecter2:
         self.dim = 768
         self.tok, self.model = load_auto_or_fallback(local_path, device=DEVICE)
         self.model.eval()
+
+    def encode(
+        self,
+        texts: list[str],
+        progress_label: Optional[str] = None,
+        batch_size: Optional[int] = None,
+        progress_done_summary: bool = True,
+    ) -> np.ndarray:
+        """
+        Encode a list of texts into L2-normalized embeddings (float32, N x 768).
+        If progress_label is provided, render a single in-place line from 0 -> N, ending with a newline.
+        """
+        if not texts:
+            return np.zeros((0, self.dim), dtype="float32")
+
+        embs = []
+        bs = int(batch_size or (16 if DEVICE == "cuda" else 8))
+        total = len(texts)
+
+        render = (
+            _inline_progress_renderer(
+                progress_label or "Embedding papers", total, done_summary=progress_done_summary
+            )
+            if progress_label
+            else None
+        )
+        if render:
+            render(0)
+
+        # Resolve the model's actual device robustly
+        model_device = next(self.model.parameters()).device
+
+        with torch.no_grad():
+            for i in range(0, total, bs):
+                batch = texts[i : i + bs]
+                toks = self.tok(
+                    batch, padding=True, truncation=True, max_length=512, return_tensors="pt"
+                ).to(model_device)
+                out = self.model(**toks)
+                cls = out.last_hidden_state[:, 0, :]  # CLS/<s> token
+                cls = torch.nn.functional.normalize(cls, p=2, dim=1)
+                embs.append(cls.detach().cpu().numpy().astype("float32"))
+                if render:
+                    render(min(total, i + len(batch)))
+
+        if render:
+            render(total, final=True)
+
+        return np.vstack(embs) if embs else np.zeros((0, self.dim), dtype="float32")
 
 
 class ChunkEmbedderSBERT:
@@ -2251,44 +2288,44 @@ def _load_temp_candidates(conn, pids: list[int]) -> None:
     conn.commit()
 
 
-def _resolve_model_alias(requested: str, available_ids: list[str]) -> str | None:
-    """Try to reconcile common naming mismatches:
-      - colon <-> hyphen
-      - add/remove vendor prefixes like 'openai/'
-      - case-insensitive match
+# def _resolve_model_alias(requested: str, available_ids: list[str]) -> str | None:
+#     """Try to reconcile common naming mismatches:
+#       - colon <-> hyphen
+#       - add/remove vendor prefixes like 'openai/'
+#       - case-insensitive match
 
-    Returns the canonical available id if a match is found; else None.
-    """
-    req = (requested or "").strip()
-    if not req or not available_ids:
-        return None
+#     Returns the canonical available id if a match is found; else None.
+#     """
+#     req = (requested or "").strip()
+#     if not req or not available_ids:
+#         return None
 
-    # Generate candidate spellings
-    cands = set()
+#     # Generate candidate spellings
+#     cands = set()
 
-    def add(x: str):
-        if x:
-            cands.add(x)
+#     def add(x: str):
+#         if x:
+#             cands.add(x)
 
-    add(req)
-    add(req.replace(":", "-"))
-    add(req.replace("-", ":"))
+#     add(req)
+#     add(req.replace(":", "-"))
+#     add(req.replace("-", ":"))
 
-    # Handle vendor prefixes
-    for v in list(cands):
-        add("openai/" + v)
-        if "/" in v:
-            add(v.split("/", 1)[1])
+#     # Handle vendor prefixes
+#     for v in list(cands):
+#         add("openai/" + v)
+#         if "/" in v:
+#             add(v.split("/", 1)[1])
 
-    # Case-insensitive lookup table of available ids
-    lower_map = {a.lower(): a for a in available_ids}
+#     # Case-insensitive lookup table of available ids
+#     lower_map = {a.lower(): a for a in available_ids}
 
-    # Try direct case-insensitive matches over candidates
-    for c in {x.lower() for x in cands}:
-        if c in lower_map:
-            return lower_map[c]
+#     # Try direct case-insensitive matches over candidates
+#     for c in {x.lower() for x in cands}:
+#         if c in lower_map:
+#             return lower_map[c]
 
-    return None
+#     return None
 
 
 def load_checkpoint() -> dict:
@@ -2758,11 +2795,11 @@ def build_or_update_indices(args):
     )
 
     # ----- TAR SHARD PATH (NO EXTRACTION) -----
-    tar_paths = list(
-        _shard_filter(
-            iter_tar_paths(args.tar_dir, args.tar_manifest), args.shard_id, args.num_shards
-        )
-    )
+    tar_paths = list(_shard_filter(
+        iter_tar_paths(args.tar_dir, args.tar_manifest),
+        args.shard_id, args.num_shards
+    ))
+
     print(f"[scan] found {len(tar_paths)} tar shards in shard {args.shard_id}/{args.num_shards}")
 
     # NOTE: The global --rebuild handling already reset DB/indices/checkpoint
@@ -3806,6 +3843,39 @@ def answer_with_llm(
       - Detect a broader set of context/token-limit errors.
       - On each retry, trim chunks AND reduce max_out to actually free room.
     """
+
+    def _clarify_llm_error(model: str, base_url: str, raw: str) -> str:
+        msg = (raw or "").strip()
+        low = msg.lower()
+        # Common local/LM Studio cases
+        if ("no models loaded" in low) or ("model_not_found" in low) or ("404" in low and "model" in low):
+            return (
+                "[llm] ERROR: The endpoint is up but has no model loaded (or does not recognize "
+                f"{model!r}).\n"
+                f"  • Endpoint: {base_url}\n"
+                "  • Fix (LM Studio): open LM Studio, load a chat model, and enable the local server "
+                "(or run: `lms load <model_name>`). Then rerun your command.\n"
+                "  • Alt: use OpenAI — e.g., `--llm-model o3-mini --openai-api-key $OPENAI_API_KEY`.\n"
+                "  • Alt: retrieval only — add `--no-llm`.\n"
+                f"  • Provider message: {msg}\n"
+            )
+        if ("unauthorized" in low) or ("invalid api key" in low) or ("401" in low):
+            return (
+                "[llm] ERROR: Authentication failed for the LLM endpoint.\n"
+                f"  • Endpoint: {base_url}\n"
+                "  • Fix: pass a valid `--openai-api-key` (OpenAI), or for local servers set a dummy token or none, "
+                "depending on the server’s requirements.\n"
+                f"  • Provider message: {msg}\n"
+            )
+        return (
+            "[llm] ERROR: LLM call failed.\n"
+            f"  • Endpoint: {base_url}\n"
+            f"  • Model: {model}\n"
+            "  • Try: load a local model, switch to an OpenAI model with a valid API key, "
+            "or run with `--no-llm`.\n"
+            f"  • Provider message: {msg}\n"
+        )
+
     # Lazy import to avoid hard dependency during build-only runs.
     try:
         import openai
@@ -3818,6 +3888,20 @@ def answer_with_llm(
     client = OpenAI(base_url=base_url, api_key=api_key, timeout=OPENAI_TIMEOUT_SEC)
     m = (model or "").lower()
     is_o3 = m.startswith("o3")
+
+    # Preflight check: local servers often support `models.list`.
+    # If it returns empty, surface a clear error before the main call.
+    try:
+        models_resp = client.models.list()
+        available = [getattr(x, "id", str(x)) for x in getattr(models_resp, "data", list(models_resp) or [])]
+        if ("localhost" in base_url or "127.0.0.1" in base_url) and not available:
+            raise RuntimeError("No models loaded. Please load an LLM.")
+        if available and (model not in available) and ("localhost" in base_url or "127.0.0.1" in base_url):
+            raise RuntimeError(f"Model {model!r} not found on the local endpoint. Available: {', '.join(available[:8])}{' …' if len(available) > 8 else ''}")
+    except Exception:
+        # Not fatal: some providers don’t implement models.list; proceed to the main call.
+        pass
+
     # Default output budgets (conservative)
     max_out = int(max_out_tokens) if max_out_tokens is not None else 3000
 
@@ -3932,7 +4016,7 @@ def answer_with_llm(
                 continue
 
             # Not an overflow, or no sensible retry left
-            raise
+            raise RuntimeError(_clarify_llm_error(model, base_url, str(e)))
 
 
 # -------------------- Citations: normalize + print only cited --------------------
@@ -4057,8 +4141,7 @@ def main():
         "--tar-dir",
         type=Path,
         default=None,
-        help="Directory containing .tar/.tar.gz shards; stream without extracting. "
-        "If omitted, uses TAR_DIR if that directory exists.",
+        help="Directory containing tar shards; streamed without extracting. "
     )
     ap.add_argument(
         "--tar-manifest",
@@ -4230,9 +4313,72 @@ def main():
 
     args = ap.parse_args()
 
-    # Print paths
+    #--- helper: determine if a directory contains .tar.gz files ---
+    def _has_tars(p: Path) -> bool:
+        try:
+            return p.exists() and (
+                any(p.glob("*.tar"))
+                or any(p.glob("*.tar.*"))   # catches .tar.gz, .tar.bz2, etc.
+                or any(p.glob("*.tgz"))
+            )
+        except Exception:
+            return False
+
+    #--- resolve path to tar shards (CLI > ENV > defaults) ---
+    env_tar = os.getenv("LITKIT_TAR_DIR")
+
+    # Track provenance of tar shard source setting for clarity in logs.
+    tar_dir_origin: str | None = None
+
+    if args.tar_manifest is not None:
+        effective_tar_dir = None
+    elif args.tar_dir is not None:
+        effective_tar_dir = Path(args.tar_dir).expanduser().resolve()
+    elif env_tar:
+        effective_tar_dir = Path(env_tar).expanduser().resolve()
+        tar_dir_origin = "(from LITKIT_TAR_DIR)"
+    else:
+        # Only accept defaults that actually contain tar shards.
+        candidates: list[Path] = [
+            (ROOT.parent / "litkit_input" / "tar_shards"),
+            (WORKSPACE / "tar_shards"),
+        ]
+
+        def _pick(cands: list[Path]) -> Path | None:
+            for c in cands:
+                if _has_tars(c):
+                    return c
+            return None
+
+        effective_tar_dir = _pick(candidates)
+        if effective_tar_dir is not None:
+            tar_dir_origin = "(default)"
+
+    args.tar_dir = effective_tar_dir
+    args.tar_dir_origin = tar_dir_origin
+
+    # No source error
+    if args.tar_dir is None and args.tar_manifest is None:
+        raise SystemExit(
+            "No source specified for tar shards.\n"
+            "Provide --tar-dir or set env LITKIT_TAR_DIR.\n"
+            "You can also pass a file with absolute shard paths via --tar-manifest.\n"
+            f"Defaults checked: {ROOT.parent / 'litkit_input' / 'tar_shards'} and {WORKSPACE / 'tar_shards'}."
+        )
+
+    # If a directory was resolved but has no tar files, exit with error message.
+    if args.tar_manifest is None and args.tar_dir is not None and not _has_tars(args.tar_dir):
+        raise SystemExit(
+            f"No tar shards found in {args.tar_dir}\n"
+            "Expected one of: *.tar, *.tar.gz, *.tar.*, or *.tgz.\n"
+            "Specify a directory containing shards via --tar-dir or LITKIT_TAR_DIR, "
+            "or pass a file with absolute shard paths via --tar-manifest.\n"
+            f"Defaults: {ROOT.parent / 'litkit_input' / 'tar_shards'} or {WORKSPACE / 'tar_shards'}."
+        )
+
+    # Report paths
     if not args.quiet:
-        _report_paths()
+        _report_paths(args.tar_dir, WORKSPACE, args.tar_manifest, args.tar_dir_origin)
 
     # Wire CLI --quiet into the early env-based guard for the rest of the run
     if args.quiet:
@@ -4336,15 +4482,12 @@ def main():
             shard_id=args.shard_id,
         )
 
-    # If --tar-dir is not provided, adopt TAR_DIR (if env setting is present).
-    if args.tar_dir is None and TAR_DIR.exists():
-        args.tar_dir = TAR_DIR
-
-    if args.tar_dir is None and args.tar_manifest is None:
-        raise SystemExit(
-            "tar-only mode: please provide --tar-dir (or --tar-manifest). "
-            "You can also create ./workspace/tar_shards or set LITKIT_INPUT."
-        )
+    # if args.tar_dir is None and args.tar_manifest is None:
+    #     raise SystemExit(
+    #         "No source specified for .tar.gz files. " \
+    #         f"Provide --tar-dir or set env LITKIT_TAR_DIR." \
+    #         f"You can also pass a file with paths to .tar.gz files via --tar-manifest."
+    #     )
 
     # If user asked to build (explicitly) or a rebuild/update is needed, do that first
     # Honor --yes by setting the env so _confirm_rebuild doesn't prompt.
@@ -4432,7 +4575,7 @@ def main():
             sys_prompt=SYS_PROMPT,
         )
     except Exception as e:
-        sys.stderr.write(f"[llm] ERROR: {e}\n")
+        sys.stderr.write(str(e).rstrip() + "\n")
         # Fall back to printing context to unblock usage
         print("\n[llm] Falling back to retrieval-only output.\n")
         answer = ""
