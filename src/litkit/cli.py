@@ -519,7 +519,8 @@ def init_db(journal_mode: str, busy_timeout_ms: int):
     eff_mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
     print(f"[db] journal_mode set to {eff_mode}")
 
-    conn.execute("PRAGMA synchronous=NORMAL;")
+    # Crash-safe on shared filesystems (NFS/Lustre) requires FULL.
+    conn.execute("PRAGMA synchronous=FULL;")
     conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)};")
     conn.execute("PRAGMA temp_store=MEMORY;")  # force in-memory temp storage
 
@@ -891,6 +892,8 @@ def _add_ids_union_compat(
         present = _faiss_present_ids(index) or set()
         mask = np.array([int(i) not in present for i in ids_arr], dtype=bool)
     if not mask.any():
+        # Nothing to add. However, these ids are present in FAISS; mark DB accordingly.
+        _mark_in_index(cur, table, [int(i) for i in ids_arr])
         return 0
     ids_new = ids_arr[mask]
     X_new = np.ascontiguousarray(X[mask].astype("float32"))
@@ -1440,7 +1443,7 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
                             else:
                                 _PENDING_MARKS["chunks"].extend([int(i) for i in ids_added])
                 except RuntimeError:
-                    _add_ids_union_compat(
+                    added = _add_ids_union_compat(
                         chunk_index, ids, X, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
                     )
                 conn.commit()
@@ -1545,9 +1548,11 @@ def backfill_unindexed_vectors(
                         else:
                             _PENDING_MARKS["papers"].extend([int(i) for i in ids_added])
             except RuntimeError:
-                _add_ids_union_compat(
-                    paper_index, ids, Xp, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
+                added = _add_ids_union_compat(
+                     paper_index, ids, Xp, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
                 )
+                if added == 0:  # ensure flags match presence
+                    _mark_in_index(cur, "papers", [int(i) for i in ids])
         conn.commit()
 
     # Chunks
@@ -1583,9 +1588,11 @@ def backfill_unindexed_vectors(
                         else:
                             _PENDING_MARKS["chunks"].extend([int(i) for i in ids_added])
             except RuntimeError:
-                _add_ids_union_compat(
+                added = _add_ids_union_compat(
                     chunk_index, ids, Xc, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
                 )
+                if added == 0:
+                    _mark_in_index(cur, "chunks", [int(i) for i in ids])
         conn.commit()
 
 
@@ -2554,7 +2561,7 @@ def build_or_update_indices(args):
                                                 _PENDING_MARKS["papers"].extend(
                                                     [int(i) for i in ids_added]
                                                 )
-                                papers_added_total += len(u_ids)
+                                papers_added_total += int(added)  # len(u_ids)
 
                             else:
                                 with FileLock(DB_LOCK):
@@ -2607,7 +2614,7 @@ def build_or_update_indices(args):
                                                 _PENDING_MARKS["chunks"].extend(
                                                     [int(i) for i in ids_added]
                                                 )
-                                chunks_added_total += len(u_ids)
+                                chunks_added_total += int(added)  # len(u_ids)
 
                             else:
                                 with FileLock(DB_LOCK):
@@ -2665,23 +2672,43 @@ def build_or_update_indices(args):
             )
             if not isinstance(paper_index, faiss.IndexIDMap2):
                 paper_index = faiss.IndexIDMap2(paper_index)
+            # with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
+            #     try:
+            #         added = len(u_ids)
+            #         sel = _make_id_selector(u_ids)
+            #         _safe_remove_ids(paper_index, sel)
+            #         prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
+            #         paper_index.add_with_ids(Xp, np.asarray(u_ids, dtype=np.int64))
+            #         if prior_ntotal == 0:
+            #             _faiss_save_force(paper_index, PAPER_INDEX_PATH)
+            #         else:
+            #             _faiss_save(paper_index, PAPER_INDEX_PATH)
+            #         _mark_in_index(cur, "papers", u_ids)
+            #     except RuntimeError:
+            #         added = _add_ids_union_compat(
+            #             paper_index, u_ids, Xp, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
+            #         )
+            #     conn.commit()
             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
                 try:
-                    sel = _make_id_selector(u_ids)
-                    _safe_remove_ids(paper_index, sel)
                     prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
-                    paper_index.add_with_ids(Xp, np.asarray(u_ids, dtype=np.int64))
-                    if prior_ntotal == 0:
-                        _faiss_save_force(paper_index, PAPER_INDEX_PATH)
-                    else:
-                        _faiss_save(paper_index, PAPER_INDEX_PATH)
-                    _mark_in_index(cur, "papers", u_ids)
+                    added, ids_added = _add_with_ids_dedup(paper_index, u_ids, Xp)
+                    if added:
+                        if prior_ntotal == 0:
+                            _faiss_save_force(paper_index, PAPER_INDEX_PATH)
+                            _mark_in_index(cur, "papers", [int(i) for i in ids_added])
+                        else:
+                            if _faiss_save(paper_index, PAPER_INDEX_PATH):
+                                _mark_in_index(cur, "papers", [int(i) for i in ids_added])
+                                _flush_pending_marks(cur)
+                            else:
+                                _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
                 except RuntimeError:
-                    _add_ids_union_compat(
+                    added = _add_ids_union_compat(
                         paper_index, u_ids, Xp, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
                     )
                 conn.commit()
-            papers_added_total += len(u_ids)
+            papers_added_total += int(added)
 
         paper_ids_buf.clear()
         paper_texts_buf.clear()
@@ -2695,23 +2722,43 @@ def build_or_update_indices(args):
             )
             if not isinstance(chunk_index, faiss.IndexIDMap2):
                 chunk_index = faiss.IndexIDMap2(chunk_index)
+            # with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
+            #     try:
+            #         added = len(u_ids)
+            #         sel = _make_id_selector(u_ids)
+            #         _safe_remove_ids(chunk_index, sel)
+            #         prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
+            #         chunk_index.add_with_ids(Xc, np.asarray(u_ids, dtype=np.int64))
+            #         if prior_ntotal == 0:
+            #             _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+            #         else:
+            #             _faiss_save(chunk_index, CHUNK_INDEX_PATH)
+            #         _mark_in_index(cur, "chunks", u_ids)
+            #     except RuntimeError:
+            #         added = _add_ids_union_compat(
+            #             chunk_index, u_ids, Xc, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
+            #         )
+            #     conn.commit()
             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
                 try:
-                    sel = _make_id_selector(u_ids)
-                    _safe_remove_ids(chunk_index, sel)
                     prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
-                    chunk_index.add_with_ids(Xc, np.asarray(u_ids, dtype=np.int64))
-                    if prior_ntotal == 0:
-                        _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
-                    else:
-                        _faiss_save(chunk_index, CHUNK_INDEX_PATH)
-                    _mark_in_index(cur, "chunks", u_ids)
+                    added, ids_added = _add_with_ids_dedup(chunk_index, u_ids, Xc)
+                    if added:
+                        if prior_ntotal == 0:
+                            _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+                            _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
+                        else:
+                            if _faiss_save(chunk_index, CHUNK_INDEX_PATH):
+                                _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
+                                _flush_pending_marks(cur)
+                            else:
+                                _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
                 except RuntimeError:
-                    _add_ids_union_compat(
+                    added = _add_ids_union_compat(
                         chunk_index, u_ids, Xc, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
                     )
                 conn.commit()
-            chunks_added_total += len(u_ids)
+            chunks_added_total += int(added)
 
         chunk_ids_buf.clear()
         chunk_texts_buf.clear()
@@ -2861,20 +2908,30 @@ def reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index) -> tuple[i
     # Papers
     ids_present = _faiss_present_ids(paper_index)
     if ids_present is not None:
-        cur.execute("SELECT id FROM papers WHERE in_index=1")
-        bad = [row[0] for row in cur.fetchall() if row[0] not in ids_present]
+        cur.execute("SELECT id, in_index FROM papers")
+        bad = [row[0] for row in cur.fetchall() if row[0] not in ids_present and row[1] == 1]
+        good_missing_flag = [row[0] for row in cur.execute(
+            "SELECT id FROM papers WHERE in_index=0"
+        ).fetchall() if row[0] in ids_present]
         if bad:
             cur.executemany("UPDATE papers SET in_index=0 WHERE id=?", [(i,) for i in bad])
             reset_p = len(bad)
+        if good_missing_flag:
+            cur.executemany("UPDATE papers SET in_index=1 WHERE id=?", [(i,) for i in good_missing_flag])
 
     # Chunks
     ids_present = _faiss_present_ids(chunk_index)
     if ids_present is not None:
-        cur.execute("SELECT id FROM chunks WHERE in_index=1")
-        bad = [row[0] for row in cur.fetchall() if row[0] not in ids_present]
+        cur.execute("SELECT id, in_index FROM chunks")
+        bad = [row[0] for row in cur.fetchall() if row[0] not in ids_present and row[1] == 1]
+        good_missing_flag = [row[0] for row in cur.execute(
+            "SELECT id FROM chunks WHERE in_index=0"
+        ).fetchall() if row[0] in ids_present]
         if bad:
             cur.executemany("UPDATE chunks SET in_index=0 WHERE id=?", [(i,) for i in bad])
             reset_c = len(bad)
+        if good_missing_flag:
+            cur.executemany("UPDATE chunks SET in_index=1 WHERE id=?", [(i,) for i in good_missing_flag])
 
     conn.commit()
     return reset_p, reset_c

@@ -1,4 +1,4 @@
-# /src/litkit/embeddeings/hf_local.py
+# /src/litkit/embeddings/hf_local.py
 
 """
 Utilities for loading Hugging Face models from local snapshots only.
