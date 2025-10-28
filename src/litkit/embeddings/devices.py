@@ -57,7 +57,7 @@ from __future__ import annotations
 import os
 
 
-def configure_threads(default: str | None = None) -> dict:
+def configure_threads(default: str | None = None) -> dict[str, str]:
     """Set BLAS/FAISS thread caps (to avoid crashes) unless env already sets them.
     Respect the setting for LITKIT_THREADS if available.
     Return a dict of values.
@@ -110,7 +110,7 @@ def _mps_ok() -> bool:
         return False
 
 
-def detect_device(force_env: str | None = None) -> dict[str, str]:
+def detect_device(force_env: str | None = None) -> str:
     """Select the device type to be used for embeddings.
     Return a PyTorch device string: 'cuda' | 'mps' | 'cpu'
     Respect the setting for LITKIT_FORCE_DEVICE if force_env is None.

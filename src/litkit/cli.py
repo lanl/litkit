@@ -56,9 +56,8 @@ from litkit.embeddings.base import (
 from litkit.embeddings.base import (
     progress_write as _progress_write,
 )
-from litkit.embeddings.devices import configure_threads, detect_device, resolve_embed_devices
-from litkit.embeddings.sbert_mpnet import ChunkEmbedderSBERT
-from litkit.embeddings.specter2 import PaperEmbedderSpecter2
+from litkit.embeddings.devices import configure_threads, detect_device
+from litkit.embeddings.factory import make_chunk_embedder, make_paper_embedder
 from litkit.formatting.answers import (
     normalize_answer_and_build_refs,
     render_references,
@@ -1897,11 +1896,12 @@ def build_or_update_indices(args):
     conn = init_db(args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
     cur = conn.cursor()
 
-    # Embedders (lazy init later if training needs them)
-    paper_embedder = PaperEmbedderSpecter2()
-    chunk_embedder = ChunkEmbedderSBERT(
-        devices=resolve_embed_devices(args.embed_devices, force=args.force_embed_devices),
+    # Embedders
+    paper_embedder, _paper_cfg = make_paper_embedder()
+    chunk_embedder, _chunk_cfg = make_chunk_embedder(
+        devices=args.embed_devices,
         workers=args.embed_workers,
+        force_devices=args.force_embed_devices,
     )
 
     paper_dim = 768
@@ -2971,7 +2971,7 @@ def shortlist_papers(
     """Stage 1: encode the question with SPECTER2 and retrieve top-k paper IDs
     from the paper index (HNSW by default). Returns a list of paper ids.
     """
-    enc = embedder or PaperEmbedderSpecter2()
+    enc = embedder or make_paper_embedder()[0]
     q = enc.encode([question])
     ids, _, meta = _faiss_search(PAPER_INDEX_PATH, q, k, efSearch=efsearch)
     try:
@@ -3020,7 +3020,7 @@ def search_chunks_constrained(
         chunk_ids: top-k ranked chunk IDs (lexical-first, de-duped, then ANN order).
         meta: effective FAISS search params for the last query (e.g., {"nprobe": int, "nlist": int}).
     """
-    enc = embedder or ChunkEmbedderSBERT()
+    enc = embedder or make_chunk_embedder()[0]
     q = enc.encode([question])
     did_fallback = False  # always define; set True only when we drop the shortlist
 
@@ -3958,10 +3958,11 @@ def main():
             if p_reset or c_reset:
                 print(f"[reconcile] reset flags — papers={p_reset} chunks={c_reset}")
             # backfill (uses current embedders)
-            paper_embedder = PaperEmbedderSpecter2()
-            chunk_embedder = ChunkEmbedderSBERT(
-                devices=resolve_embed_devices(args.embed_devices, force=args.force_embed_devices),
+            paper_embedder, _ = make_paper_embedder()
+            chunk_embedder, _ = make_chunk_embedder(
+                devices=args.embed_devices,
                 workers=args.embed_workers,
+                force_devices=args.force_embed_devices,
             )
             backfill_unindexed_vectors(
                 conn,
