@@ -7,7 +7,7 @@ from typing import Any
 from .base import Embedder  # protocol for type hints
 from .devices import detect_device, resolve_embed_devices
 from .sbert_mpnet import SBERT_ID, ChunkEmbedderSBERT
-from .specter2 import PaperEmbedderSpecter2
+from .specter2 import PaperEmbedderSpecter2, SPECTER2_ID
 
 
 def make_paper_embedder() -> tuple[Embedder, dict[str, Any]]:
@@ -25,9 +25,9 @@ def make_paper_embedder() -> tuple[Embedder, dict[str, Any]]:
     cfg = {
         "type": "paper",
         "impl": "PaperEmbedderSpecter2",
-        "model_id": "allenai/specter2",  # informational only
+        "model_id": SPECTER2_ID,  # informational only
         "dim": int(dim),
-        "device": detect_device(),  # best-effort hint; SPECTER2 may override internally
+        "device": getattr(e, "device", detect_device()),
     }
     return e, cfg
 
@@ -56,7 +56,9 @@ def make_chunk_embedder(
         embedder : object implementing Embedder.encode(list[str]) -> np.ndarray
         cfg      : dict with metadata (model id, dim, devices, workers)
     """
-    dev_list = resolve_embed_devices(devices, force=force_devices)
+
+    spec = ",".join(devices) if isinstance(devices, list) else (devices or "auto")
+    dev_list = resolve_embed_devices(spec, force=force_devices)
     e = ChunkEmbedderSBERT(devices=dev_list, workers=workers)
     dim = getattr(e, "dim", 768)
     cfg = {
