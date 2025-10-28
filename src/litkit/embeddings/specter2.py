@@ -1,4 +1,4 @@
-# /src/embeddings/specter2.py
+# /src/litkit/embeddings/specter2.py
 
 # Paper-level embedder using SPECTER2 (title+abstract → 768-dim)
 
