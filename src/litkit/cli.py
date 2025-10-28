@@ -1549,7 +1549,7 @@ def backfill_unindexed_vectors(
                             _PENDING_MARKS["papers"].extend([int(i) for i in ids_added])
             except RuntimeError:
                 added = _add_ids_union_compat(
-                     paper_index, ids, Xp, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
+                    paper_index, ids, Xp, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
                 )
                 if added == 0:  # ensure flags match presence
                     _mark_in_index(cur, "papers", [int(i) for i in ids])
@@ -2910,28 +2910,36 @@ def reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index) -> tuple[i
     if ids_present is not None:
         cur.execute("SELECT id, in_index FROM papers")
         bad = [row[0] for row in cur.fetchall() if row[0] not in ids_present and row[1] == 1]
-        good_missing_flag = [row[0] for row in cur.execute(
-            "SELECT id FROM papers WHERE in_index=0"
-        ).fetchall() if row[0] in ids_present]
+        good_missing_flag = [
+            row[0]
+            for row in cur.execute("SELECT id FROM papers WHERE in_index=0").fetchall()
+            if row[0] in ids_present
+        ]
         if bad:
             cur.executemany("UPDATE papers SET in_index=0 WHERE id=?", [(i,) for i in bad])
             reset_p = len(bad)
         if good_missing_flag:
-            cur.executemany("UPDATE papers SET in_index=1 WHERE id=?", [(i,) for i in good_missing_flag])
+            cur.executemany(
+                "UPDATE papers SET in_index=1 WHERE id=?", [(i,) for i in good_missing_flag]
+            )
 
     # Chunks
     ids_present = _faiss_present_ids(chunk_index)
     if ids_present is not None:
         cur.execute("SELECT id, in_index FROM chunks")
         bad = [row[0] for row in cur.fetchall() if row[0] not in ids_present and row[1] == 1]
-        good_missing_flag = [row[0] for row in cur.execute(
-            "SELECT id FROM chunks WHERE in_index=0"
-        ).fetchall() if row[0] in ids_present]
+        good_missing_flag = [
+            row[0]
+            for row in cur.execute("SELECT id FROM chunks WHERE in_index=0").fetchall()
+            if row[0] in ids_present
+        ]
         if bad:
             cur.executemany("UPDATE chunks SET in_index=0 WHERE id=?", [(i,) for i in bad])
             reset_c = len(bad)
         if good_missing_flag:
-            cur.executemany("UPDATE chunks SET in_index=1 WHERE id=?", [(i,) for i in good_missing_flag])
+            cur.executemany(
+                "UPDATE chunks SET in_index=1 WHERE id=?", [(i,) for i in good_missing_flag]
+            )
 
     conn.commit()
     return reset_p, reset_c

@@ -7,7 +7,7 @@ from typing import Any
 from .base import Embedder  # protocol for type hints
 from .devices import detect_device, resolve_embed_devices
 from .sbert_mpnet import SBERT_ID, ChunkEmbedderSBERT
-from .specter2 import PaperEmbedderSpecter2, SPECTER2_ID
+from .specter2 import SPECTER2_ID, PaperEmbedderSpecter2
 
 
 def make_paper_embedder() -> tuple[Embedder, dict[str, Any]]:
