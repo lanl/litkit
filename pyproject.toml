@@ -4,17 +4,29 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "litkit"
-version = "0.3.27"
+version = "0.3.33"
 description = "Literature tooling: ingest, embed, index, answer."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12,<3.13"
 license = { text = "Proprietary" }
 authors = [{ name = "William S. Hlavacek", email = "hlavacek@lanl.gov" }]
+
+dependencies = [
+  "lxml>=5.2,<6",
+  "sympy==1.13.1",
+  "numpy<2",
+  "safetensors>=0.4,<1",
+  "sentence-transformers>=3.1,<4",
+  "transformers>=4.44,<5",
+  "openai>=1,<2",
+  "faiss-cpu>=1.8,<1.9",
+  "torch==2.5.1.*",
+]
 
 # Advertise supported operating systems (informational)
 classifiers = [
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.12",
   "Operating System :: POSIX",
   "Operating System :: POSIX :: Linux",
   "Operating System :: MacOS",
@@ -22,10 +34,8 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-gpu = ["torch", "transformers"]
-index = ["faiss-cpu"]
+# Dev tools
 dev = ["black", "ruff", "mypy", "pytest"]
-all = ["torch", "transformers", "faiss-cpu"]
 
 [project.scripts]
 litkit = "litkit.cli:main"
@@ -43,24 +53,26 @@ include = ["litkit*"]
 # Formatting / linting
 [tool.black]
 line-length = 100
-target-version = ["py310"]
+target-version = ["py312"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py312"
 fix = true
+unsafe-fixes = false
 src = ["src", "tests"]
-exclude = [".venv", "build", "dist", ".eggs", "*.egg-info"]
+exclude = [".venv", "build", "dist", ".eggs", "*.egg-info", "workspace"]
 
 [tool.ruff.lint]
-select = ["E", "W", "F", "I", "D", "UP", "B"]
-ignore = ["D105", "D107"]  # magic methods and __init__ do not require docstrings
+select = ["E", "W", "F", "I", "UP", "B"]  # Add "D" later.
+ignore = ["E501", "D105", "D107"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
-[tool.ruff.per-file-ignores]
+[tool.ruff.lint.per-file-ignores]
 "tests/**/*" = ["D"]
+"src/litkit/cli.py" = ["E402", "B006", "B008", "B023"]
 
 # Disclosure
 [tool.litkit.ai_assistance]
@@ -68,3 +80,14 @@ used = true
 models = ["ChatGPT"]
 scope = ["refactoring", "docs", "packaging"]
 human_reviewed = true
+
+# --- uv resolver config (for reproducible GPU locking) ---
+[tool.uv]
+# Only resolve for the platform/arch/Python we actually ship.
+environments = [
+  "sys_platform == 'linux' and platform_machine == 'aarch64' and python_full_version >= '3.12' and python_full_version < '3.13'"
+]
+
+# Tell uv exactly where to get torch. This enforces our CUDA 12.5.0 build.
+[tool.uv.sources]
+torch = { path = "wheels/torch-2.5.1-cp312-cp312-linux_aarch64.whl" }

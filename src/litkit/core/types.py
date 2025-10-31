@@ -1,6 +1,6 @@
 # src/litkit/core/types.py
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Optional, Sequence
 
 
 @dataclass(frozen=True)
@@ -8,7 +8,7 @@ class Chunk:
     id: str
     paper_id: str
     text: str
-    section: Optional[str] = None
+    section: str | None = None
     order: int = 0
 
 
@@ -16,5 +16,5 @@ class Chunk:
 class Document:
     id: str
     title: str
-    abstract: Optional[str]
+    abstract: str | None
     chunks: Sequence[Chunk] = ()

@@ -8,26 +8,25 @@ Public API
 ----------
 - cap_chunks_per_paper(chunk_ids_in_rank_order, chunkid_to_paperid, max_per_paper=3) -> list[int]
 
-Notes
+Notes:
 -----
 - This module has no dependencies beyond the Python standard library.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any
 
 
-def cap_chunks_per_paper(chunk_ids_in_rank_order: List[int],
-                         chunkid_to_paperid: Dict[int, Any],
-                         max_per_paper: int = 3) -> List[int]:
-    """
-    Helper for Stage-2: enforce a per-paper cap over a ranked list of chunk IDs.
+def cap_chunks_per_paper(
+    chunk_ids_in_rank_order: list[int], chunkid_to_paperid: dict[int, Any], max_per_paper: int = 3
+) -> list[int]:
+    """Helper for Stage-2: enforce a per-paper cap over a ranked list of chunk IDs.
 
     Returns a filtered list preserving original order.
     """
-    count: Dict[Any, int] = {}
-    out: List[int] = []
+    count: dict[Any, int] = {}
+    out: list[int] = []
     for cid in chunk_ids_in_rank_order:
         pid = chunkid_to_paperid.get(cid)
         c = count.get(pid, 0)
