@@ -22,24 +22,28 @@ This project implements an **offline** retrieval‑augmented generation workflow
 1. Create and activate a Python env (conda/mamba/venv) with:
 
    ```bash
-   # Python ≥ 3.10
-   pip install faiss-cpu transformers sentence-transformers torch lxml openai numpy
+   # Python ≥ 3.10 (3.12 preferred)
+   pip install "faiss-cpu" "transformers" "sentence-transformers" "torch" "lxml" "openai" "numpy<2"
    # sqlite3 is stdlib
    ```
 
-   **Devices & acceleration (important)**
+   **Devices & acceleration (facts):**
 
-   - CUDA multi‑GPU distribution is supported and used **only** on NVIDIA GPUs.  
-     On Apple Silicon (MPS) and CPU‑only hosts, encoding runs on a single device.
+   - CUDA multi‑GPU distribution is **NVIDIA‑only**.  
+     On Apple Silicon (MPS) and CPU‑only hosts, encoding uses a single device.
    - The **EmbeddingPool** uses one process per CUDA device; it does **not** spawn workers on MPS.
-   - If you pass `--embed-devices auto` on Apple, you will see `mps` and a single worker. Multi‑GPU sharding (`cuda:0,cuda:1,…`) requires NVIDIA GPUs.
+   - `--embed-devices auto` on Apple yields `mps` and a single worker. Multi‑GPU sharding (`cuda:0,cuda:1,…`) requires NVIDIA.
 
-2. Place **local HF snapshots** (air‑gapped) under `./hf_cache/hub/`:
+2. Place **local HF snapshots** (for offline/air‑gapped runs) under `./hf_cache/hub/`:
 
    - `allenai/specter2_base`  
    - `sentence-transformers/all-mpnet-base-v2`
 
-   The CLI sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` automatically.
+   To force offline behavior, set:
+   ```bash
+   export HF_HUB_OFFLINE=1
+   export TRANSFORMERS_OFFLINE=1
+   ```
 
 3. Build indices (single‑process writer):
 
@@ -53,7 +57,7 @@ This project implements an **offline** retrieval‑augmented generation workflow
    python -m litkit --faiss-writer --rebuild --build-only
    ```
 
-4. Query (uses local LLM endpoint by default for testing):
+4. Query (defaults to local OpenAI‑compatible endpoint for testing or whatever you pass via env/CLI):
 
    ```bash
    python -m litkit "What is BioNetGen?"
@@ -75,37 +79,34 @@ This project implements an **offline** retrieval‑augmented generation workflow
 
 5. Tuning / Troubleshooting
 
-   - If you see a context‑length error on small‑context local models (e.g., 4096 tokens), either reduce retrieval sizes:
+   - If you hit a context‑length error on small‑context local models (e.g., 4k tokens), either reduce retrieval sizes:
      ```
      --top-chunks 10 --overshoot 10
      ```
-     or lower the prompt budget (built‑in default for OSS models is conservative).
-   - `--top-chunks` controls how many chunks are passed to the LLM (default: 30).
-   - `--overshoot` widens ANN search before filtering to shortlisted papers (default: 20), which can increase recall but may increase prompt size; reduce it if you hit limits.
-   - The script auto‑trims and retries (×4) when an overflow is detected.
-   - `--ckpt-every` controls how often we persist resume progress (default: 500 files). Increase on slow parallel filesystems to reduce metadata churn.
+     or lower the prompt budget. The script auto‑trims and retries (×4) when overflow is detected.
+   - `--top-chunks` controls how many chunks reach the LLM (default: 30).
+   - `--overshoot` widens ANN search before paper‑level filtering (default: 20); reduce if prompt size is an issue.
+   - `--ckpt-every` controls resume checkpoints (default: 500 files).
 
 ---
 
 ## SQLite journal mode (HPC filesystems)
 
-- **Default:** `TRUNCATE`. On shared HPC filesystems (e.g., NFS/Lustre), `WAL` can cause “database is locked” errors or poor behavior under preemption. Use `WAL` **only** on node‑local storage (e.g., NVMe) with a single writer.
+- **Default:** `TRUNCATE`. On shared HPC filesystems (NFS/Lustre), `WAL` can cause “database is locked” or poor behavior under preemption. Use `WAL` **only** on node‑local storage with a single writer.
 
 - **How to set:**
   ```bash
-  # CLI
   --sqlite-journal-mode {TRUNCATE|WAL}
   ```
-  (Other modes like `DELETE`/`MEMORY`/`OFF` are intentionally unsupported.)
 
-- **HPC guidance:**
-  - Use `TRUNCATE` when the DB lives on shared storage.
-  - If you place the DB on node‑local NVMe/scratch and have a single writer, `WAL` is acceptable and faster.
+- **Guidance:**
+  - Shared storage → `TRUNCATE`.
+  - Node‑local NVMe (single writer) → `WAL` is acceptable and faster.
 
 - **What the code does:**
-  - Applies `PRAGMA journal_mode` to the chosen mode.
-  - Sets `wal_autocheckpoint=1000` only when in `WAL` mode.
-  - Logs the effective choice as: `[db] journal_mode set to wal|truncate|delete`.
+  - Applies `PRAGMA journal_mode`.
+  - Sets `wal_autocheckpoint=1000` only for `WAL`.
+  - Logs: `[db] journal_mode set to wal|truncate|delete`.
 
 - **Quick check:**
   ```bash
@@ -116,14 +117,12 @@ This project implements an **offline** retrieval‑augmented generation workflow
   # Expect: [db] journal_mode set to wal
   ```
 
-- If you see “database is locked” or odd stalls on a shared FS, switch to `TRUNCATE`.
-
 ---
 
 ## Chunking
 
-- Greedily pack paragraphs to ~`CHUNK_TARGET_CHARS`. A small tail chunk is merged into the previous one so most chunks meet `CHUNK_MIN_CHARS`.
-- Add a small character overlap between consecutive chunks (default `CHUNK_OVERLAP_CHARS=200`) to reduce claim‑splitting across boundaries.
+- Greedily pack paragraphs to ~`CHUNK_TARGET_CHARS`. Small tail merged to meet `CHUNK_MIN_CHARS`.
+- Character overlap (default `CHUNK_OVERLAP_CHARS=200`) reduces claim splitting.
 
 **Tunables (CLI):**
 ```
@@ -131,93 +130,58 @@ This project implements an **offline** retrieval‑augmented generation workflow
 --chunk-min-chars     (default 300)
 --chunk-overlap       (default 200)
 ```
-For biomedical prose, the defaults are robust; raise overlap to 200–250 if you observe cross‑paragraph claims being split in answers.
 
 ---
 
 ## Busy timeout (locks on shared filesystems)
 
-- The script sets both Python's connect() timeout and SQLite `PRAGMA busy_timeout` to the same value. **Default:** `120000 ms` (120 s).
-
-**Override:**
-- Env: `LITKIT_SQLITE_BUSY_TIMEOUT_MS=180000`  
-- CLI: `--sqlite-busy-timeout-ms 180000`
+- **Default:** `120000 ms` (`--sqlite-busy-timeout-ms`), applied to both Python connect and SQLite `PRAGMA busy_timeout`.
 
 **Recommendations:**
 - Shared NFS/Lustre with multiple writers: 120–300 s
-- Node‑local NVMe (single writer): 10–30 s is usually fine
-- Keep `journal_mode=TRUNCATE` on shared FS. Use `WAL` only on node‑local storage.
-
-**Symptom & fix:** If you see “database is locked” under load, raise `--sqlite-busy-timeout-ms` and ensure you are using `TRUNCATE` on shared storage.
+- Node‑local NVMe (single writer): 10–30 s
+- If you see “database is locked,” raise the timeout and ensure `TRUNCATE` on shared FS.
 
 ---
 
 ## Quick start — HPC (ARM CPUs + NVIDIA GPUs) [CUDA]
 
-1. Use a CUDA‑enabled PyTorch build and `faiss-gpu` or `faiss-cpu` as available. The script auto‑detects device:
-   `cuda` (NVIDIA GPU) → `mps` (Apple Metal) → `cpu` (fallback).
-
-2. Ensure the same **offline HF snapshots** exist on the node(s) (see above).
-
-3. For multi‑process ingestion on a shared filesystem:
-   - Choose exactly **one writer** (adds vectors to FAISS, saves indices).
-   - Others run as **non‑writers** (DB rows only), e.g., with sharding:
-
+1. Use a CUDA‑enabled PyTorch build and `faiss-gpu` or fallback `faiss-cpu`. Device selection: `cuda` → `mps` → `cpu`.
+2. Ensure the **offline HF snapshots** exist (see Mac instructions).
+3. Multi‑process ingestion on shared FS:
+   - Exactly **one writer** (adds vectors to FAISS, saves indices).
+   - Others run as **non‑writers** (DB rows only), e.g.:
      ```bash
      # writer on shard 0
      python -m litkit --faiss-writer --shard-id 0 --num-shards 8 --build-only
      # readers on shards 1..7
      python -m litkit --shard-id 1 --num-shards 8 --build-only
-     # ... repeat for 2..7
      ```
-
-   The writer creates/updates indices while all processes insert into SQLite.
-
-4. Query as usual (o3 model recommended for production if online):
-
+4. Query as usual. If you have OpenAI access, e.g.:
    ```bash
-   export OPENAI_API_KEY="sk-..."   # if you’re using OpenAI o3 online
+   export OPENAI_API_KEY="sk-..."
    python -m litkit --llm-model o3 "Summarize X"
    ```
 
-**GPU batch‑size presets** (tested on CUDA; override via `--paper-embed-bs` / `--chunk-embed-bs`)
-
-- **V100 32 GB**  
-  `--paper-embed-bs 48`  
-  `--chunk-embed-bs 128`
-
-- **H100 80 GB**  
-  `--paper-embed-bs 96`  
-  `--chunk-embed-bs 256`
-
-Notes:
-- `all-mpnet-base-v2` and SPECTER2 use `seq=512`; these presets balance throughput vs. headroom.
-- If you see OOM on V100, drop chunk batch to 96 or 64. H100 can usually go higher (e.g., 192–256+).
+**GPU batch‑size presets (baseline):**
+- **V100 32 GB**: `--paper-embed-bs 48`, `--chunk-embed-bs 128`
+- **H100 80 GB**: `--paper-embed-bs 96`, `--chunk-embed-bs 256`
 
 ---
 
 ## HPC / cluster recipes (tar shards, single writer, resumable)
 
-**Prereqs (one time per project)**
+**Prereqs (one‑time per project)**
 
 ```bash
-# Writable base (shared or node-local). All sqlite/, indices/, hf_cache/ go here.
-export LITKIT_WORKSPACE=/lustre/$USER/litkit
-
-# Optional: make logs quieter on giant tar.gz shards
-export LITKIT_TAR_RENDER_SEC=30      # progress refresh every N seconds (default: 5)
-export LITKIT_TAR_PCT_STP=5          # also print each +5% milestone (0=off)
-
-# Optional: skip tar member prescan if counting is expensive
-# (default is LITKIT_TAR_PRESCAN=0 on HPC)
-export LITKIT_TAR_PRESCAN=0
-
-# Optional: cap math/BLAS/FAISS threads to keep nodes polite
-export LITKIT_THREADS=32
+export LITKIT_WORKSPACE=/lustre/$USER/litkit    # writable base
+export LITKIT_TAR_PRESCAN=0                     # default on HPC; keep off for huge shards
+export LITKIT_TAR_RENDER_SEC=30                 # progress refresh cadence
+export LITKIT_TAR_PCT_STP=5                     # +5% milestones
+export LITKIT_THREADS=32                        # cap BLAS/FAISS threads
 ```
 
 **Recommended shard layout**
-
 ```
 /lustre/$USER/pmcoa_tar_shards/
     shard_0001.tar.gz
@@ -226,97 +190,285 @@ export LITKIT_THREADS=32
 ```
 
 **Single FAISS writer (build indices from tar shards)**
-
 ```bash
-srun -N1 -n1 python -m litkit   --faiss-writer --build-only --rebuild   --tar-dir /lustre/$USER/pmcoa_tar_shards   --sqlite-journal-mode TRUNCATE --sqlite-busy-timeout-ms 180000   --papers-index hnsw --hnsw-m 32 --efconstruction 200 --efsearch 128   --chunks-index ivfpq --ivf-nlist 16384 --pq-m 64 --nprobe 64   --paper-embed-bs 24 --chunk-embed-bs 24
+python -m litkit \
+  --faiss-writer --build-only --rebuild \
+  --tar-dir /lustre/$USER/pmcoa_tar_shards \
+  --sqlite-journal-mode TRUNCATE --sqlite-busy-timeout-ms 180000 \
+  --papers-index hnsw --hnsw-m 32 --efconstruction 200 --efsearch 128 \
+  --chunks-index ivfpq --ivf-nlist 16384 --pq-m 64 --nprobe 64 \
+  --paper-embed-bs 24 --chunk-embed-bs 24
 ```
 
-Notes:
-- `journal_mode=TRUNCATE` is safest on NFS/Lustre. `WAL` is fine only on node‑local NVMe.
-- `ivf-nlist` is an upper bound; code auto‑reduces to respect training samples (~40× rule).
-- `nprobe` defaults to ~√(nlist) if omitted; 64 is a good starting point.
-- Batch sizes: CPU/MPS ~16–32; CUDA GPUs ~64–128 (adjust to your memory).
-
-**Scale‑out readers (DB only, no FAISS mutation)**
-
+**Scale‑out readers (DB only)**
 ```bash
-# Example: 8 shards total – writer is shard 0; launch readers on 1..7
 for s in 1 2 3 4 5 6 7; do
-  srun -N1 -n1 --exclusive python -m litkit     --build-only --shard-id $s --num-shards 8     --tar-dir /lustre/$USER/pmcoa_tar_shards     --sqlite-journal-mode TRUNCATE --sqlite-busy-timeout-ms 180000 &
+  python -m litkit \
+    --build-only --shard-id $s --num-shards 8 \
+    --tar-dir /lustre/$USER/pmcoa_tar_shards \
+    --sqlite-journal-mode TRUNCATE --sqlite-busy-timeout-ms 180000 &
 done
 wait
 ```
 
-**SLURM job‑array variant (one writer + array readers)**
-
-Writer:
+**Query against a local endpoint**
 ```bash
-sbatch <<'EOF'
-#!/bin/bash
-#SBATCH -J litkit-writer -N 1 -n 1 -c 16
-srun python -m litkit   --faiss-writer --build-only --rebuild   --tar-dir /lustre/$USER/pmcoa_tar_shards   --sqlite-journal-mode TRUNCATE --sqlite-busy-timeout-ms 180000   --papers-index hnsw --hnsw-m 32 --efconstruction 200 --efsearch 128   --chunks-index ivfpq --ivf-nlist 16384 --pq-m 64 --nprobe 64   --paper-embed-bs 24 --chunk-embed-bs 24
-EOF
-```
-
-Readers (array 1..7 for an 8‑way split):
-```bash
-sbatch <<'EOF'
-#!/bin/bash
-#SBATCH -J litkit-readers -N 1 -n 1 -c 16
-#SBATCH --array=1-7
-srun python -m litkit   --build-only --shard-id ${SLURM_ARRAY_TASK_ID} --num-shards 8   --tar-dir /lustre/$USER/pmcoa_tar_shards   --sqlite-journal-mode TRUNCATE --sqlite-busy-timeout-ms 180000
-EOF
-```
-
-**Query (offline or local OpenAI‑compatible endpoint)**
-
-```bash
-# Example: local endpoint (LM Studio) on http://localhost:1234/v1
-python -m litkit   --offline   --llm-model gpt-oss:20b   --openai-base-url http://localhost:1234/v1   --openai-api-key no-auth   --nprobe 64   "How is mathematical modeling useful in the study of HIV dynamics?"
+python -m litkit \
+  --offline \
+  --llm-model gpt-oss:20b \
+  --openai-base-url http://localhost:1234/v1 \
+  --openai-api-key no-auth \
+  --nprobe 64 \
+  "How is mathematical modeling useful in the study of HIV dynamics?"
 ```
 
 **Operational tips**
 
-- Checkpointing: `--ckpt-every` controls commit+checkpoint cadence (default 500).
-- Save throttling: index saves are rate‑limited (`LITKIT_SAVE_EVERY_SEC`, default 120).
-- Progress mode: logs append by default; set `LITKIT_PROGRESS_MODE=tty` for single‑line bars.
-- Resumes: tar streaming resumes per‑shard via a persisted member counter.
+- `--ckpt-every` controls commit+checkpoint cadence (default 500).
+- Index saves are rate‑limited by `LITKIT_SAVE_EVERY_SEC` (default 120).
+- `LITKIT_PROGRESS_MODE=tty` for single‑line bars.
+- Tar streaming resumes per‑shard via a persisted member counter.
 
 ---
 
 ## Writable work directory (`LITKIT_WORKSPACE`)
 
-By default, the script writes to folders next to the script (`sqlite/`, `indices/`, `hf_cache/`).  
-On HPC, you specify the destintion of writable artifacts by setting:
+By default, artifacts go next to the script (`sqlite/`, `indices/`, `hf_cache/`, `emb_segments/`).  
+On HPC, set:
 
 ```bash
-export LITKIT_WORKSPACE=/lustre/$USER/litkit   # or any writable Lustre/NFS path
+export LITKIT_WORKSPACE=/lustre/$USER/litkit
 ```
 
-When set, the following directories are created under `$LITKIT_WORKSPACE`:
+Then litkit creates (under `$LITKIT_WORKSPACE`):
 
 - `sqlite/`   (SQLite DB, checkpoints, locks)  
 - `indices/`  (FAISS indices)  
-- `hf_cache/` (local HF snapshots for offline runs)
+- `hf_cache/` (local HF snapshots)  
 - `emb_segments/` (embedding segments)
 
-**Important:**
-
-- `LITKIT_WORKSPACE` should point to a writable Lustre/NFS (shared) or node‑local path.
-- On shared filesystems, prefer `--sqlite-journal-mode TRUNCATE` (see SQLite guidance).
-
 ---
 
-## Guardrails & safety (o3 vs local OSS)
+## Guardrails & safety (o‑series vs local OSS)
 
-- OpenAI’s hosted o‑series models (e.g., `o3`) always enforce OpenAI safety policies. There is no API flag to disable guardrails.
+- OpenAI o‑series (e.g., `o3`) always enforce OpenAI safety policies.
 - For fully offline or unguardrailed runs, use a **local** OpenAI‑compatible endpoint.
-- Prompt discipline: By default the script runs in **strict RAG** mode and prompts tell the model to use **only** the provided context and to include bracketed citations.
+- Prompts default to strict RAG: **use only provided context** and bracketed citations.
 
 ---
 
-## Notes
+## Reproducible locking with `uv.lock`
 
-- **Overshoot:** during chunk retrieval we search more candidates (`k * overshoot`) then filter down to the shortlisted candidate papers; improves recall.
-- **Multiple data subdirectories:** pass the **parent** (e.g., `./data`). The script recurses into `pmc_oa_xml_dir01`, `pmc_oa_xml_dir02`, etc.
-- **Air‑gap:** the script is robust to missing internet; all models must be present locally (HF snapshot paths). If a snapshot is missing, it throws a clear `FileNotFoundError` with guidance.
+A `uv.lock` file (derived from `pyproject.toml`) is used for reproducible container builds.
+
+**On a non‑GPU frontend:**
+```bash
+cd /path/to/litkit
+python3.12 -m pip install --user uv
+~/.local/bin/uv lock --python 3.12
+```
+Commit the resulting `uv.lock`.
+
+---
+
+## SPECTER2: `.bin` → `.safetensors`
+
+Recent `transformers` releases block unsafe `torch.load` on `.bin` (older Torch) due to CVEs. We avoid `torch.load` at runtime by using **safetensors**.
+
+- Set:
+  ```bash
+  export TRANSFORMERS_USE_SAFE_TENSORS=1
+  ```
+- Convert once:
+  - Use the provided `setup_safetensors.sh` to convert `pytorch_model.bin` → `model.safetensors` for **SPECTER2** in your HF cache.
+  - After conversion, the embedder loads `model.safetensors` and never calls `torch.load` on `.bin`.
+
+---
+
+## HPC cluster — GH200 & V100: install & run
+
+Two container flavors:
+
+- **lean** (recommended): no CUDA userspace inside; bind site CUDA libs at runtime via Charliecloud + CDI. Most portable.
+- **nv**: CUDA userspace baked into the image; simpler to run, but cluster driver must be ≥ the baked CUDA version.
+
+### Common prerequisites
+
+- Charliecloud ≥ 0.42
+- Generate a CDI spec once per GPU type:
+  ```bash
+  # GH200 (Grace Hopper) example
+  mkdir -p /path/to/cdi-grace
+  nvidia-ctk cdi generate --format=json \
+    --output=/path/to/cdi-grace/nvidia.json
+  nvidia-ctk cdi list --spec-dir=/path/to/cdi-grace
+  ```
+- Host CUDA 12.5 userspace (for lean flavor):
+  ```bash
+  ch-image pull nvidia/cuda:12.5.0-devel-ubuntu22.04
+  DEST=/path/to/cuda-12.5-host
+  mkdir -p "$DEST"
+  ch-run nvidia/cuda:12.5.0-devel-ubuntu22.04 -- bash -lc \
+    'tar -C /usr/local -cf - cuda-12.5' | tar -C "$DEST" -xvf -
+  ```
+
+Define (per node type):
+```bash
+# GH200
+export CDI_SPEC_DIR="/path/to/cdi-grace"
+# V100
+export CDI_SPEC_DIR="/path/to/cdi-v100"
+
+export CUDA_BASE="/path/to/cuda-12.5-host/cuda-12.5"
+export CUDA_LIBA="$CUDA_BASE/targets/sbsa-linux/lib"
+export CUDA_LIBB="$CUDA_BASE/lib64"
+```
+
+### Smoke test: CUDA inside the container (lean flavor)
+
+```bash
+module purge
+module load charliecloud/0.42
+module load cuda/12.5.0
+
+IMG=/path/to/litkit/sqfs/litkit-v0.3.33-aarch64-lean.sqfs
+
+ch-run "$IMG" \
+  --unset-env='*' \
+  --cdi-dirs="$CDI_SPEC_DIR" --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  -- /root/.local/share/uv/tools/litkit/bin/python - <<'PY'
+import torch, sys, os
+print("Python:", sys.version.split()[0])
+print("Torch:", torch.__version__, "CUDA build:", torch.version.cuda)
+print("LD_LIBRARY_PATH:", os.environ.get("LD_LIBRARY_PATH"))
+print("CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("Device 0:", torch.cuda.get_device_name(0),
+          "CC:", torch.cuda.get_device_capability(0))
+PY
+```
+
+If you see `CUDA available: False`, you didn’t bind CUDA libs or CDI correctly.
+
+### Build vector store (test run)
+
+```bash
+HF_HOST=/path/to/hf_cache_persist
+mkdir -p "$HF_HOST"
+
+# Convert SPECTER2 .bin -> .safetensors once (required)
+./setup_safetensors.sh
+
+ch-run "$IMG" \
+  --unset-env='*' \
+  --set-env=HOME=/root \
+  --cdi-dirs="$CDI_SPEC_DIR" --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --bind "/path/to/test_tar_shards:/path/to/test_tar_shards" \
+  --bind "$(pwd)/workspace:/workspace" \
+  --bind "$HF_HOST:/app/hf_cache" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  --set-env="LITKIT_WORKSPACE=/workspace" \
+  --set-env="HF_HOME=/app/hf_cache" \
+  --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
+  -- litkit --faiss-writer --build-only --rebuild --yes \
+            --tar-dir /path/to/test_tar_shards
+```
+
+### Query with hosted LLM API (OpenAI‑compatible)
+
+**Do not forget `/v1`** on the base URL. You must also bind a host CA bundle into the container; Charliecloud 0.42 does **not** support `:ro` suffix on binds, so avoid it.
+
+```bash
+KEY="$(head -n1 ~/.llm_api_key)"
+BASE="https://llm.example.com/v1"
+
+# Choose an existing CA bundle on the host. On RHEL-like HPC frontends one of these exists:
+#   /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+#   /etc/pki/tls/certs/ca-bundle.crt
+HOST_CA="/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"  # adjust if needed
+
+cp question.txt workspace/
+
+ch-run "$IMG" \
+  --unset-env='*' \
+  --set-env=HOME=/root \
+  --cdi-dirs="$CDI_SPEC_DIR" --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --bind "$(pwd)/workspace:/workspace" \
+  --bind "/path/to/test_tar_shards:/path/to/test_tar_shards" \
+  --bind "$HF_HOST:/app/hf_cache" \
+  --bind "$HOST_CA:/workspace/site-ca.pem" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  --set-env="SSL_CERT_FILE=/workspace/site-ca.pem" \
+  --set-env="REQUESTS_CA_BUNDLE=/workspace/site-ca.pem" \
+  --set-env="CURL_CA_BUNDLE=/workspace/site-ca.pem" \
+  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  --set-env="LITKIT_WORKSPACE=/workspace" \
+  --set-env="LITKIT_TAR_DIR=/path/to/test_tar_shards" \
+  --set-env="HF_HOME=/app/hf_cache" \
+  --set-env="HF_HUB_OFFLINE=1" \
+  --set-env="TRANSFORMERS_OFFLINE=1" \
+  --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
+  --set-env="LITKIT_OPENAI_TIMEOUT_SEC=60" \
+  --set-env="OPENAI_BASE_URL=$BASE" \
+  --set-env="OPENAI_API_KEY=$KEY" \
+  -- litkit \
+      --llm-model gpt-oss-120b \
+      --openai-base-url "$BASE" \
+      --openai-api-key  "$KEY" \
+      --question-file /workspace/question.txt
+```
+
+**HPC gotchas:**
+
+- TLS errors like `CERTIFICATE_VERIFY_FAILED: self-signed certificate in certificate chain` mean the CA bundle isn’t visible **inside** the container. Bind the host bundle and set the three env vars exactly as above.
+- If you see `Endpoint: http://localhost:1234/v1` in logs, your base URL isn’t propagating. Set both env **and** `--openai-base-url`.
+- If you see `libcudart.so.12` or `libcublas.so.* not found`, you didn’t bind CUDA userspace (lean flavor). Bind `CUDA_LIBA` and `CUDA_LIBB` and set `LD_LIBRARY_PATH`, or use the **nv** image.
+
+### V100 quick smoke test
+
+```bash
+salloc -N1 -t 10:00:00 -p gpu-v100 --no-shell
+ssh gpu-node1  # or gpu-node2/gpu-node3/gpu-node4
+
+IMG=/path/to/litkit/sqfs/litkit-v0.3.33-aarch64-lean.sqfs
+CUDA_BASE=/path/to/cuda-12.5-host/cuda-12.5
+CUDA_LIBA="$CUDA_BASE/targets/sbsa-linux/lib"
+CUDA_LIBB="$CUDA_BASE/lib64"
+
+ch-run "$IMG" \
+  --unset-env='*' \
+  --set-env=HOME=/root \
+  --cdi-dirs=/path/to/cdi-v100 \
+  --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  -- /root/.local/share/uv/tools/litkit/bin/python - <<'PY'
+import torch, sys
+print("Torch:", torch.__version__, "CUDA build tag:", torch.version.cuda)
+print("CUDA available:", torch.cuda.is_available())
+PY
+```
+
+---
+
+## Project metadata
+
+- `pyproject.toml` pins `torch==2.5.1.*` and forces a local wheel via `tool.uv.sources` for the aarch64 CUDA 12.5 build.
+- Core deps: `openai>=1,<2`, `transformers>=4.44,<5`, `sentence-transformers>=3.1,<4`, `faiss-cpu>=1.8,<1.9`.
+- Container builds copy HF snapshots and (optionally) perform guarded `.bin` → `.safetensors` conversion for SPECTER2.
+
+---
+
+## License
+
+Proprietary. 
