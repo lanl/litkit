@@ -4,7 +4,6 @@ This module provides small, dependency-light utilities for reading article
 metadata and body text from JATS/NXML contained inside tar
 archives (.tar, .tar.gz/.tgz, .tar.bz2/.tbz2, .tar.xz/.txz). It also includes
 a simple paragraph packer for turning body text into chunk-sized strings.
-XML documents are intentionally ignored: see setting for _XML_EXTS
 
 Highlights
 ----------
@@ -26,7 +25,7 @@ Chunking:
     pack_paragraphs(paras, max_chars=..., min_chars=..., overlap_chars=...)
 
 TAR helpers:
-    iter_tar_paths(tar_dir, manifest=None)
+    iter_tar_paths(tar_dir=None, manifest=None)
     iter_tar_xml_member_names(tar_path, exts=...)
     count_tar_xml_members(tar_path, exts=...)
     iter_tar_xml_streams(tar_path, exts=...)
@@ -57,11 +56,8 @@ CHUNK_TARGET_CHARS = 1200
 BODY_MIN_CHARS = 300
 CHUNK_OVERLAP_CHARS = 200
 
-# Only ingest NXML files because we are processing the PMC-OA corpus (JATS/NXML files)
-#   Ingestion can be modified to ingest only PubMed XML files or both XML and NXML.
-#   Setting for XML only: _XML_EXTS = (".xml")
-#   Setting for both XML and NXML: _XML_EXTS = (".xml", ".nxml")
-_XML_EXTS = (".nxml",)
+# Ingest XML and JATS/NXML files
+_XML_EXTS = (".nxml", ".xml")
 _TAR_EXTS = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
 
 
@@ -292,14 +288,21 @@ def _is_tar_path(p: Path) -> bool:
     return s.endswith(_TAR_EXTS)
 
 
-def iter_tar_paths(tar_dir: str | Path, manifest: str | Path | None = None) -> Iterator[Path]:
-    """Yield paths to tar-like archives under `tar_dir`, with optional manifest control.
+def iter_tar_paths(
+    tar_dir: str | Path | None,
+    manifest: str | Path | None = None,
+) -> Iterator[Path]:
+    """Yield paths to tar-like archives, optionally driven by a manifest.
 
     If `manifest` is provided, it is read line-by-line to select which shards to yield.
     Each non-empty, non-comment line may be:
       - an absolute or relative path to a tar file, or
       - a basename (optionally without an extension). If no extension is given,
         each known tar extension in `_TAR_EXTS` is tried in order.
+
+    When resolving relative entries from a manifest, the base directory is:
+      * `Path(tar_dir)` if `tar_dir` is given, else
+      * the directory containing the manifest file.
 
     Lines starting with '#' and blank lines are ignored. Duplicate resolved paths
     are de-duplicated while preserving their first occurrence order.
@@ -308,12 +311,15 @@ def iter_tar_paths(tar_dir: str | Path, manifest: str | Path | None = None) -> I
     (non-recursive) and yields files whose names end with any extension in
     `_TAR_EXTS`, in lexicographic order.
 
+    In a manifest file, inline comments after # are allowed.
+
     Parameters
     ----------
-    tar_dir : str | Path
-        Root directory used to resolve relative manifest entries and, when no
-        manifest is given, the directory to scan for tar files.
-    manifest : str | Path, optional
+    tar_dir : str | Path | None
+        Base directory used to resolve relative manifest entries and, when no
+        manifest is given, the directory to scan for tar files. May be None when
+        a manifest is provided. In that case, the manifest's parent is used.
+    manifest : str | Path | None
         Optional path to a text file specifying shards (one per line).
 
     Yields:
@@ -327,40 +333,55 @@ def iter_tar_paths(tar_dir: str | Path, manifest: str | Path | None = None) -> I
     This function does not open or validate the files as tar archives; it only
     checks for existence and filename suffix via `_is_tar_path`.
     """
-    root = Path(tar_dir)
 
-    def _resolve_token(tok: str) -> Path | None:
+    def _resolve_token(tok: str, base: Path) -> Path | None:
         tok = tok.strip()
         if not tok:
             return None
         p = Path(tok)
         if p.is_absolute():
             return p if p.exists() and _is_tar_path(p) else None
-        candidate = root / tok
+        candidate = base / tok
         if candidate.exists() and _is_tar_path(candidate):
             return candidate
-        if candidate.suffix == "":  # try common compressions when no suffix
-            base = candidate  # no suffix to strip
+        # If no suffix was provided, try common tar compressions.
+        if candidate.suffix == "":
             for ext in _TAR_EXTS:
-                c3 = Path(str(base) + ext)
+                c3 = Path(str(candidate) + ext)
                 if c3.exists() and _is_tar_path(c3):
                     return c3
         return None
 
-    if manifest:
+
+    if manifest is not None:
+        mf = Path(manifest)
+        base = Path(tar_dir) if tar_dir is not None else mf.parent
         seen: set[Path] = set()
-        for line in Path(manifest).read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
+        for line in mf.read_text(encoding="utf-8").splitlines():
+            raw = line.split("#", 1)[0].strip()  # allow inline comments
+            if not raw:
                 continue
-            p = _resolve_token(line)
-            if p and p not in seen:
-                seen.add(p)
-                yield p  # preserve manifest order
-    else:
-        for p in sorted(root.iterdir()):  # not recursive, by design
-            if p.is_file() and _is_tar_path(p):
-                yield p
+            p = _resolve_token(raw, base)
+            if p:
+                rp = p.resolve(strict=False)      # normalize for de-duplication
+                if rp not in seen:
+                    seen.add(rp)
+                    yield rp                      # preserve manifest order
+            else:
+                logger.warning(
+                    "[manifest] skipping unresolved entry %r (base=%s)", raw, base
+                )
+        return
+    
+
+    # No manifest: require a directory to scan.
+    if tar_dir is None:
+        raise ValueError("Either --tar-dir or --tar-manifest must be provided.")
+
+    root = Path(tar_dir)
+    for p in sorted(root.iterdir()):  # not recursive, by design
+        if p.is_file() and _is_tar_path(p):
+            yield p
 
 
 def iter_tar_xml_member_names(
