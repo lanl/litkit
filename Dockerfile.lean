@@ -126,7 +126,7 @@ FROM ghcr.io/astral-sh/uv:0.9.0-bookworm AS runtime
 ENV PATH="/root/.local/bin:${PATH}"
 RUN uv python install 3.12
 
-RUN mkdir -p /workspace /data/pmc_oa /data/test_tar_shards /opt/wheels
+RUN mkdir -p /workspace /data/pmc_oa /data/test_tar_shards /opt/wheels /host_cache
 WORKDIR /workspace
 
 COPY --from=torchwheel /opt/wheels /opt/wheels

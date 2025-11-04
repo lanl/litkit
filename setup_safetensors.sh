@@ -33,6 +33,7 @@ fi
 
 # Do the conversion with only the pieces we actually need.
 ch-run \
+  --mount="${CH_MNT:-"$(pwd)/.ch-mnt"}" \
   --unset-env='*' \
   --set-env=HOME=/root \
   "${cdi_flags[@]}" \
@@ -41,13 +42,13 @@ ch-run \
   "$IMG" -- bash -lc '
 set -euo pipefail
 
-# 1) Seed host cache from the image; do not overwrite existing files
+# Seed host cache from the image; do not overwrite existing files
 mkdir -p /host_cache/hub
 cp -an /app/hf_cache/hub/. /host_cache/hub/ || true
 
-# 2) Convert .bin -> .safetensors (idempotent)
+# Convert .bin -> .safetensors (idempotent)
 PY=/root/.local/share/uv/tools/litkit/bin/python
-"$PY" - <<PY
+"$PY" - <<'PY'
 import os, torch
 from safetensors.torch import save_file
 
@@ -69,7 +70,7 @@ for base in bases:
         print(f"No conversion needed for {base}")
 PY
 
-# 3) Delete .bin only if .safetensors exists
+# Delete .bin if .safetensors exists
 for d in \
   /host_cache/hub/models--allenai--specter2_base \
   /host_cache/hub/models--sentence-transformers--all-mpnet-base-v2

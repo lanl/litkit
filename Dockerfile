@@ -128,7 +128,7 @@ ENV PATH="/root/.local/bin:${PATH}"
 RUN uv python install 3.12
 
 # Bind points & wheel cache
-RUN mkdir -p /workspace /data/pmc_oa /data/test_tar_shards /opt/wheels
+RUN mkdir -p /workspace /data/pmc_oa /data/test_tar_shards /opt/wheels /host_cache
 WORKDIR /workspace
 
 # Bring in wheels
