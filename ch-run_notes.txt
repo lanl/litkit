@@ -1,0 +1,535 @@
+##################################################
+### SLURM script for vector build (single GPU) ###
+##################################################
+
+# --- submit job
+
+sbatch -p gpu-v100 --export=ALL,TARGET=v100 vector_build_single.sbatch
+sbatch -p gpu-gh200 --export=ALL,TARGET=gh vector_build_single.sbatch
+
+# --- get JOBID
+
+# if job is running
+squeue --me
+
+# if job is finished
+jid=$(sacct -X -n --name=litkit-build --starttime=now-7days -o JobID | tail -1)
+echo "$jid"
+
+# --- inspect console logs
+
+less "litkit-build.$jid.out"
+less "litkit-build.$jid.err"
+
+# --- get elapsed runtime & status
+
+sacct -X -j "$jid" -o JobID,JobName%30,Partition,State,ExitCode,Start,End,Elapsed,Timelimit
+
+#############################################
+### Setup and test on a Grace Hopper node ###
+#############################################
+
+# On the cluster's gpu-gh200 partition, the nodes are gh-node1 and gh-node2.
+
+###########################
+# Mount an ARM+GH200 node #
+###########################
+
+# Ask Slurm for 1 node on the Grace-Hopper *shared* partition for up to 10 hours.
+# --no-shell = do NOT drop into a shell; just hold the allocation.
+# Use this only if you plan to SSH to the node yourself.
+salloc -N1 -t 10:00:00 -p gpu-gh200 --no-shell
+
+# Now log into the node you were actually granted.
+# Replace NODE_NAME with the real hostname (e.g., gh-node1).
+# You can discover it with:
+#   squeue -j <jobid> -h -o "%N"          # node for that allocation
+# or:
+#   squeue --me -h -o "%i %N %T"          # show your jobs and nodes
+# NOTE: SSH will fail with “pam_slurm_adopt” unless you have an active allocation on that node.
+ssh NODE_NAME 
+
+# When finished: scancel <jobid>          # release the allocation
+
+################################################################################
+## STEP 1/2 — Generate an NVIDIA CDI spec (GPU passthrough for charliecloud)  ##
+##                                                                            ##
+## Why:  ch-run uses CDI specs to request GPUs without bespoke host config.   ##
+## Req:  nvidia-ctk present on the host; write perms to the target directory. ##
+## Out:  /path/to/cdi-grace/nvidia.json                         ##
+## Verify: `nvidia-ctk cdi list --spec-dir=/path/to/cdi-grace`  ##
+################################################################################
+
+mkdir -p /path/to/cdi-grace
+nvidia-ctk cdi generate \
+  --format=json \
+  --output=/path/to/cdi-grace/nvidia.json
+
+nvidia-ctk cdi list --spec-dir=/path/to/cdi-grace
+
+################################################################################
+## STEP 2/2 — Materialize a host-local CUDA 12.5 toolchain from NVIDIA image  ##
+##                                                                            ##
+## Why:  Provide stable, module-free CUDA libs/binaries for ch-run bindings.  ##
+## Req:  charliecloud/0.42; network access to pull; write perms to DEST.      ##
+## Out:  $DEST/cuda-12.5/{bin,lib64,targets/sbsa-linux/lib,...}               ##
+## Notes: Image is multi-arch; on Grace you’ll get the ARM64 (sbsa) layout.   ##
+################################################################################
+
+# Work under a persistent project path.
+cd /path/to
+
+# Clean environment; load Charliecloud CLI tools.
+module purge
+module load charliecloud/0.42
+
+# Pull the CUDA 12.5 *devel* image (includes nvcc, headers, libs).
+ch-image pull nvidia/cuda:12.5.0-devel-ubuntu22.04
+
+# Host destination for the extracted toolchain.
+DEST=/path/to/cuda-12.5-host
+mkdir -p "$DEST"
+
+# Stream /usr/local/cuda-12.5 out of a short-lived container and unpack on host.
+ch-run nvidia/cuda:12.5.0-devel-ubuntu22.04 -- bash -lc \
+  'tar -C /usr/local -cf - cuda-12.5' | tar -C "$DEST" -xvf -
+
+###############################################
+# Confirm that PyTorch and CUDA are available #
+###############################################
+
+module purge
+module load charliecloud/0.42  
+
+# --- Option A: use site CUDA module (recommended on managed clusters)
+
+# Load CUDA 12.5 from the module system (fails if the module isn't installed).
+module load cuda/12.5.0
+
+# If the module didn’t set CUDA_HOME, derive it by walking up from nvcc (.../bin/nvcc -> ...).
+export CUDA_HOME="${CUDA_HOME:-$(dirname "$(dirname "$(which nvcc)")")}"
+
+# Pick the correct ARM runtime lib directory under CUDA_HOME.
+# Prefer SBSA layout (Grace/Hopper on ARM); fall back to older aarch64 layout.
+if [ -d "$CUDA_HOME/targets/sbsa-linux/lib" ]; then
+  export CUDA_LIBA="$CUDA_HOME/targets/sbsa-linux/lib"
+elif [ -d "$CUDA_HOME/targets/aarch64-linux/lib" ]; then
+  export CUDA_LIBA="$CUDA_HOME/targets/aarch64-linux/lib"
+else
+  # Nothing found -> you’re on the wrong arch or the module is broken.
+  echo "ERROR: cannot find CUDA targets/*/lib under $CUDA_HOME" >&2; exit 2
+fi
+
+# Top-level CUDA libs (e.g., cuBLAS) are here.
+export CUDA_LIBB="$CUDA_HOME/lib64"
+
+# Typical use inside containers:
+#   LD_LIBRARY_PATH="$CUDA_LIBA:$CUDA_LIBB"
+# Or bind both into the container and set LD_LIBRARY_PATH there.
+
+# --- Option B: use a fixed, known CUDA install on the host 
+
+# Root of your local CUDA 12.5 install (no modules involved).
+export CUDA_BASE=/path/to/cuda-12.5-host/cuda-12.5
+
+# ARM runtime libs (SBSA layout) and top-level libs.
+export CUDA_LIBA="$CUDA_BASE/targets/sbsa-linux/lib"
+export CUDA_LIBB="$CUDA_BASE/lib64"
+
+# Same container usage:
+#   LD_LIBRARY_PATH="$CUDA_LIBA:$CUDA_LIBB"
+
+export CDI_SPEC_DIR=/path/to/cdi-grace
+export IMG="$(pwd)/sqfs/litkit-v0.3.33-aarch64-lean.sqfs"
+
+# verify that PyTorch and CUDA are available
+ch-run \
+  --unset-env='*' \
+  --cdi-dirs="$CDI_SPEC_DIR" \
+  --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  "$IMG" -- \
+  /root/.local/share/uv/tools/litkit/bin/python - <<'PY'
+import torch, sys, os
+print("Python:", sys.version.split()[0])
+print("Torch:", torch.__version__, "CUDA build:", torch.version.cuda)
+print("LD_LIBRARY_PATH:", os.environ.get("LD_LIBRARY_PATH"))
+print("CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("Device 0:", torch.cuda.get_device_name(0),
+          "CC:", torch.cuda.get_device_capability(0))
+PY
+
+###############################
+### Run litkit on a GH node ###
+###############################
+
+cd /path/to/litkit
+
+export CUDA_BASE="/path/to/cuda-12.5-host/cuda-12.5"
+export CUDA_LIBA="$CUDA_BASE/targets/sbsa-linux/lib"
+export CUDA_LIBB="$CUDA_BASE/lib64"
+
+export IMG="$(pwd)/sqfs/litkit-v0.3.33-aarch64-lean.sqfs"
+export CDI_SPEC_DIR="/path/to/cdi-grace"
+
+export HF_HOST=/path/to/hf_cache_persist
+mkdir -p "$HF_HOST"
+
+export CH_MNT="$(pwd)/.ch-mnt"
+mkdir -p "$CH_MNT"
+
+# --- convert .bin to .safetensors 
+./setup_safetensors.sh
+
+# --- ping litkit 
+ch-run \
+  --unset-env='*' \
+  --cdi-dirs="$CDI_SPEC_DIR" \
+  --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  --set-env="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/share/uv/tools/litkit/bin" \
+  sqfs/litkit-v0.3.33-aarch64-lean.sqfs -- \
+  litkit --version
+
+# --- build vector store using a manifest with a list of .tar.gz files located in /path/to/test_tar_shards
+ch-run \
+  --unset-env='*' \
+  --set-env=HOME=/root \
+  --cdi-dirs="$CDI_SPEC_DIR" \
+  --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --bind "/path/to/test_tar_shards:/path/to/test_tar_shards" \
+  --bind "$(pwd)/workspace:/workspace" \
+  --bind "$HF_HOST:/app/hf_cache" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  --set-env="LITKIT_WORKSPACE=/workspace" \
+  --set-env="HF_HOME=/app/hf_cache" \
+  --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
+  "$IMG" -- \
+  litkit --faiss-writer --build-only --rebuild --yes --tar-manifest /workspace/test.manifest 
+
+# --- ask a question
+
+cp question.txt workspace/
+cat workspace/question.txt
+
+# path to file with API key for hosted LLM API
+KEY="$(head -n1 ~/.llm_api_key)"
+# hosted LLM API endpoint 
+BASE="https://llm.example.com/v1"
+
+cat workspace/question.txt
+ch-run \
+  --unset-env='*' \
+  --set-env=HOME=/root \
+  --cdi-dirs="$CDI_SPEC_DIR" --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --bind "$(pwd)/workspace:/workspace" \
+  --bind "/path/to/test_tar_shards:/path/to/test_tar_shards" \
+  --bind "$HF_HOST:/app/hf_cache" \
+  --bind "/etc/pki/tls/certs/ca-bundle.crt:/workspace/site-ca.pem" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  --set-env="SSL_CERT_FILE=/workspace/site-ca.pem" \
+  --set-env="REQUESTS_CA_BUNDLE=/workspace/site-ca.pem" \
+  --set-env="CURL_CA_BUNDLE=/workspace/site-ca.pem" \
+  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  --set-env="LITKIT_WORKSPACE=/workspace" \
+  --set-env="LITKIT_TAR_DIR=/path/to/test_tar_shards" \
+  --set-env="HF_HOME=/app/hf_cache" \
+  --set-env="HF_HUB_OFFLINE=1" \
+  --set-env="TRANSFORMERS_OFFLINE=1" \
+  --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
+  --set-env="LITKIT_OPENAI_TIMEOUT_SEC=60" \
+  --set-env="OPENAI_BASE_URL=$BASE" \
+  --set-env="OPENAI_API_KEY=$KEY" \
+  "$IMG" -- \
+  litkit --llm-model gpt-oss-120b --openai-base-url "$BASE" --openai-api-key  "$KEY" --question-file /workspace/question.txt
+
+# --- build vector store using a manifest with a list of .tar.gz files located in /path/to/PMC-OA
+ch-run \
+  --unset-env='*' \
+  --set-env=HOME=/root \
+  --cdi-dirs="$CDI_SPEC_DIR" \
+  --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --bind "/path/to/PMC-OA:/path/to/PMC-OA" \
+  --bind "$(pwd)/workspace:/workspace" \
+  --bind "$HF_HOST:/app/hf_cache" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  --set-env="LITKIT_WORKSPACE=/workspace" \
+  --set-env="HF_HOME=/app/hf_cache" \
+  --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
+  "$IMG" -- \
+  litkit --faiss-writer --build-only --rebuild --yes --tar-manifest /workspace/pmcoa.manifest 
+
+# --- continue vector store build 
+ch-run \
+  --unset-env='*' \
+  --set-env=HOME=/root \
+  --cdi-dirs="$CDI_SPEC_DIR" \
+  --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --bind "/path/to/PMC-OA:/path/to/PMC-OA" \
+  --bind "$(pwd)/workspace:/workspace" \
+  --bind "$HF_HOST:/app/hf_cache" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  --set-env="LITKIT_WORKSPACE=/workspace" \
+  --set-env="HF_HOME=/app/hf_cache" \
+  --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
+  "$IMG" -- \
+  litkit --faiss-writer --build-only --tar-manifest /workspace/pmcoa.manifest 
+
+#######################################################################################################################################
+
+#####################################
+### Setup and test on a V100 node ###
+#####################################
+
+# On the cluster's gpu-v100 partition, the V100 nodes are gpu-node1, gpu-node2, gpu-node3, and gpu-node4
+
+##########################
+# Mount an ARM+V100 node #
+##########################
+
+salloc -N1 -t 10:00:00 -p gpu-v100 --no-shell
+ssh NODE_NAME (e.g., gpu-node1)
+
+###################################################################################
+# Setup step #1 (if necessary): build /path/to/cdi-v100/nvidia.json #
+###################################################################################
+
+cd /path/to
+
+module purge
+
+mkdir -p /path/to/cdi-v100
+nvidia-ctk cdi generate \
+  --format=json \
+  --output=/path/to/cdi-v100/nvidia.json
+
+nvidia-ctk cdi list --spec-dir=/path/to/cdi-v100
+
+#############################################################################
+# Setup step #2 (if necessary): build /path/to/cuda-12.5-host #
+#############################################################################
+
+cd /path/to
+
+module purge
+module load charliecloud/0.42
+
+ch-image pull nvidia/cuda:12.5.0-devel-ubuntu22.04
+DEST=/path/to/cuda-12.5-host
+mkdir -p "$DEST"
+ch-run nvidia/cuda:12.5.0-devel-ubuntu22.04 -- bash -lc \
+  'tar -C /usr/local -cf - cuda-12.5' | tar -C "$DEST" -xvf -
+
+###############################################
+# Confirm that PyTorch and CUDA are available #
+###############################################
+
+cd /path/to/litkit
+
+module purge
+module load charliecloud/0.42
+
+export CDI_SPEC_DIR=/path/to/cdi-v100
+export CUDA_BASE=/path/to/cuda-12.5-host/cuda-12.5
+export CUDA_LIBA="$CUDA_BASE/targets/sbsa-linux/lib"
+export CUDA_LIBB="$CUDA_BASE/lib64"
+export IMG="$(pwd)/sqfs/litkit-v0.3.33-aarch64-lean.sqfs"
+
+ch-run \
+  --unset-env='*' \
+  --set-env=HOME=/root \
+  --cdi-dirs="$CDI_SPEC_DIR" \
+  --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  "$IMG" -- \
+  /root/.local/share/uv/tools/litkit/bin/python - <<'PY'
+import torch, sys
+print("Torch:", torch.__version__, "CUDA build tag:", torch.version.cuda)
+print("CUDA available:", torch.cuda.is_available())
+PY
+
+#################################
+### Run litkit on a V100 node ###
+#################################
+
+cd /path/to/litkit
+
+module purge
+module load charliecloud/0.42
+
+export CDI_SPEC_DIR=/path/to/cdi-v100
+export CUDA_BASE=/path/to/cuda-12.5-host/cuda-12.5
+export CUDA_LIBA="$CUDA_BASE/targets/sbsa-linux/lib"
+export CUDA_LIBB="$CUDA_BASE/lib64"
+export IMG="$(pwd)/sqfs/litkit-v0.3.33-aarch64-lean.sqfs"
+
+export HF_HOST=/path/to/hf_cache_persist
+mkdir -p "$HF_HOST"
+export CH_MNT="$(pwd)/.ch-mnt"
+mkdir -p "$CH_MNT"
+
+# --- ping litkit
+ch-run \
+  --unset-env='*' \
+  --set-env=HOME=/root \
+  --cdi-dirs="$CDI_SPEC_DIR" \
+  --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  "$IMG" -- \
+  litkit --version
+
+# --- convert .bin -> .safetensors (this step is needed to use the SPECTER2 embedding model)
+#   conversion is not repeated if /path/to/hf_cache_persist (HF_HOST) already has .safetensors 
+./setup_safetensors.sh
+
+# --- build vector store using .tar.gz files in specified --tar-dir 
+ch-run \
+  --unset-env='*' \
+  --set-env=HOME=/root \
+  --cdi-dirs="$CDI_SPEC_DIR" \
+  --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --bind "/path/to/test_tar_shards:/path/to/test_tar_shards" \
+  --bind "$(pwd)/workspace:/workspace" \
+  --bind "$HF_HOST:/app/hf_cache" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  --set-env="LITKIT_WORKSPACE=/workspace" \
+  --set-env="HF_HOME=/app/hf_cache" \
+  --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
+  "$IMG" -- \
+  litkit --faiss-writer --build-only --rebuild --yes --tar-dir /path/to/test_tar_shards
+
+# --- verify that retrieval is working
+
+cat workspace/question.txt
+ch-run \
+  --unset-env='*' \
+  --set-env=HOME=/root \
+  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  --cdi-dirs="$CDI_SPEC_DIR" --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --bind "$(pwd)/workspace:/workspace" \
+  --bind "$HF_HOST:/app/hf_cache" \
+  --bind "/path/to/test_tar_shards:/path/to/test_tar_shards" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  --set-env="HF_HOME=/app/hf_cache" \
+  --set-env="LITKIT_WORKSPACE=/workspace" \
+  --set-env="LITKIT_TAR_DIR=/path/to/test_tar_shards" \
+  "$IMG" -- \
+  litkit --no-llm --question-file /workspace/question.txt
+
+# --- ask a question
+
+KEY="$(head -n1 ~/.llm_api_key)"
+BASE="https://llm.example.com/v1"
+
+cat workspace/question.txt
+ch-run \
+  --unset-env='*' \
+  --set-env=HOME=/root \
+  --cdi-dirs="$CDI_SPEC_DIR" --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --bind "$(pwd)/workspace:/workspace" \
+  --bind "/path/to/test_tar_shards:/path/to/test_tar_shards" \
+  --bind "$HF_HOST:/app/hf_cache" \
+  --bind "/etc/pki/tls/certs/ca-bundle.crt:/workspace/site-ca.pem" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  --set-env="SSL_CERT_FILE=/workspace/site-ca.pem" \
+  --set-env="REQUESTS_CA_BUNDLE=/workspace/site-ca.pem" \
+  --set-env="CURL_CA_BUNDLE=/workspace/site-ca.pem" \
+  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  --set-env="LITKIT_WORKSPACE=/workspace" \
+  --set-env="LITKIT_TAR_DIR=/path/to/test_tar_shards" \
+  --set-env="HF_HOME=/app/hf_cache" \
+  --set-env="HF_HUB_OFFLINE=1" \
+  --set-env="TRANSFORMERS_OFFLINE=1" \
+  --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
+  --set-env="LITKIT_OPENAI_TIMEOUT_SEC=60" \
+  --set-env="OPENAI_BASE_URL=$BASE" \
+  --set-env="OPENAI_API_KEY=$KEY" \
+  "$IMG" -- \
+  litkit --llm-model gpt-oss-120b --openai-base-url "$BASE" --openai-api-key  "$KEY" --question-file /workspace/question.txt
+
+# --- build vector store using a manifest with a list of .tar.gz files located in /path/to/test_tar_shards
+ch-run \
+  --unset-env='*' \
+  --set-env=HOME=/root \
+  --cdi-dirs="$CDI_SPEC_DIR" \
+  --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --bind "/path/to/test_tar_shards:/path/to/test_tar_shards" \
+  --bind "$(pwd)/workspace:/workspace" \
+  --bind "$HF_HOST:/app/hf_cache" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  --set-env="LITKIT_WORKSPACE=/workspace" \
+  --set-env="HF_HOME=/app/hf_cache" \
+  --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
+  "$IMG" -- \
+  litkit --faiss-writer --build-only --rebuild --yes --tar-manifest /workspace/test.manifest 
+
+# --- build vector store using a manifest with a list of .tar.gz files located in /path/to/PMC-OA
+ch-run \
+  --unset-env='*' \
+  --set-env=HOME=/root \
+  --cdi-dirs="$CDI_SPEC_DIR" \
+  --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --bind "/path/to/PMC-OA:/path/to/PMC-OA" \
+  --bind "$(pwd)/workspace:/workspace" \
+  --bind "$HF_HOST:/app/hf_cache" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  --set-env="LITKIT_WORKSPACE=/workspace" \
+  --set-env="HF_HOME=/app/hf_cache" \
+  --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
+  "$IMG" -- \
+  litkit --faiss-writer --build-only --rebuild --yes --tar-manifest /workspace/pmcoa.manifest 
+
+# --- continue vector store build 
+ch-run \
+  --unset-env='*' \
+  --set-env=HOME=/root \
+  --cdi-dirs="$CDI_SPEC_DIR" \
+  --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --bind "/path/to/PMC-OA:/path/to/PMC-OA" \
+  --bind "$(pwd)/workspace:/workspace" \
+  --bind "$HF_HOST:/app/hf_cache" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  --set-env="LITKIT_WORKSPACE=/workspace" \
+  --set-env="HF_HOME=/app/hf_cache" \
+  --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
+  "$IMG" -- \
+  litkit --faiss-writer --build-only --tar-manifest /workspace/pmcoa.manifest 
+
+#######################################################################################################################################
