@@ -25,6 +25,28 @@ less "litkit-build.$jid.err"
 
 sacct -X -j "$jid" -o JobID,JobName%30,Partition,State,ExitCode,Start,End,Elapsed,Timelimit
 
+#################################################
+### SLURM script for vector build (multi GPU) ###
+#################################################
+
+cd /path/to/litkit 
+
+# build from scratch
+sbatch -p gpu-v100 -N 3 --export=ALL,TARGET=v100,REBUILD=1,YES=1,OFFLINE=1,MANIFEST=/path/to/litkit/workspace/pmcoa.manifest litkit-build.sbatch
+
+# resume
+sbatch -p gpu-v100 -N 3 --export=ALL,TARGET=v100,REBUILD=0,YES=0,OFFLINE=1,MANIFEST=/path/to/litkit/workspace/pmcoa.manifest litkit-build.sbatch
+
+# -p gpu-gh200 -N 2 TARGET=gh
+
+CHECK GPU UTILIZATION:
+
+JOB=16764369
+for n in $(scontrol show hostnames $(squeue -j $JOB -h -o %N)); do
+  srun --jobid=$JOB --overlap -N1 -n1 -w $n -c1 --cpu-bind=none \
+    bash -lc 'echo === $(hostname) ===; nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader; echo'
+done
+
 #############################################
 ### Setup and test on a Grace Hopper node ###
 #############################################
