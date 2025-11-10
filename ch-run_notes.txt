@@ -32,7 +32,7 @@ sacct -X -j "$jid" -o JobID,JobName%30,Partition,State,ExitCode,Start,End,Elapse
 cd /path/to/litkit 
 
 # build from scratch
-sbatch -p gpu-v100 -N 3 --export=ALL,TARGET=v100,REBUILD=1,YES=1,OFFLINE=1,MANIFEST=/path/to/litkit/workspace/pmcoa.manifest litkit-build.sbatch
+sbatch -p gpu-v100 -N 3 --export=ALL,TARGET=v100,REBUILD=1,YES=1,OFFLINE=1,MANIFEST=/path/to/litkit/workspace/pmcoa.manifest litkit-build2.sbatch
 
 # resume
 sbatch -p gpu-v100 -N 3 --export=ALL,TARGET=v100,REBUILD=0,YES=0,OFFLINE=1,MANIFEST=/path/to/litkit/workspace/pmcoa.manifest litkit-build.sbatch
