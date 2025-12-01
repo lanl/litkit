@@ -89,5 +89,5 @@ environments = [
 ]
 
 # Tell uv exactly where to get torch. This enforces our CUDA 12.5.0 build.
-[tool.uv.sources]
-torch = { path = "wheels/torch-2.5.1-cp312-cp312-linux_aarch64.whl" }
+# [tool.uv.sources]
+# torch = { path = "wheels/torch-2.5.1-cp312-cp312-linux_aarch64.whl" }

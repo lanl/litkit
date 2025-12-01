@@ -31,17 +31,21 @@ sacct -X -j "$jid" -o JobID,JobName%30,Partition,State,ExitCode,Start,End,Elapse
 
 cd /path/to/litkit 
 
-# build from scratch
-sbatch -p gpu-v100 -N 3 --export=ALL,TARGET=v100,REBUILD=1,YES=1,OFFLINE=1,MANIFEST=/path/to/litkit/workspace/pmcoa.manifest litkit-build.sbatch
+# Stage 1 — bootstrap/seed (lexical; builds from scratch)
+sbatch -p gpu-v100 -N 2 \
+  --export=ALL,TARGET=v100,REBUILD=1,YES=1,OFFLINE=1,ENABLE_LEXICAL=1,MANIFEST=/path/to/litkit/workspace/pmcoa.manifest \
+  litkit-build.sbatch
 
-# resume
-sbatch -p gpu-v100 -N 3 --export=ALL,TARGET=v100,REBUILD=0,YES=0,OFFLINE=1,MANIFEST=/path/to/litkit/workspace/pmcoa.manifest litkit-build.sbatch
+# Stage 2 — ANN resume/continue (normal; turns off lexical)
+sbatch -p gpu-v100 -N 2 \
+  --export=ALL,TARGET=v100,REBUILD=0,YES=0,OFFLINE=1,ENABLE_LEXICAL=0,MANIFEST=/path/to/litkit/workspace/pmcoa.manifest \
+  litkit-build.sbatch
 
 # -p gpu-gh200 -N 2 TARGET=gh
 
 CHECK GPU UTILIZATION:
 
-JOB=16764369
+JOB=16768093
 for n in $(scontrol show hostnames $(squeue -j $JOB -h -o %N)); do
   srun --jobid=$JOB --overlap -N1 -n1 -w $n -c1 --cpu-bind=none \
     bash -lc 'echo === $(hostname) ===; nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader; echo'

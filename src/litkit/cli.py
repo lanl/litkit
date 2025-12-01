@@ -1350,39 +1350,41 @@ def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int =
             if not isinstance(paper_index, faiss.IndexIDMap2):
                 paper_index = faiss.IndexIDMap2(paper_index)
 
-            with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
-                added, ids_added = 0, []
-                try:
+            prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
+            added, ids_added, saved = 0, [], False
+            try:
+                with FileLock(FAISS_LOCK):
                     added, ids_added = _add_with_ids_dedup(paper_index, ids, X)
                     if added:
-                        if prior_ntotal == 0:
-                            if _faiss_save_force(paper_index, PAPER_INDEX_PATH):
-                                _mark_in_index(cur, "papers", [int(i) for i in ids_added])
-                        else:
-                            if _faiss_save(paper_index, PAPER_INDEX_PATH):
-                                _mark_in_index(cur, "papers", [int(i) for i in ids_added])
-                            else:
-                                _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
-                except RuntimeError:
-                    # Compat path: FAISS without IDSelector support
+                        saved = _faiss_save_force(paper_index, PAPER_INDEX_PATH) if prior_ntotal == 0 \
+                                else _faiss_save(paper_index, PAPER_INDEX_PATH)
+            except RuntimeError:
+                # Compat path: hold DB_LOCK then FAISS_LOCK (lock-order invariant), and commit under DB_LOCK.
+                with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
                     added = _add_ids_union_compat(
                         paper_index, ids, X, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
                     )
-                    # _add_ids_union_compat already marks in_index & saves safely
-                conn.commit()
+                    conn.commit()
+                saved = bool(added)
+            if added:
+                if saved:
+                    with FileLock(DB_LOCK):
+                        _mark_in_index(cur, "papers", [int(i) for i in ids_added]) if ids_added else None
+                        conn.commit()
+                else:
+                    _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
 
             added_total += int(added or 0)
             batch_counter += 1
             os.remove(tmp)
 
             if (batch_counter % max(1, int(save_every))) == 0:
-                # Respect lock order: DB then FAISS
-                with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                    if _faiss_save(paper_index, PAPER_INDEX_PATH):
+                with FileLock(FAISS_LOCK):
+                    saved_now = _faiss_save(paper_index, PAPER_INDEX_PATH)
+                if saved_now:
+                    with FileLock(DB_LOCK):
                         _flush_pending_marks(cur)
-                    conn.commit()
-            _maybe_flush_marks_every(conn, cur, batch_counter)
+                        conn.commit()
         except Exception as e:
             if not is_ingesting:
                 try:
@@ -1459,41 +1461,42 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
                 os.remove(tmp)
                 continue
 
-            with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                added = 0
-                ids_added = []
-                try:
+            prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
+            added, ids_added, saved = 0, [], False
+            try:
+                with FileLock(FAISS_LOCK):
                     sel = _make_id_selector(ids)
                     _safe_remove_ids(chunk_index, sel)
-                    prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
                     added, ids_added = _add_with_ids_dedup(chunk_index, ids, X)
                     if added:
-                        if prior_ntotal == 0:
-                            _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
-                            _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
-                        else:
-                            if _faiss_save(chunk_index, CHUNK_INDEX_PATH):
-                                _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
-                            else:
-                                _PENDING_MARKS["chunks"].extend([int(i) for i in ids_added])
-                except RuntimeError:
+                        saved = _faiss_save_force(chunk_index, CHUNK_INDEX_PATH) if prior_ntotal == 0 \
+                                else _faiss_save(chunk_index, CHUNK_INDEX_PATH)
+            except RuntimeError:
+                with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
                     added = _add_ids_union_compat(
                         chunk_index, ids, X, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
                     )
-                conn.commit()
+                    conn.commit()
+                saved = bool(added)
+            if added:
+                if saved:
+                    with FileLock(DB_LOCK):
+                        _mark_in_index(cur, "chunks", [int(i) for i in ids_added]) if ids_added else None
+                        conn.commit()
+                else:
+                    _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
 
             added_total += int(added)
             batch_counter += 1
             os.remove(tmp)
 
             if (batch_counter % max(1, int(save_every))) == 0:
-                # Respect lock order: DB then FAISS
-                with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                    if _faiss_save(chunk_index, CHUNK_INDEX_PATH):
+                with FileLock(FAISS_LOCK):
+                    saved_now = _faiss_save(chunk_index, CHUNK_INDEX_PATH)
+                if saved_now:
+                    with FileLock(DB_LOCK):
                         _flush_pending_marks(cur)
-                    # Commit any DB updates made by _flush_pending_marks
-                    conn.commit()
-            _maybe_flush_marks_every(conn, cur, batch_counter)
+                        conn.commit()
 
         except Exception as e:
             # If we claimed it, put it back so another run can retry.
@@ -1568,29 +1571,33 @@ def backfill_unindexed_vectors(
         if not isinstance(paper_index, faiss.IndexIDMap2):
             paper_index = faiss.IndexIDMap2(paper_index)
 
-        with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-            try:
+        try:
+            prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
+            with FileLock(FAISS_LOCK):
                 sel = _make_id_selector(ids)
                 _safe_remove_ids(paper_index, sel)
-                prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
                 added, ids_added = _add_with_ids_dedup(paper_index, ids, Xp)
+                saved = False
                 if added:
-                    if prior_ntotal == 0:
-                        _faiss_save_force(paper_index, PAPER_INDEX_PATH)
-                        _mark_in_index(cur, "papers", [int(i) for i in ids_added])
-                    else:
-                        if _faiss_save(paper_index, PAPER_INDEX_PATH):
-                            _mark_in_index(cur, "papers", [int(i) for i in ids_added])
-                            _flush_pending_marks(cur)
-                        else:
-                            _PENDING_MARKS["papers"].extend([int(i) for i in ids_added])
-            except RuntimeError:
+                    saved = _faiss_save_force(paper_index, PAPER_INDEX_PATH) if prior_ntotal == 0 \
+                            else _faiss_save(paper_index, PAPER_INDEX_PATH)
+        except RuntimeError:
+            with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
                 added = _add_ids_union_compat(
                     paper_index, ids, Xp, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
                 )
-                if added == 0:  # ensure flags match presence
-                    _mark_in_index(cur, "papers", [int(i) for i in ids])
-        conn.commit()
+                conn.commit()
+            saved = bool(added)
+            ids_added = ids if added == 0 else []
+        if added and saved:
+            with FileLock(DB_LOCK):
+                _mark_in_index(cur, "papers", [int(i) for i in (ids_added or ids)])
+                _flush_pending_marks(cur)
+                conn.commit()
+        else:
+            if added:
+                _PENDING_MARKS["papers"].extend([int(i) for i in (ids_added or ids)])
+            conn.commit()
 
     # Chunks
     while True:
@@ -1609,29 +1616,33 @@ def backfill_unindexed_vectors(
         if not isinstance(chunk_index, faiss.IndexIDMap2):
             chunk_index = faiss.IndexIDMap2(chunk_index)
 
-        with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-            try:
+        try:
+            prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
+            with FileLock(FAISS_LOCK):
                 sel = _make_id_selector(ids)
                 _safe_remove_ids(chunk_index, sel)
-                prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
                 added, ids_added = _add_with_ids_dedup(chunk_index, ids, Xc)
+                saved = False
                 if added:
-                    if prior_ntotal == 0:
-                        _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
-                        _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
-                    else:
-                        if _faiss_save(chunk_index, CHUNK_INDEX_PATH):
-                            _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
-                            _flush_pending_marks(cur)
-                        else:
-                            _PENDING_MARKS["chunks"].extend([int(i) for i in ids_added])
-            except RuntimeError:
+                    saved = _faiss_save_force(chunk_index, CHUNK_INDEX_PATH) if prior_ntotal == 0 \
+                            else _faiss_save(chunk_index, CHUNK_INDEX_PATH)
+        except RuntimeError:
+            with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
                 added = _add_ids_union_compat(
                     chunk_index, ids, Xc, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
                 )
-                if added == 0:
-                    _mark_in_index(cur, "chunks", [int(i) for i in ids])
-        conn.commit()
+                conn.commit()
+            saved = bool(added)
+            ids_added = ids if added == 0 else []
+        if added and saved:
+            with FileLock(DB_LOCK):
+                _mark_in_index(cur, "chunks", [int(i) for i in (ids_added or ids)])
+                _flush_pending_marks(cur)
+                conn.commit()
+        else:
+            if added:
+                _PENDING_MARKS["chunks"].extend([int(i) for i in (ids_added or ids)])
+            conn.commit()
 
 
 def _make_id_selector(ids_like):
@@ -1998,7 +2009,7 @@ def build_or_update_indices(args):
         if not isinstance(paper_index, faiss.IndexIDMap2):
             paper_index = faiss.IndexIDMap2(paper_index)
             if args.faiss_writer:
-                with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
+                with FileLock(FAISS_LOCK):
                     _faiss_save(paper_index, PAPER_INDEX_PATH)
     else:
         # Create base (HNSW or FLAT) and wrap in IDMap2
@@ -2040,7 +2051,7 @@ def build_or_update_indices(args):
         if not isinstance(chunk_index, faiss.IndexIDMap2):
             chunk_index = faiss.IndexIDMap2(chunk_index)
             if args.faiss_writer:
-                with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
+                with FileLock(FAISS_LOCK):
                     _faiss_save(chunk_index, CHUNK_INDEX_PATH)
 
         ivf = _extract_ivf(chunk_index)
@@ -2486,7 +2497,7 @@ def build_or_update_indices(args):
                         )
                         if seen_this_path:
                             if args.faiss_writer:
-                                with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
+                                with FileLock(FAISS_LOCK):
                                     if not isinstance(paper_index, faiss.IndexIDMap2):
                                         paper_index = faiss.IndexIDMap2(paper_index)
                                     selp = _make_id_selector([pid])
@@ -2500,7 +2511,7 @@ def build_or_update_indices(args):
                                     )
                                 ]
                                 if old_ids:
-                                    with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
+                                    with FileLock(FAISS_LOCK):
                                         if not isinstance(chunk_index, faiss.IndexIDMap2):
                                             chunk_index = faiss.IndexIDMap2(chunk_index)
                                         selc = _make_id_selector(old_ids)
@@ -2564,8 +2575,7 @@ def build_or_update_indices(args):
                                 paper_seg_writer.write(
                                     ids=np.asarray(u_ids, dtype=np.int64), vecs=Xp
                                 )
-                                with FileLock(DB_LOCK):
-                                    conn.commit()
+                                conn.commit()
                                 papers_added_total += len(u_ids)
 
                             elif args.faiss_writer:
@@ -2573,35 +2583,32 @@ def build_or_update_indices(args):
                                     u_texts,
                                     progress_label=f"Embedding papers (batch of {len(u_texts)})",
                                     batch_size=args.paper_embed_bs,
-                                    # prevent noisy summary line that collides with [scan]
                                     progress_done_summary=False,
                                 )
-                                with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                                    sel = _make_id_selector(u_ids)
+                                # mutate & save FAISS without holding DB_LOCK
+                                prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
+                                sel = _make_id_selector(u_ids)
+                                with FileLock(FAISS_LOCK):
                                     _safe_remove_ids(paper_index, sel)
-                                    prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
                                     added, ids_added = _add_with_ids_dedup(paper_index, u_ids, Xp)
+                                    saved = False
                                     if added:
                                         if prior_ntotal == 0:
-                                            _faiss_save_force(paper_index, PAPER_INDEX_PATH)
-                                            _mark_in_index(
-                                                cur, "papers", [int(i) for i in ids_added]
-                                            )
+                                            saved = _faiss_save_force(paper_index, PAPER_INDEX_PATH)
                                         else:
-                                            if _faiss_save(paper_index, PAPER_INDEX_PATH):
-                                                _mark_in_index(
-                                                    cur, "papers", [int(i) for i in ids_added]
-                                                )
-                                                _flush_pending_marks(cur)
-                                            else:
-                                                _PENDING_MARKS["papers"].extend(
-                                                    [int(i) for i in ids_added]
-                                                )
+                                            saved = _faiss_save(paper_index, PAPER_INDEX_PATH)
+                                if added:
+                                    if saved:
+                                        with FileLock(DB_LOCK):
+                                            _mark_in_index(cur, "papers", [int(i) for i in ids_added])
+                                            _flush_pending_marks(cur)
+                                            conn.commit()
+                                    else:
+                                        _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
                                 papers_added_total += int(added) 
 
                             else:
-                                with FileLock(DB_LOCK):
-                                    conn.commit()
+                                conn.commit()
                                 papers_added_total += len(u_ids)
 
                             paper_ids_buf.clear()
@@ -2620,8 +2627,7 @@ def build_or_update_indices(args):
                                 chunk_seg_writer.write(
                                     ids=np.asarray(u_ids, dtype=np.int64), vecs=Xc
                                 )
-                                with FileLock(DB_LOCK):
-                                    conn.commit()
+                                conn.commit()
                                 chunks_added_total += len(u_ids)
 
                             elif args.faiss_writer:
@@ -2629,35 +2635,33 @@ def build_or_update_indices(args):
                                     u_texts,
                                     progress_label=f"Embedding chunks (batch of {len(u_texts)})",
                                     batch_size=args.chunk_embed_bs,
-                                    # prevent noisy summary line that collides with [scan]
                                     progress_done_summary=False,
                                 )
-                                with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                                    sel = _make_id_selector(u_ids)
+                                # mutate & save FAISS without holding DB_LOCK
+                                prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
+                                sel = _make_id_selector(u_ids)
+                                with FileLock(FAISS_LOCK):
                                     _safe_remove_ids(chunk_index, sel)
-                                    prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
                                     added, ids_added = _add_with_ids_dedup(chunk_index, u_ids, Xc)
+                                    saved = False
                                     if added:
                                         if prior_ntotal == 0:
-                                            _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
-                                            _mark_in_index(
-                                                cur, "chunks", [int(i) for i in ids_added]
-                                            )
+                                            saved = _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
                                         else:
-                                            if _faiss_save(chunk_index, CHUNK_INDEX_PATH):
-                                                _mark_in_index(
-                                                    cur, "chunks", [int(i) for i in ids_added]
-                                                )
-                                                _flush_pending_marks(cur)
-                                            else:
-                                                _PENDING_MARKS["chunks"].extend(
-                                                    [int(i) for i in ids_added]
-                                                )
+                                            saved = _faiss_save(chunk_index, CHUNK_INDEX_PATH)
+                                if added:
+                                    if saved:
+                                        with FileLock(DB_LOCK):
+                                            _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
+                                            _flush_pending_marks(cur)
+                                            conn.commit()
+                                    else:
+                                        _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
+
                                 chunks_added_total += int(added)
 
                             else:
-                                with FileLock(DB_LOCK):
-                                    conn.commit()
+                                conn.commit()
                                 chunks_added_total += len(u_ids)
 
                             chunk_ids_buf.clear()
@@ -2683,8 +2687,7 @@ def build_or_update_indices(args):
 
                 # Persist every CKPT_EVERY handled members (commit + checkpoint)
                 if (processed_count - persisted_count) >= CKPT_EVERY:
-                    with FileLock(DB_LOCK):
-                        conn.commit()
+                    conn.commit()
                     ckpt_stream[str(tpath)] = processed_count
                     ckpt["build_stream"] = ckpt_stream
                     save_checkpoint(ckpt)
@@ -2694,8 +2697,7 @@ def build_or_update_indices(args):
         # End of this tar: final commit + checkpoint at the *processed* count
         _render(force=True)
         _progress_newline(sys.stderr)
-        with FileLock(DB_LOCK):
-            conn.commit()
+        conn.commit()
         ckpt_stream[str(tpath)] = processed_count
         ckpt["build_stream"] = ckpt_stream
         save_checkpoint(ckpt)
@@ -2785,8 +2787,7 @@ def build_or_update_indices(args):
             )
             assert paper_seg_writer is not None, "producer mode requires paper_seg_writer"
             paper_seg_writer.write(ids=np.asarray(u_ids, dtype=np.int64), vecs=Xp)
-            with FileLock(DB_LOCK):
-                conn.commit()
+            conn.commit()
             papers_added_total += len(u_ids)
         paper_ids_buf.clear()
         paper_texts_buf.clear()
@@ -2801,16 +2802,14 @@ def build_or_update_indices(args):
             )
             assert chunk_seg_writer is not None, "producer mode requires chunk_seg_writer"
             chunk_seg_writer.write(ids=np.asarray(u_ids, dtype=np.int64), vecs=Xc)
-            with FileLock(DB_LOCK):
-                conn.commit()
+            conn.commit()
             chunks_added_total += len(u_ids)
         chunk_ids_buf.clear()
         chunk_texts_buf.clear()
 
     else:
         # ---- plain reader: DB only ----
-        with FileLock(DB_LOCK):
-            conn.commit()
+        conn.commit()
         papers_added_total += len(paper_ids_buf)
         paper_ids_buf.clear()
         paper_texts_buf.clear()
@@ -2854,9 +2853,10 @@ def build_or_update_indices(args):
         )
 
         # Respect lock order while forcing saves and flushing marks
-        with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
+        with FileLock(FAISS_LOCK):
             _faiss_save_force(paper_index, PAPER_INDEX_PATH)
             _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+        with FileLock(DB_LOCK):
             _flush_pending_marks(conn.cursor())
             conn.commit()
 
@@ -4242,7 +4242,7 @@ def main():
                 paper_bs=args.paper_embed_bs,
                 chunk_bs=args.chunk_embed_bs,
             )
-            with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
+            with FileLock(FAISS_LOCK):
                 _faiss_save_force(paper_index, PAPER_INDEX_PATH)
                 _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
         finally:
