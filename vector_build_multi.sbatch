@@ -1,18 +1,51 @@
 #!/bin/bash
 #SBATCH --job-name=litkit_multi
+#SBATCH --partition=gpu-v100
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
-#SBATCH --partition=gpu-v100
-#SBATCH --gres=gpu:v100:2
+#SBATCH --gres=gpu:2
 #SBATCH --time=04:00:00
 #SBATCH --output=litkit_multi_%j.out
 #SBATCH --error=litkit_multi_%j.err
+#SBATCH --export=NONE
 
-# Load Charliecloud
+set -euo pipefail
+
+# Load Charliecloud module (but don't trust it blindly)
 module purge
-module load charliecloud/0.42
+module load charliecloud/0.42 2>/dev/null || true
+
+# Pick an aarch64 ch-run (avoid "Exec format error")
+want_arch="$(uname -m)"
+echo "[arch] Compute node architecture: $want_arch"
+
+declare -a CHRUN_CANDIDATES=()
+command -v ch-run >/dev/null 2>&1 && CHRUN_CANDIDATES+=("$(command -v ch-run)")
+# Common site layouts by arch
+for p in \
+  "/opt/site/centos8/${want_arch}/charliecloud/0.42/bin/ch-run" \
+  "/opt/site/rhel8/${want_arch}/charliecloud/0.42/bin/ch-run" \
+  "/opt/site-nv/rhel8/${want_arch}/charliecloud/0.42/bin/ch-run" \
+  "/usr/bin/ch-run" "/usr/local/bin/ch-run"
+do
+  [[ -x "$p" ]] && CHRUN_CANDIDATES+=("$p")
+done
+
+CHRUN=""
+for p in "${CHRUN_CANDIDATES[@]}"; do
+  if file -L "$p" 2>/dev/null | grep -qi "$want_arch"; then
+    CHRUN="$p"
+    echo "[charliecloud] Found arch-correct ch-run: $CHRUN"
+    break
+  fi
+done
+
+if [[ -z "$CHRUN" ]]; then
+  echo "FATAL: no arch-correct ch-run ($want_arch) found. Searched: ${CHRUN_CANDIDATES[*]-<none>}" >&2
+  exit 2
+fi
 
 # HPC-specific paths
 export LITKIT_REPO="/path/to/litkit"
@@ -50,7 +83,7 @@ run_producer() {
     local node_id=$1
     echo "[Producer $node_id] Starting on $(hostname)"
     
-    srun -N1 -n1 ch-run \
+    srun -N1 -n1 "$CHRUN" \
         --unset-env='*' \
         --set-env=HOME=/root \
         --cdi-dirs="$CDI_SPEC_DIR" \
@@ -92,7 +125,7 @@ run_consumer() {
     local max_polls=1000  # ~8 hours at 30s intervals
     
     while [ $poll_count -lt $max_polls ]; do
-        srun -N1 -n1 ch-run \
+        srun -N1 -n1 "$CHRUN" \
             --unset-env='*' \
             --set-env=HOME=/root \
             --cdi-dirs="$CDI_SPEC_DIR" \
