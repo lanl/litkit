@@ -50,7 +50,11 @@ fi
 # HPC-specific paths
 export LITKIT_REPO="/path/to/litkit"
 export LITKIT_WORKSPACE="${LITKIT_REPO}/workspace"
-export LITKIT_TAR_DIR="/path/to/PMC-OA"
+
+# TAR directory: Use test dataset by default, switch to PMC-OA for production
+# TEST (7 files, ~14MB, ~5-10 min): /path/to/test_tar_shards
+# PRODUCTION (full dataset, hours): /path/to/PMC-OA
+export LITKIT_TAR_DIR="/path/to/test_tar_shards"
 
 # Container and CUDA setup for V100 nodes
 export IMG="${LITKIT_REPO}/sqfs/litkit-v0.3.33-aarch64-lean.sqfs"
