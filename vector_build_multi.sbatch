@@ -115,7 +115,7 @@ run_producer() {
             --chunk-embed-bs 64 \
             --embed-devices "cuda:0,cuda:1" \
             --embed-workers 2 \
-            --build-only
+            --tar-dir "${LITKIT_TAR_DIR}"
     
     echo "[Producer $node_id] Completed"
 }
@@ -152,7 +152,8 @@ run_consumer() {
                 --faiss-writer \
                 --consume-segments \
                 --embed-outdir "/workspace/emb_segments" \
-                --reconcile-only
+                --tar-dir "${LITKIT_TAR_DIR}" \
+                --build-only
         
         # Check if any producers still running or segments remaining
         local producers_running=$(jobs -r | grep -c "run_producer" || true)
