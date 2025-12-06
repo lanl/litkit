@@ -124,6 +124,43 @@ run_producer() {
 NODELIST=($(scontrol show hostnames $SLURM_NODELIST))
 echo "Allocated nodes: ${NODELIST[*]}"
 
+# Bootstrap phase: Create FAISS indices if they don't exist
+CONSUMER_NODE="${NODELIST[$((SLURM_NNODES - 1))]}"
+echo ""
+echo "=== Bootstrapping FAISS Indices ==="
+echo "Running bootstrap on consumer node: $CONSUMER_NODE"
+
+srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
+    --unset-env='*' \
+    --set-env=HOME=/root \
+    --cdi-dirs="$CDI_SPEC_DIR" \
+    --cdi=nvidia.com/gpu=all \
+    --bind "$CUDA_LIBA:$CUDA_LIBA" \
+    --bind "$CUDA_LIBB:$CUDA_LIBB" \
+    --bind /path/to/PMC-OA:/path/to/PMC-OA \
+    --bind "${LITKIT_WORKSPACE}:/workspace" \
+    --bind "$HF_HOST:/app/hf_cache" \
+    --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+    --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    --set-env="LITKIT_WORKSPACE=/workspace" \
+    --set-env="HF_HOME=/app/hf_cache" \
+    --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
+    --set-env="LITKIT_SQLITE_BUSY_TIMEOUT_MS=${LITKIT_SQLITE_BUSY_TIMEOUT_MS}" \
+    --set-env="LITKIT_SAVE_EVERY_SEC=${LITKIT_SAVE_EVERY_SEC}" \
+    "$IMG" -- \
+    litkit \
+        --faiss-writer \
+        --build-only \
+        --tar-manifest "/workspace/test.manifest" \
+        --papers-index hnsw \
+        --chunks-index ivfpq
+
+echo "=== Bootstrap Complete ==="
+echo ""
+
+# Wait for filesystem sync
+sleep 5
+
 # Run producers on all nodes except the last one
 NUM_PRODUCERS=$((SLURM_NNODES - 1))
 echo "Starting $NUM_PRODUCERS producers on nodes: ${NODELIST[@]:0:$NUM_PRODUCERS}"
@@ -136,8 +173,7 @@ done
 # Wait a bit for producers to start
 sleep 10
 
-# Run consumer on the last node
-CONSUMER_NODE="${NODELIST[$((SLURM_NNODES - 1))]}"
+# Run consumer on the last node (already set above in bootstrap)
 echo "Starting consumer on node: $CONSUMER_NODE"
 srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
     --unset-env='*' \
