@@ -52,9 +52,8 @@ export LITKIT_REPO="/path/to/litkit"
 export LITKIT_WORKSPACE="${LITKIT_REPO}/workspace"
 
 # Manifest file: List of specific tar.gz files to process
-# TEST (small baseline files, ~15-20 min): test_manifest.txt
-# Or use --tar-dir to process all files in a directory
-export LITKIT_TAR_MANIFEST="${LITKIT_REPO}/test_manifest.txt"
+# Located in workspace for easy git tracking and container access
+export LITKIT_TAR_MANIFEST="${LITKIT_WORKSPACE}/test.manifest"
 
 # Container and CUDA setup for V100 nodes
 export IMG="${LITKIT_REPO}/sqfs/litkit-v0.3.33-aarch64-lean.sqfs"
@@ -96,7 +95,6 @@ run_producer() {
         --bind "$CUDA_LIBB:$CUDA_LIBB" \
         --bind /path/to/PMC-OA:/path/to/PMC-OA \
         --bind "${LITKIT_WORKSPACE}:/workspace" \
-        --bind "${LITKIT_TAR_MANIFEST}:/manifest.txt" \
         --bind "$HF_HOST:/app/hf_cache" \
         --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
         --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
@@ -115,7 +113,7 @@ run_producer() {
             --chunk-embed-bs 64 \
             --embed-devices "cuda:0,cuda:1" \
             --embed-workers 2 \
-            --tar-manifest "/manifest.txt"
+            --tar-manifest "/workspace/test.manifest"
     
     echo "[Producer $node_id] Completed"
 }
@@ -138,7 +136,6 @@ run_consumer() {
             --bind "$CUDA_LIBB:$CUDA_LIBB" \
             --bind /path/to/PMC-OA:/path/to/PMC-OA \
             --bind "${LITKIT_WORKSPACE}:/workspace" \
-            --bind "${LITKIT_TAR_MANIFEST}:/manifest.txt" \
             --bind "$HF_HOST:/app/hf_cache" \
             --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
             --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
@@ -152,7 +149,7 @@ run_consumer() {
                 --faiss-writer \
                 --consume-segments \
                 --embed-outdir "/workspace/emb_segments" \
-                --tar-manifest "/manifest.txt" \
+                --tar-manifest "/workspace/test.manifest" \
                 --build-only
         
         # Check if any producers still running or segments remaining
