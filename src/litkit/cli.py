@@ -1948,13 +1948,48 @@ def build_or_update_indices(args):
     need = args.rebuild or not (
         DB_PATH.exists() and PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists()
     )
-    if not need and not args.update and not args.build_only and not args.consume_only:
+    if not need and not args.update and not args.build_only and not args.consume_only and not args.init_indices_only:
         # nothing to do
         return
 
     _eprint(f"[build] using DB at {DB_PATH}")
     conn = init_db(args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
     cur = conn.cursor()
+
+    if args.init_indices_only:
+        if not args.faiss_writer:
+            raise ValueError("--init-indices-only requires --faiss-writer")
+        _eprint("[bootstrap] Creating empty FAISS indices...")
+        
+        paper_dim = 768  # SPECTER2 dimension
+        chunk_dim = 768  # SBERT dimension
+        
+        # Create paper index (always HNSW for papers)
+        paper_index = _hnsw_index(
+            paper_dim,
+            M=args.hnsw_m,
+            ef_construction=args.efconstruction,
+            ef_search=args.efsearch,
+        )
+        paper_index = faiss.IndexIDMap2(paper_index)
+        _ensure_parent(PAPER_INDEX_PATH)
+        with FileLock(FAISS_LOCK):
+            _faiss_save_force(paper_index, PAPER_INDEX_PATH)
+        
+        # Create chunk index (FLAT or IVF-PQ based on args)
+        if args.chunks_index == "flat":
+            chunk_index = _flat_ip_index(chunk_dim)
+        else:  # ivfpq
+            m_safe = _safe_pq_m(chunk_dim, args.pq_m)
+            chunk_index = _ivfpq_index(chunk_dim, nlist=args.ivf_nlist, m=m_safe)
+        
+        chunk_index = faiss.IndexIDMap2(chunk_index)
+        _ensure_parent(CHUNK_INDEX_PATH)
+        with FileLock(FAISS_LOCK):
+            _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+        
+        _eprint("[bootstrap] Empty indices created. Exiting.")
+        return
 
     if args.consume_only:
         if not args.faiss_writer:
@@ -3939,6 +3974,12 @@ def main():
 
     ap.add_argument(
         "--build-only", action="store_true", help="Only (re)build indexes; do not run a query"
+    )
+    ap.add_argument(
+        "--init-indices-only",
+        action="store_true",
+        help="Create empty FAISS indices and exit immediately (for multi-node bootstrap). "
+        "Requires --faiss-writer. Does not process any documents.",
     )
     ap.add_argument("--update", action="store_true", help="Append-only update (skip seen files)")
     ap.add_argument(

@@ -124,11 +124,12 @@ run_producer() {
 NODELIST=($(scontrol show hostnames $SLURM_NODELIST))
 echo "Allocated nodes: ${NODELIST[*]}"
 
-# Bootstrap phase: Create FAISS indices if they don't exist
+# Bootstrap phase: Create empty FAISS indices if they don't exist
 CONSUMER_NODE="${NODELIST[$((SLURM_NNODES - 1))]}"
 echo ""
-echo "=== Bootstrapping FAISS Indices ==="
-echo "Running bootstrap on consumer node: $CONSUMER_NODE"
+echo "=== Bootstrapping Empty FAISS Indices ==="
+echo "Running fast bootstrap on consumer node: $CONSUMER_NODE"
+echo "This should complete in < 30 seconds..."
 
 srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
     --unset-env='*' \
@@ -150,12 +151,11 @@ srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
     "$IMG" -- \
     litkit \
         --faiss-writer \
-        --build-only \
-        --tar-manifest "/workspace/test.manifest" \
+        --init-indices-only \
         --papers-index hnsw \
         --chunks-index flat
 
-echo "=== Bootstrap Complete ==="
+echo "=== Bootstrap Complete (empty indices created) ==="
 echo ""
 
 # Wait for filesystem sync
