@@ -84,9 +84,10 @@ echo "======================================"
 # Function to run producer in Charliecloud container
 run_producer() {
     local node_id=$1
-    echo "[Producer $node_id] Starting on $(hostname)"
+    local target_node=$2
+    echo "[Producer $node_id] Starting on $target_node"
     
-    srun -N1 -n1 "$CHRUN" \
+    srun -N1 -n1 -w "$target_node" "$CHRUN" \
         --unset-env='*' \
         --set-env=HOME=/root \
         --cdi-dirs="$CDI_SPEC_DIR" \
@@ -118,72 +119,65 @@ run_producer() {
     echo "[Producer $node_id] Completed"
 }
 
-# Function to run consumer in Charliecloud container
-run_consumer() {
-    echo "[Consumer] Starting on $(hostname)"
-    
-    # Consumer polls and ingests segments until all producers complete
-    local poll_count=0
-    local max_polls=1000  # ~8 hours at 30s intervals
-    
-    while [ $poll_count -lt $max_polls ]; do
-        srun -N1 -n1 "$CHRUN" \
-            --unset-env='*' \
-            --set-env=HOME=/root \
-            --cdi-dirs="$CDI_SPEC_DIR" \
-            --cdi=nvidia.com/gpu=all \
-            --bind "$CUDA_LIBA:$CUDA_LIBA" \
-            --bind "$CUDA_LIBB:$CUDA_LIBB" \
-            --bind /path/to/PMC-OA:/path/to/PMC-OA \
-            --bind "${LITKIT_WORKSPACE}:/workspace" \
-            --bind "$HF_HOST:/app/hf_cache" \
-            --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
-            --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-            --set-env="LITKIT_WORKSPACE=/workspace" \
-            --set-env="HF_HOME=/app/hf_cache" \
-            --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
-            --set-env="LITKIT_SQLITE_BUSY_TIMEOUT_MS=${LITKIT_SQLITE_BUSY_TIMEOUT_MS}" \
-            --set-env="LITKIT_SAVE_EVERY_SEC=${LITKIT_SAVE_EVERY_SEC}" \
-            "$IMG" -- \
-            litkit \
-                --faiss-writer \
-                --consume-segments \
-                --embed-outdir "/workspace/emb_segments" \
-                --tar-manifest "/workspace/test.manifest" \
-                --build-only
-        
-        # Check if any producers still running or segments remaining
-        local producers_running=$(jobs -r | grep -c "run_producer" || true)
-        local segments_remaining=$(ls "${LITKIT_WORKSPACE}/emb_segments"/*.npz 2>/dev/null | wc -l)
-        
-        if [ $producers_running -eq 0 ] && [ $segments_remaining -eq 0 ]; then
-            echo "[Consumer] All producers complete and all segments ingested"
-            break
-        fi
-        
-        echo "[Consumer] Poll $poll_count: $producers_running producers running, $segments_remaining segments remaining"
-        sleep 30
-        poll_count=$((poll_count + 1))
-    done
-    
-    echo "[Consumer] Completed"
-}
+
+# Get list of allocated nodes
+NODELIST=($(scontrol show hostnames $SLURM_NODELIST))
+echo "Allocated nodes: ${NODELIST[*]}"
 
 # Run producers on all nodes except the last one
 NUM_PRODUCERS=$((SLURM_NNODES - 1))
-echo "Starting $NUM_PRODUCERS producers..."
+echo "Starting $NUM_PRODUCERS producers on nodes: ${NODELIST[@]:0:$NUM_PRODUCERS}"
 
 for ((i=0; i<NUM_PRODUCERS; i++))
 do
-    run_producer $i &
+    run_producer $i "${NODELIST[$i]}" &
 done
 
 # Wait a bit for producers to start
 sleep 10
 
 # Run consumer on the last node
-echo "Starting consumer..."
-run_consumer &
+CONSUMER_NODE="${NODELIST[$((SLURM_NNODES - 1))]}"
+echo "Starting consumer on node: $CONSUMER_NODE"
+srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
+    --unset-env='*' \
+    --set-env=HOME=/root \
+    --cdi-dirs="$CDI_SPEC_DIR" \
+    --cdi=nvidia.com/gpu=all \
+    --bind "$CUDA_LIBA:$CUDA_LIBA" \
+    --bind "$CUDA_LIBB:$CUDA_LIBB" \
+    --bind /path/to/PMC-OA:/path/to/PMC-OA \
+    --bind "${LITKIT_WORKSPACE}:/workspace" \
+    --bind "$HF_HOST:/app/hf_cache" \
+    --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+    --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    --set-env="LITKIT_WORKSPACE=/workspace" \
+    --set-env="HF_HOME=/app/hf_cache" \
+    --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
+    --set-env="LITKIT_SQLITE_BUSY_TIMEOUT_MS=${LITKIT_SQLITE_BUSY_TIMEOUT_MS}" \
+    --set-env="LITKIT_SAVE_EVERY_SEC=${LITKIT_SAVE_EVERY_SEC}" \
+    "$IMG" -- \
+    bash -c '
+    poll_count=0
+    max_polls=1000
+    while [ $poll_count -lt $max_polls ]; do
+        litkit \
+            --faiss-writer \
+            --consume-segments \
+            --embed-outdir "/workspace/emb_segments" \
+            --tar-manifest "/workspace/test.manifest" \
+            --build-only
+        
+        segments_remaining=$(ls /workspace/emb_segments/*.npz 2>/dev/null | wc -l)
+        if [ $segments_remaining -eq 0 ]; then
+            echo "[Consumer] All segments ingested"
+            break
+        fi
+        echo "[Consumer] Poll $poll_count: $segments_remaining segments remaining"
+        sleep 30
+        poll_count=$((poll_count + 1))
+    done
+    ' &
 
 # Wait for all background jobs to finish
 echo "Waiting for all jobs to complete..."
