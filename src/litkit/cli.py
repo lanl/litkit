@@ -1937,6 +1937,7 @@ def build_or_update_indices(args):
     * --rebuild: wipe DB & indices, then rebuild from scratch (writer creates indices).
     * --update : append-only update (skip previously seen files).
     * --build-only: ingest/build but do not run a query.
+    * --consume-only: skip tar scanning and embedding, only ingest segments in a polling loop.
 
     Writer vs Non-writer
     --------------------
@@ -1947,13 +1948,33 @@ def build_or_update_indices(args):
     need = args.rebuild or not (
         DB_PATH.exists() and PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists()
     )
-    if not need and not args.update and not args.build_only:
+    if not need and not args.update and not args.build_only and not args.consume_only:
         # nothing to do
         return
 
     _eprint(f"[build] using DB at {DB_PATH}")
     conn = init_db(args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
     cur = conn.cursor()
+
+    if args.consume_only:
+        if not args.faiss_writer:
+            raise ValueError("--consume-only requires --faiss-writer")
+        _eprint("[consumer] Starting consume-only mode")
+        seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
+        paper_index = _faiss_load(PAPER_INDEX_PATH)
+        chunk_index = _faiss_load(CHUNK_INDEX_PATH)
+        
+        while True:
+            p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
+            c_added = _ingest_chunk_segments(conn, chunk_index, seg_dir)
+            
+            if p_added or c_added:
+                _eprint(f"[consumer] Ingested {p_added} paper vectors and {c_added} chunk vectors")
+            else:
+                _eprint("[consumer] No new segments found, waiting...")
+                time.sleep(30)  # Wait for 30 seconds before checking again
+        
+        return  # End consume-only mode
 
     # Embedders
     paper_embedder, _paper_cfg = make_paper_embedder()
@@ -2820,7 +2841,7 @@ def build_or_update_indices(args):
     # Final commit + ensure on-disk indices are current *before* sanity
     conn.commit()
 
-    if args.faiss_writer:
+    if args.faiss_writer and not args.consume_only:
         seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
 
         if args.consume_segments and seg_dir and Path(seg_dir).exists():
@@ -4005,6 +4026,12 @@ def main():
         "--consume-segments",
         action="store_true",
         help="Writer: also consume any pending segment files at the end of a build.",
+    )
+    ap.add_argument(
+        "--consume-only",
+        action="store_true",
+        help="Consumer-only mode: skip tar scanning and embedding, only ingest segments in a polling loop. "
+        "Requires --faiss-writer. Typically used on a dedicated consumer node in multi-node setups.",
     )
     ap.add_argument(
         "--embed-outdir",

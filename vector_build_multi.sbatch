@@ -157,27 +157,11 @@ srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
     --set-env="LITKIT_SQLITE_BUSY_TIMEOUT_MS=${LITKIT_SQLITE_BUSY_TIMEOUT_MS}" \
     --set-env="LITKIT_SAVE_EVERY_SEC=${LITKIT_SAVE_EVERY_SEC}" \
     "$IMG" -- \
-    bash -c '
-    poll_count=0
-    max_polls=1000
-    while [ $poll_count -lt $max_polls ]; do
-        litkit \
-            --faiss-writer \
-            --consume-segments \
-            --embed-outdir "/workspace/emb_segments" \
-            --tar-manifest "/workspace/test.manifest" \
-            --build-only
-        
-        segments_remaining=$(ls /workspace/emb_segments/*.npz 2>/dev/null | wc -l)
-        if [ $segments_remaining -eq 0 ]; then
-            echo "[Consumer] All segments ingested"
-            break
-        fi
-        echo "[Consumer] Poll $poll_count: $segments_remaining segments remaining"
-        sleep 30
-        poll_count=$((poll_count + 1))
-    done
-    ' &
+    litkit \
+        --faiss-writer \
+        --consume-only \
+        --embed-outdir "/workspace/emb_segments" \
+        --tar-manifest "/workspace/test.manifest" &
 
 # Wait for all background jobs to finish
 echo "Waiting for all jobs to complete..."
