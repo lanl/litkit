@@ -70,9 +70,10 @@ tail -f litkit_multi_<JOBID>.out
 
 ## What the Job Will Do
 
-1. **Bootstrap Phase** (~1-2 minutes)
+1. **Bootstrap Phase** (~30-60 seconds)
    - Consumer node creates empty FAISS indices
-   - Trains IVF-PQ index with small sample
+   - Uses FLAT index for chunks (no training needed)
+   - Uses HNSW for papers
    - Exits cleanly
 
 2. **Producer Phase** (parallel)
@@ -107,7 +108,7 @@ grep "\[Producer" litkit_multi_<JOBID>.out
 ## Expected Behavior
 
 ### Success Indicators
-- ✅ Bootstrap completes without errors
+- ✅ Bootstrap completes in ~30 seconds (FLAT index, no training)
 - ✅ All producer GPUs show high utilization (nvidia-smi)
 - ✅ Consumer GPU memory remains low (<1GB)
 - ✅ Segment files appear and disappear from `/emb_segments/`
@@ -118,8 +119,9 @@ grep "\[Producer" litkit_multi_<JOBID>.out
 ```
 === Bootstrapping FAISS Indices ===
 Running bootstrap on consumer node: gpu-node4
-[train] chunk training samples: target=150000 collected=...
-[train] training IVF-PQ: nlist=... m=64
+[build] using DB at /workspace/sqlite/litkit.sqlite3
+[phase] Creating FLAT chunk index (bootstrap)
+[phase] Creating HNSW papers index
 === Bootstrap Complete ===
 
 [Producer 0] Starting on gpu-node1

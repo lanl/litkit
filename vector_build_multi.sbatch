@@ -153,7 +153,7 @@ srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
         --build-only \
         --tar-manifest "/workspace/test.manifest" \
         --papers-index hnsw \
-        --chunks-index ivfpq
+        --chunks-index flat
 
 echo "=== Bootstrap Complete ==="
 echo ""
@@ -197,7 +197,9 @@ srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
         --faiss-writer \
         --consume-only \
         --embed-outdir "/workspace/emb_segments" \
-        --tar-manifest "/workspace/test.manifest" &
+        --tar-manifest "/workspace/test.manifest" \
+        --papers-index hnsw \
+        --chunks-index ivfpq &
 
 # Wait for all background jobs to finish
 echo "Waiting for all jobs to complete..."
