@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=litkit_multi
 #SBATCH --partition=gpu-v100
-#SBATCH --nodes=2
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
@@ -51,10 +51,10 @@ fi
 export LITKIT_REPO="/path/to/litkit"
 export LITKIT_WORKSPACE="${LITKIT_REPO}/workspace"
 
-# TAR directory: Use test dataset by default, switch to PMC-OA for production
-# TEST (7 files, ~14MB, ~5-10 min): /path/to/test_tar_shards
-# PRODUCTION (full dataset, hours): /path/to/PMC-OA
-export LITKIT_TAR_DIR="/path/to/test_tar_shards"
+# Manifest file: List of specific tar.gz files to process
+# TEST (small baseline files, ~15-20 min): test_manifest.txt
+# Or use --tar-dir to process all files in a directory
+export LITKIT_TAR_MANIFEST="${LITKIT_REPO}/test_manifest.txt"
 
 # Container and CUDA setup for V100 nodes
 export IMG="${LITKIT_REPO}/sqfs/litkit-v0.3.33-aarch64-lean.sqfs"
@@ -78,7 +78,7 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "Nodes: $SLURM_NNODES"
 echo "Nodelist: $SLURM_NODELIST"
 echo "Workspace: $LITKIT_WORKSPACE"
-echo "TAR dir: $LITKIT_TAR_DIR"
+echo "TAR manifest: $LITKIT_TAR_MANIFEST"
 echo "Container: $IMG"
 echo "======================================"
 
@@ -94,13 +94,13 @@ run_producer() {
         --cdi=nvidia.com/gpu=all \
         --bind "$CUDA_LIBA:$CUDA_LIBA" \
         --bind "$CUDA_LIBB:$CUDA_LIBB" \
-        --bind "${LITKIT_TAR_DIR}:${LITKIT_TAR_DIR}" \
+        --bind /path/to/PMC-OA:/path/to/PMC-OA \
         --bind "${LITKIT_WORKSPACE}:/workspace" \
+        --bind "${LITKIT_TAR_MANIFEST}:/manifest.txt" \
         --bind "$HF_HOST:/app/hf_cache" \
         --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
         --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
         --set-env="LITKIT_WORKSPACE=/workspace" \
-        --set-env="LITKIT_TAR_DIR=${LITKIT_TAR_DIR}" \
         --set-env="HF_HOME=/app/hf_cache" \
         --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
         --set-env="LITKIT_SQLITE_BUSY_TIMEOUT_MS=${LITKIT_SQLITE_BUSY_TIMEOUT_MS}" \
@@ -115,7 +115,7 @@ run_producer() {
             --chunk-embed-bs 64 \
             --embed-devices "cuda:0,cuda:1" \
             --embed-workers 2 \
-            --tar-dir "${LITKIT_TAR_DIR}"
+            --tar-manifest "/manifest.txt"
     
     echo "[Producer $node_id] Completed"
 }
@@ -136,13 +136,13 @@ run_consumer() {
             --cdi=nvidia.com/gpu=all \
             --bind "$CUDA_LIBA:$CUDA_LIBA" \
             --bind "$CUDA_LIBB:$CUDA_LIBB" \
-            --bind "${LITKIT_TAR_DIR}:${LITKIT_TAR_DIR}" \
+            --bind /path/to/PMC-OA:/path/to/PMC-OA \
             --bind "${LITKIT_WORKSPACE}:/workspace" \
+            --bind "${LITKIT_TAR_MANIFEST}:/manifest.txt" \
             --bind "$HF_HOST:/app/hf_cache" \
             --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
             --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             --set-env="LITKIT_WORKSPACE=/workspace" \
-            --set-env="LITKIT_TAR_DIR=${LITKIT_TAR_DIR}" \
             --set-env="HF_HOME=/app/hf_cache" \
             --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
             --set-env="LITKIT_SQLITE_BUSY_TIMEOUT_MS=${LITKIT_SQLITE_BUSY_TIMEOUT_MS}" \
@@ -152,7 +152,7 @@ run_consumer() {
                 --faiss-writer \
                 --consume-segments \
                 --embed-outdir "/workspace/emb_segments" \
-                --tar-dir "${LITKIT_TAR_DIR}" \
+                --tar-manifest "/manifest.txt" \
                 --build-only
         
         # Check if any producers still running or segments remaining
