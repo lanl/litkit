@@ -32,6 +32,10 @@ workspace/hf_cache/
 workspace/pmcoa_links/
 workspace/.ch-mnt/
 
-# SLURM logs
-/litkit-build.*.out
-/litkit-build.*.err
+# SLURM logs (all patterns)
+litkit-build.*.out
+litkit-build.*.err
+litkit_multi_*.out
+litkit_multi_*.err
+*.out
+*.err
