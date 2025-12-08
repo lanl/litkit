@@ -107,6 +107,7 @@ run_producer() {
         "$IMG" -- \
         litkit \
             --embed-producer \
+            --build-only \
             --shard-id $node_id \
             --num-shards $((SLURM_NNODES - 1)) \
             --embed-outdir "/workspace/emb_segments" \
