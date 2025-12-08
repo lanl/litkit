@@ -4159,7 +4159,7 @@ def main():
         or args.embed_producer
         or args.faiss_writer
         or (not _vector_store_exists())
-    )
+    ) and not args.init_indices_only  # Bootstrap doesn't need corpus
 
     # --- helper: determine if a directory contains .tar.gz files ---
     def _has_tars(p: Path) -> bool:
