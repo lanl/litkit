@@ -761,6 +761,107 @@ class _SegmentWriter:
             _maybe_fsync_dir(final)
 
 
+class ProducerCoordinator:
+    """Manages producer completion signaling for multi-node coordination."""
+    
+    def __init__(self, outdir: Path, shard_id: int, num_shards: int):
+        self.outdir = Path(outdir)
+        self.shard_id = int(shard_id)
+        self.num_shards = int(num_shards)
+        self.marker_file = self.outdir / f".shard_{self.shard_id:02d}_complete"
+    
+    def mark_complete(self):
+        """Signal that this producer shard has finished processing."""
+        self.outdir.mkdir(parents=True, exist_ok=True)
+        tmp = self.marker_file.with_suffix(".tmp")
+        
+        marker_data = {
+            "shard_id": self.shard_id,
+            "num_shards": self.num_shards,
+            "timestamp": time.time(),
+            "hostname": socket.gethostname(),
+            "pid": os.getpid()
+        }
+        
+        with open(tmp, "w") as f:
+            f.write(json.dumps(marker_data, indent=2))
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        
+        os.replace(tmp, self.marker_file)
+        _maybe_fsync_dir(self.marker_file)
+        _eprint(f"[producer] Shard {self.shard_id}/{self.num_shards} marked complete")
+
+
+class ConsumerCoordinator:
+    """Manages consumer polling for producer completion in multi-node scenarios."""
+    
+    def __init__(self, outdir: Path, num_shards: int):
+        self.outdir = Path(outdir)
+        self.num_shards = int(num_shards)
+    
+    def count_complete_shards(self) -> int:
+        """Return the number of producer shards that have completed."""
+        if not self.outdir.exists():
+            return 0
+        
+        complete = 0
+        for i in range(self.num_shards):
+            marker = self.outdir / f".shard_{i:02d}_complete"
+            if marker.exists():
+                complete += 1
+        return complete
+    
+    def all_producers_complete(self) -> bool:
+        """Check if all producer shards have completed."""
+        return self.count_complete_shards() == self.num_shards
+    
+    def wait_for_completion(
+        self, 
+        poll_interval: float = 10.0, 
+        timeout: float = 14400.0,
+        progress_callback=None
+    ) -> bool:
+        """Wait for all producers to signal completion.
+        
+        Args:
+            poll_interval: How often to check for completion (seconds)
+            timeout: Maximum time to wait (seconds), default 4 hours
+            progress_callback: Optional function called with (complete, total) each poll
+        
+        Returns:
+            True if all completed within timeout, False if timed out
+        """
+        start = time.time()
+        last_report = 0.0
+        report_interval = 60.0  # Report progress every minute
+        
+        while time.time() - start < timeout:
+            complete = self.count_complete_shards()
+            
+            if progress_callback:
+                progress_callback(complete, self.num_shards)
+            
+            # Periodic progress report
+            now = time.time()
+            if (now - last_report) >= report_interval:
+                _eprint(f"[consumer] Waiting for producers: {complete}/{self.num_shards} complete")
+                last_report = now
+            
+            if complete == self.num_shards:
+                _eprint(f"[consumer] All {self.num_shards} producers complete!")
+                return True
+            
+            time.sleep(poll_interval)
+        
+        complete = self.count_complete_shards()
+        _eprint(f"[consumer] TIMEOUT after {timeout}s: only {complete}/{self.num_shards} producers complete")
+        return False
+
+
 # --- lightweight progress line (stderr), dependency-free ---
 class _Progress:
     def __init__(
@@ -1999,16 +2100,31 @@ def build_or_update_indices(args):
         paper_index = _faiss_load(PAPER_INDEX_PATH)
         chunk_index = _faiss_load(CHUNK_INDEX_PATH)
         
-        while True:
+        consumer_coordinator = ConsumerCoordinator(seg_dir, args.num_shards)
+        
+        def progress_callback(complete, total):
+            _eprint(f"[consumer] Progress: {complete}/{total} producers complete")
+        
+        while not consumer_coordinator.all_producers_complete():
             p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
             c_added = _ingest_chunk_segments(conn, chunk_index, seg_dir)
             
             if p_added or c_added:
                 _eprint(f"[consumer] Ingested {p_added} paper vectors and {c_added} chunk vectors")
             else:
-                _eprint("[consumer] No new segments found, waiting...")
-                time.sleep(30)  # Wait for 30 seconds before checking again
+                _eprint("[consumer] No new segments found, waiting for producers to complete...")
+            
+            # Wait for completion or timeout
+            if consumer_coordinator.wait_for_completion(poll_interval=30, timeout=600, progress_callback=progress_callback):
+                _eprint("[consumer] All producers have completed")
+                break
         
+        # Final ingestion pass after all producers have completed
+        p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
+        c_added = _ingest_chunk_segments(conn, chunk_index, seg_dir)
+        _eprint(f"[consumer] Final ingestion: {p_added} paper vectors and {c_added} chunk vectors")
+        
+        _eprint("[consumer] Consume-only mode completed")
         return  # End consume-only mode
 
     # Embedders
@@ -2875,6 +2991,13 @@ def build_or_update_indices(args):
 
     # Final commit + ensure on-disk indices are current *before* sanity
     conn.commit()
+
+    # Write completion marker for producer
+    if args.embed_producer:
+        seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
+        producer_coordinator = ProducerCoordinator(seg_dir, args.shard_id, args.num_shards)
+        producer_coordinator.mark_complete()
+        _eprint(f"[producer] Shard {args.shard_id}/{args.num_shards} marked complete")
 
     if args.faiss_writer and not args.consume_only:
         seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR

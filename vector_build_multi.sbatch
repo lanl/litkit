@@ -200,7 +200,8 @@ srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
         --embed-outdir "/workspace/emb_segments" \
         --tar-manifest "/workspace/test.manifest" \
         --papers-index hnsw \
-        --chunks-index ivfpq &
+        --chunks-index ivfpq \
+        --num-shards $((SLURM_NNODES - 1))
 
 # Wait for all background jobs to finish
 echo "Waiting for all jobs to complete..."
