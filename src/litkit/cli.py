@@ -1334,7 +1334,7 @@ def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int =
                 continue
         try:
             with np.load(tmp, mmap_mode="r") as z:
-                if "kind" in z.files and str(z["kind"]).strip() != "papers":
+                if "kind" in z.files and str(z["kind"].item()).strip() != "papers":
                     raise ValueError("wrong segment kind for paper ingester")
                 if "ids" in z and ("vecs" in z or "emb" in z):
                     ids = np.ascontiguousarray(z["ids"].astype(np.int64))
@@ -1413,7 +1413,7 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
     if not isinstance(chunk_index, faiss.IndexIDMap2):
         chunk_index = faiss.IndexIDMap2(chunk_index)
 
-    # Accept both our writer’s names and generic .npz containing {'ids','vecs'}.
+    # Accept both our writer's names and generic .npz containing {'ids','vecs'}.
     # Also consider files already in the ".ingesting" state.
     cand = sorted(
         list(outdir.glob("chunks_*.npz"))  # new style
@@ -1446,7 +1446,7 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
         try:
             with np.load(tmp, mmap_mode="r") as z:
                 # Reject wrong-kind files (old .seg has 'kind')
-                if "kind" in z.files and str(z["kind"]).strip() != "chunks":
+                if "kind" in z.files and str(z["kind"].item()).strip() != "chunks":
                     raise ValueError("wrong segment kind for chunk ingester")
                 if "ids" in z and "vecs" in z:
                     ids = np.ascontiguousarray(z["ids"].astype(np.int64))
