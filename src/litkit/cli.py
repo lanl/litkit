@@ -2507,13 +2507,71 @@ def build_or_update_indices(args):
                         _clear_chunk_trained_flag()
 
     def _shard_filter(paths, shard_id, num_shards):
-        """Deterministically assign files to a shard by hashing path (mod num_shards).
-        Streaming (no global sort/materialization here).
+        """Deterministically assign tar files to shards using size-aware bin-packing
+        to balance load across producers.
+        
+        Algorithm:
+        1. Stat each tar file from the manifest to get sizes
+        2. Sort by size (largest first) for better packing
+        3. Greedy bin-packing: assign each tar to the shard with smallest current load
+        4. Yield only the tars assigned to this shard
+        
+        Falls back to hash-based sharding if stat fails (errors out loudly per user request).
         """
-        for p in paths:
-            h = int(hashlib.md5(str(p).encode("utf-8")).hexdigest(), 16)
-            if h % num_shards == shard_id:
-                yield p
+        # Materialize the path list for sorting
+        paths_list = list(paths)
+        
+        if not paths_list:
+            return
+        
+        # Collect sizes for load balancing
+        paths_with_sizes = []
+        for p in paths_list:
+            try:
+                size = p.stat().st_size
+                paths_with_sizes.append((p, size))
+            except Exception as e:
+                # User requested: fail loudly if a manifest file is unreadable
+                raise RuntimeError(f"Cannot stat tar file {p}: {e}") from e
+        
+        if not paths_with_sizes:
+            return  # all files failed stat (already raised above)
+        
+        # Sort by size (largest first) for better bin-packing
+        paths_with_sizes.sort(key=lambda x: x[1], reverse=True)
+        
+        # Greedy bin-packing: assign each tar to the shard with smallest current load
+        shard_loads = [0] * num_shards
+        shard_assignments = [[] for _ in range(num_shards)]
+        
+        for tar_path, size in paths_with_sizes:
+            # Find shard with minimum load
+            min_shard = min(range(num_shards), key=lambda i: shard_loads[i])
+            shard_assignments[min_shard].append((tar_path, size))
+            shard_loads[min_shard] += size
+        
+        # Log shard assignments (shows load balance across all shards)
+        if not QUIET:
+            _eprint(f"\n[shard] Load-balanced tar distribution across {num_shards} shard(s):")
+            for i in range(num_shards):
+                count = len(shard_assignments[i])
+                load_gb = shard_loads[i] / (1024**3)
+                marker = " <-- THIS SHARD" if i == shard_id else ""
+                _eprint(f"[shard]   Shard {i}/{num_shards}: {count} tar files, {load_gb:.2f} GB{marker}")
+                
+                # Show first few files for this shard if it's the current one
+                if i == shard_id and shard_assignments[i]:
+                    _eprint(f"[shard]   Files assigned to shard {shard_id}:")
+                    for j, (tar_p, tar_sz) in enumerate(shard_assignments[i][:5]):
+                        sz_gb = tar_sz / (1024**3)
+                        _eprint(f"[shard]     - {tar_p.name} ({sz_gb:.2f} GB)")
+                    if len(shard_assignments[i]) > 5:
+                        remaining = len(shard_assignments[i]) - 5
+                        _eprint(f"[shard]     ... and {remaining} more file(s)")
+        
+        # Yield only the tars assigned to this shard
+        for tar_path, _ in shard_assignments[shard_id]:
+            yield tar_path
 
     use_tar = (getattr(args, "tar_dir", None) is not None) or (
         getattr(args, "tar_manifest", None) is not None
