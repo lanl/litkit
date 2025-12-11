@@ -2,6 +2,9 @@
 """
 EmbeddingPool: one SentenceTransformers worker per device (CUDA/CPU/MPS).
 Spawn-based, no sockets/NCCL; safe for air-gapped/HPC.
+
+FIXED: Uses per-worker input queues to prevent race conditions where
+the faster-initializing worker grabs all tasks.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ class EmbeddingPool:
     -----
     - Uses spawn() for CUDA hygiene.
     - Workers return L2-normalized float32 arrays.
+    - Each worker has its own input queue to prevent race conditions.
     """
 
     def __init__(self, model_path: Path, devices: list[str]):
@@ -40,8 +44,13 @@ class EmbeddingPool:
             raise ValueError("EmbeddingPool requires at least one device")
 
         self.ctx = mp.get_context("spawn")
-        self.q_in = self.ctx.Queue()
+        
+        # FIX: Per-worker input queues instead of shared queue
+        # This prevents the race condition where the faster-initializing
+        # worker grabs all tasks before slower workers are ready
+        self.q_ins: list[mp.Queue] = [self.ctx.Queue() for _ in self.devices]
         self.q_out = self.ctx.Queue()
+        
         self.workers: list[mp.Process] = []
         self._closed = False
         self._prev_signals: tuple | None = None
@@ -49,7 +58,7 @@ class EmbeddingPool:
         for rank, dev in enumerate(self.devices):
             p = self.ctx.Process(
                 target=self._worker_main,
-                args=(rank, dev, self.model_path, self.q_in, self.q_out),
+                args=(rank, dev, self.model_path, self.q_ins[rank], self.q_out),
                 daemon=True,
             )
             p.start()
@@ -109,14 +118,20 @@ class EmbeddingPool:
             return np.zeros((0, 768), dtype="float32")
 
         n = len(texts)
-        splits = np.array_split(np.arange(n), max(1, len(self.devices)))
+        num_workers = len(self.devices)
+        
+        # Split work evenly across workers
+        splits = np.array_split(np.arange(n), max(1, num_workers))
+        
+        # FIX: Send each split directly to its designated worker's queue
         submitted: list[int] = []
-        for tid, idxs in enumerate(splits):
+        for worker_id, idxs in enumerate(splits):
             if idxs.size == 0:
                 continue
             shard = [texts[i] for i in idxs]
-            self.q_in.put((tid, shard, int(batch_size)))
-            submitted.append(tid)
+            # Each worker gets work on its own queue - no race!
+            self.q_ins[worker_id].put((worker_id, shard, int(batch_size)))
+            submitted.append(worker_id)
 
         results: dict[int, np.ndarray | Exception] = {}
         for _ in submitted:
@@ -147,9 +162,10 @@ class EmbeddingPool:
             return
         self._closed = True
         try:
-            for _ in self.workers:
+            # Send shutdown signal to each worker's queue
+            for q_in in self.q_ins:
                 try:
-                    self.q_in.put(None)
+                    q_in.put(None)
                 except Exception:
                     pass
             if force:
@@ -160,7 +176,8 @@ class EmbeddingPool:
                 p.join(timeout=2.0)
         finally:
             try:
-                self.q_in.close()
+                for q_in in self.q_ins:
+                    q_in.close()
                 self.q_out.close()
             except Exception:
                 pass
