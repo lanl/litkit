@@ -1470,10 +1470,12 @@ def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int =
             if added:
                 if saved:
                     with FileLock(DB_LOCK):
-                        _mark_in_index(cur, "papers", [int(i) for i in ids_added]) if ids_added else None
+                        if len(ids_added) > 0:
+                            _mark_in_index(cur, "papers", [int(i) for i in ids_added])
                         conn.commit()
                 else:
-                    _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
+                    if len(ids_added) > 0:
+                        _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
 
             added_total += int(added or 0)
             batch_counter += 1
@@ -1582,10 +1584,12 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
             if added:
                 if saved:
                     with FileLock(DB_LOCK):
-                        _mark_in_index(cur, "chunks", [int(i) for i in ids_added]) if ids_added else None
+                        if len(ids_added) > 0:
+                            _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
                         conn.commit()
                 else:
-                    _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
+                    if len(ids_added) > 0:
+                        _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
 
             added_total += int(added)
             batch_counter += 1
