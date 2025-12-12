@@ -2690,9 +2690,8 @@ def build_or_update_indices(args):
                 _eprint("[consumer] No new segments found, waiting for producers to complete...")
             
             # Wait for completion or timeout
-            # Timeout set to 6 hours (21600s) for large corpus processing
-            # Producers processing ~180GB of tar files can take 2-4 hours
-            if consumer_coordinator.wait_for_completion(poll_interval=30, timeout=21600, progress_callback=progress_callback):
+            # Timeout set to 10 hours (36000s) to match the cluster's max job time
+            if consumer_coordinator.wait_for_completion(poll_interval=30, timeout=36000, progress_callback=progress_callback):
                 _eprint("[consumer] All producers have completed")
                 break
         

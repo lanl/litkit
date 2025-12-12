@@ -1,236 +1,256 @@
-> **TODO**: This document is outdated and should be updated after the next code review. Many of the bugs described here have been fixed in the `feature/multi-producer-sqlite` branch.
+# LitKit Code Review Summary
 
-# LitKit Multi-Node Producer-Consumer Analysis - Summary
+> **Last Updated:** December 12, 2025
 
-## Overview
+This document provides a comprehensive analysis of the litkit codebase as it exists today.
 
-This document summarizes the comprehensive analysis of the litkit repository's producer-consumer architecture for multi-node vector indexing, identifies critical bugs, and provides actionable recommendations.
+## Architecture Overview
 
-## What Was Done
+LitKit is a two-stage RAG (Retrieval-Augmented Generation) pipeline designed for HPC environments. It processes the PMC-OA corpus (PubMed Central Open Access) and provides semantic search over scientific literature.
 
-### 1. Deep Code Review
-- Analyzed 3000+ lines of `src/litkit/cli.py`
-- Identified producer-consumer implementation patterns
-- Traced segment file lifecycle from creation to ingestion
-- Examined SQLite synchronization and FAISS index management
-
-### 2. Bug Identification
-Found **5 critical bugs** that prevent reliable multi-node operation:
-
-1. **Race condition in segment writing** (CRITICAL)
-   - Producers commit to DB before segment files are durable
-   - Can cause data corruption if consumer reads partial files
-
-2. **No segment file state management**
-   - No distinction between in-progress vs complete segments
-   - Consumers may process incomplete files or skip complete ones
-
-3. **Lack of producer-consumer coordination**
-   - No signaling mechanism for completion
-   - Consumers don't know when producers are done
-
-4. **Incomplete error recovery**
-   - Failed segments retry forever with no escape path
-   - No dead-letter queue for persistently failing segments
-
-5. **Marker flag inconsistency**
-   - `in_index` flags not properly maintained across crashes
-   - Potential duplicate work on restarts
-
-### 3. Solution Design
-Designed comprehensive fixes including:
-- Atomic segment writing with state tracking (.tmp → .writing → final)
-- Producer-consumer coordination protocol with completion markers
-- Enhanced error recovery with retry limits and failure tracking
-- Improved SQLite flag consistency
-
-### 4. Documentation Created
-
-| Document | Purpose | Status |
-|----------|---------|--------|
-| `PRODUCER_CONSUMER_ANALYSIS.md` | Detailed bug analysis and proposed fixes | ✅ Complete |
-| `vector_build_multi.sbatch` | Diagnostic multi-node SLURM script | ✅ Complete |
-| `MULTI_NODE_TESTING_GUIDE.md` | Comprehensive testing procedures | ✅ Complete |
-| `SUMMARY.md` | This document | ✅ Complete |
-
-## Key Findings
-
-### Current Architecture
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  Producer 1 │     │  Producer 2 │ ... │  Producer N │
-│  (GPU Node) │     │  (GPU Node) │     │  (GPU Node) │
-└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
-       │                   │                    │
-       │ Write segments    │                    │
-       └───────────────────┴────────────────────┘
-                           │
-                   ┌───────▼────────┐
-                   │ Shared Storage │
-                   │  (NFS/Lustre)  │
-                   └───────┬────────┘
-                           │
-                   ┌───────▼────────┐
-                   │   Consumer     │
-                   │  (Writer Node) │
-                   │  Ingests into  │
-                   │     FAISS      │
-                   └────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         MULTI-NODE ARCHITECTURE                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐               │
+│   │  Producer 0  │   │  Producer 1  │   │  Producer 2  │  (N-1 nodes)  │
+│   │  (GPU Node)  │   │  (GPU Node)  │   │  (GPU Node)  │               │
+│   │              │   │              │   │              │               │
+│   │ • Parse XML  │   │ • Parse XML  │   │ • Parse XML  │               │
+│   │ • Embed docs │   │ • Embed docs │   │ • Embed docs │               │
+│   │ • Write .npz │   │ • Write .npz │   │ • Write .npz │               │
+│   │ • Shard DB   │   │ • Shard DB   │   │ • Shard DB   │               │
+│   └──────┬───────┘   └──────┬───────┘   └──────┬───────┘               │
+│          │                  │                  │                        │
+│          └──────────────────┼──────────────────┘                        │
+│                             │                                           │
+│                     ┌───────▼────────┐                                  │
+│                     │ Shared Storage │  (Lustre/NFS)                    │
+│                     │                │                                  │
+│                     │ • emb_segments/│  (.npz vector files)             │
+│                     │ • sqlite/      │  (shard DBs + main DB)           │
+│                     │ • indices/     │  (FAISS files)                   │
+│                     └───────┬────────┘                                  │
+│                             │                                           │
+│                     ┌───────▼────────┐                                  │
+│                     │   Consumer     │  (1 dedicated node)              │
+│                     │                │                                  │
+│                     │ • Merge shards │                                  │
+│                     │ • Ingest .npz  │                                  │
+│                     │ • Build FAISS  │                                  │
+│                     │ • Backfill     │                                  │
+│                     └────────────────┘                                  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Problems Identified
+## Key Modules
 
-1. **Timing Issues**
-   - Producer: Write segment → Commit DB (❌ TOO EARLY)
-   - Consumer: Read DB → Try to ingest segment (❌ MAY NOT EXIST YET)
+### `src/litkit/cli.py` (~3500 lines)
 
-2. **No Coordination**
-   - Consumers poll directory blindly
-   - No completion signal when producers finish
-   - May exit before all work is done
+The main module containing:
 
-3. **Error Handling**
-   - Infinite retries on corrupted segments
-   - No visibility into failures
-   - No recovery path
+| Component | Description |
+|-----------|-------------|
+| `build_or_update_indices()` | Core build logic for single/multi-node |
+| `ProducerCoordinator` | Writes `.shard_XX_complete` markers |
+| `ConsumerCoordinator` | Polls for producer completion (10h timeout) |
+| `_SegmentWriter` | Writes paper embeddings to `.npz` files |
+| `_ChunkSegmentWriter` | Writes chunk embeddings to `.npz` files |
+| `merge_shard_databases()` | Merges per-shard SQLite DBs into main |
+| `_ingest_paper_segments()` | Consumer ingests paper vectors into FAISS |
+| `_ingest_chunk_segments()` | Consumer ingests chunk vectors into FAISS |
+| `reconcile_sqlite_flags_with_faiss()` | Ensures `in_index` flags match FAISS |
+| `backfill_unindexed_vectors()` | Re-embeds any rows with `in_index=0` |
 
-## Recommended Implementation Path
+### `src/litkit/embeddings/`
 
-### Phase 1: Critical Fixes (Week 1)
-**Priority: HIGH**
+| Module | Description |
+|--------|-------------|
+| `base.py` | `Embedder` protocol and progress utilities |
+| `factory.py` | Creates paper/chunk embedders |
+| `pool.py` | Multi-GPU worker pool for SBERT |
+| `specter2.py` | SPECTER2 paper embeddings |
+| `sbert_mpnet.py` | SBERT chunk embeddings |
+| `devices.py` | GPU detection and thread configuration |
 
-1. **Fix atomic segment writing** (2-3 hours)
-   - Implement state machine: .tmp → .writing → final
-   - Defer DB commit until after segment is written
-   - Update `_SegmentWriter` and `_ChunkSegmentWriter` classes
+### `src/litkit/ingest/`
 
-2. **Add coordination protocol** (3-4 hours)
-   - Implement `ProducerCoordinator` class
-   - Implement `ConsumerCoordinator` class
-   - Add completion markers
-   - Consumer waits for all producers
+| Module | Description |
+|--------|-------------|
+| `ingest.py` | Tar streaming, XML parsing, parallel parsing |
 
-### Phase 2: Enhanced Reliability (Week 2)
-**Priority: MEDIUM**
+### `src/litkit/formatting/`
 
-3. **Improve error recovery** (2-3 hours)
-   - Add retry counters
-   - Implement .failed state
-   - Add detailed error logging
+| Module | Description |
+|--------|-------------|
+| `answers.py` | Citation normalization and reference rendering |
 
-4. **Fix flag consistency** (2 hours)
-   - Ensure proper `in_index` flag management
-   - Add reconciliation on startup
+## Data Flow
 
-### Phase 3: Testing & Validation (Week 2-3)
-**Priority: HIGH**
+### 1. Ingestion (Producer Mode)
 
-5. **Run test suite** (4-6 hours)
-   - Phase 1: Single-node baseline
-   - Phase 2: Two-node producer-consumer
-   - Phase 3: Multi-node stress test
+```
+tar files → XML parsing → SQLite (shard DB) → Embedding → .npz segments
+```
 
-## Success Criteria
+- Each producer processes a shard of tar files (load-balanced by size)
+- Uses `--embed-producer --shard-id X --num-shards N`
+- Writes to `litkit_shard_XX.sqlite3` (no lock contention)
+- Outputs `papers_shXX_*.npz` and `chunks_shXX_*.npz`
 
-### Must Have ✅
-- [x] Identified all critical bugs
-- [x] Proposed concrete fixes with code
-- [x] Created diagnostic SLURM script
-- [x] Documented testing procedures
-- [ ] Implement fixes (pending)
-- [ ] Pass all test phases (pending)
+### 2. Consumption (Consumer Mode)
 
-### Should Have 📋
-- [x] Detailed bug analysis
-- [x] Architecture diagrams
-- [x] Error recovery procedures
-- [ ] Performance benchmarks (after implementation)
+```
+.npz segments → FAISS indices + shard DBs → main DB merge → backfill
+```
 
-### Nice to Have 🎯
-- [x] Multiple SLURM script examples
-- [x] Monitoring commands
-- [x] Troubleshooting guide
-- [ ] Automated testing harness (future)
+- Single consumer runs with `--faiss-writer --consume-only`
+- Polls `emb_segments/` for new `.npz` files
+- Waits for `.shard_XX_complete` markers (up to 10 hours)
+- Merges shard DBs using `doc_id` for deduplication
+- Runs `backfill_unindexed_vectors()` to catch any gaps
 
-## Risk Assessment
+### 3. Retrieval (Query Mode)
 
-### Before Fixes
-- **Data Corruption Risk**: HIGH
-- **Incomplete Indexing Risk**: HIGH  
-- **Production Readiness**: NOT READY
+```
+Question → SPECTER2 (Stage 1) → SBERT (Stage 2) → LLM → Answer
+```
 
-### After Fixes
-- **Data Corruption Risk**: LOW
-- **Incomplete Indexing Risk**: LOW
-- **Production Readiness**: READY (after testing)
+- Stage 1: HNSW search over paper embeddings
+- Stage 2: ANN search over chunks, filtered to candidate papers
+- Lexical front-loading for rare terms (e.g., "rulemonkey")
+- Per-paper cap to ensure diversity in context
 
-## Estimated Timeline
+## Coordination Protocol
 
-| Phase | Duration | Deliverable |
-|-------|----------|-------------|
-| Implementation | 1 week | Fixed code |
-| Testing | 1 week | Validated system |
-| Documentation | 2 days | Updated docs |
-| **Total** | **~2.5 weeks** | Production-ready |
+### Producer Completion Signaling
 
-## Next Actions
+1. Producer finishes processing its tar shard
+2. Writes `.shard_XX_complete` marker file (JSON with timestamp, hostname, pid)
+3. Uses atomic write pattern: `.tmp` → `os.replace()` → final
 
-### Immediate (This Week)
-1. ✅ Review analysis with team
-2. ✅ Get approval for fixes
-3. ⏳ Implement Fix 1 (atomic writing)
-4. ⏳ Implement Fix 2 (coordination)
+### Consumer Completion Detection
 
-### Short Term (Next Week)
-5. ⏳ Implement Fix 3 (error recovery)
-6. ⏳ Run Phase 1 tests
-7. ⏳ Run Phase 2 tests
+1. Consumer polls `emb_segments/` for markers every 30 seconds
+2. Logs progress: "Waiting for producers: X/N complete"
+3. Timeout: 36000 seconds (10 hours) to match the cluster's max job time
+4. After all producers complete, runs final ingestion pass
 
-### Medium Term (Week 3)
-8. ⏳ Run Phase 3 tests
-9. ⏳ Performance tuning
-10. ⏳ Production deployment
+### Shard Database Merging
 
-## Resources Required
+1. Consumer reads all `litkit_shard_*.sqlite3` files
+2. Inserts papers using `doc_id` for deduplication (prevents duplicates)
+3. Remaps chunk/file `paper_id` references to main DB IDs
+4. Deletes shard DBs after successful merge
 
-- **Development**: 1 engineer, 1 week
-- **Testing**: 1 engineer, 1 week  
-- **HPC Resources**: 4-8 GPU nodes for testing
-- **Storage**: Shared filesystem (already available)
+## Document ID Scheme
 
-## Alternative Approaches Considered
+Papers are deduplicated across shards using a stable `doc_id`:
 
-### Option 1: Message Queue (Redis/RabbitMQ)
-- **Pros**: Industry-standard, robust
-- **Cons**: External dependency, complex setup on HPC
-- **Decision**: Too heavy for this use case
+| Priority | Format | Example |
+|----------|--------|---------|
+| 1 | `pmc:{pmcid}` | `pmc:PMC1234567` |
+| 2 | `pmid:{pmid}` | `pmid:12345678` |
+| 3 | `hash:{sha256[:16]}` | `hash:a1b2c3d4e5f6g7h8` |
+| 4 | `uuid:{random}` | `uuid:f47ac10b58cc4372` |
 
-### Option 2: Distributed Lock Manager
-- **Pros**: Prevents race conditions explicitly
-- **Cons**: Requires additional infrastructure
-- **Decision**: Filesystem-based coordination sufficient
+## FAISS Index Types
 
-### Option 3: Monolithic Single-Node Processing
-- **Pros**: No coordination needed
-- **Cons**: Cannot scale beyond single node
-- **Decision**: Defeats purpose of multi-node architecture
+| Index | Type | Use Case |
+|-------|------|----------|
+| Papers | HNSW (M=32, efConstruction=200) | Fast ANN for ~millions of papers |
+| Chunks | IVF-PQ or FLAT | Depends on corpus size |
 
-## Conclusion
+- FLAT: Used for small corpora or when IVF-PQ training fails
+- IVF-PQ: Used for large corpora (requires training pass)
 
-The litkit producer-consumer implementation has **5 critical bugs** that prevent reliable multi-node operation. The proposed fixes are **well-defined, implementable, and testable**. With ~2.5 weeks of focused effort, the system can be production-ready for multi-node HPC environments.
+## Segment File Lifecycle
 
-The architecture is fundamentally sound—it just needs these synchronization and coordination fixes to work reliably at scale.
+```
+Producer:
+  .tmp → os.replace() → final .npz → Producer completes
 
-## Contact & Support
+Consumer:
+  .npz → os.replace() → .npz.ingesting → ingest → delete
+        (on error)    → os.replace() → .npz (retry next run)
+```
 
-For questions or issues:
-1. Review `PRODUCER_CONSUMER_ANALYSIS.md` for technical details
-2. Follow `MULTI_NODE_TESTING_GUIDE.md` for testing procedures
-3. Use `vector_build_multi.sbatch` as starting template
-4. File issues in the project repository
+## Configuration
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LITKIT_WORKSPACE` | `./workspace` | Writable output directory |
+| `LITKIT_SQLITE_BUSY_TIMEOUT_MS` | `120000` | SQLite busy timeout (ms) |
+| `LITKIT_SAVE_EVERY_SEC` | `120` | FAISS save throttle (seconds) |
+| `LITKIT_EMBED_SEGMENT_SIZE` | `131072` | Vectors per segment file |
+| `LITKIT_EMBED_SEGMENT_DTYPE` | `fp16` | Segment storage dtype |
+
+### Key CLI Flags
+
+| Flag | Description |
+|------|-------------|
+| `--faiss-writer` | This process mutates FAISS indices |
+| `--embed-producer` | Producer mode (embed + write segments) |
+| `--consume-only` | Consumer mode (ingest segments only) |
+| `--init-indices-only` | Bootstrap empty FAISS indices |
+| `--shard-id` / `--num-shards` | Producer shard assignment |
+| `--tar-manifest` | Path to manifest file listing tar paths |
+| `--chunks-index flat` | Use FLAT index (skip IVF-PQ training) |
+
+## Locking Strategy
+
+Lock order (always acquire in this sequence to prevent deadlock):
+1. `DB_LOCK` (SQLite writes)
+2. `FAISS_LOCK` (FAISS mutations)
+
+Additional guards:
+- `WRITER_GUARD`: Prevents multiple `--faiss-writer` processes
+- Advisory file locks via `fcntl.flock()` (best-effort on NFS)
+
+## Known Limitations
+
+### No Dead-Letter Queue
+- Failed segments are renamed back to `.npz` for retry
+- Persistently failing segments will retry indefinitely
+- **Mitigation:** Manual inspection if a segment keeps failing
+
+### No Real-Time Monitoring
+- Progress is logged to stderr
+- No Prometheus/metrics endpoint
+- **Mitigation:** Parse logs or use `validate_build.sh`
+
+### Single Consumer Bottleneck
+- Only one consumer can ingest segments
+- Could be parallelized with sharded FAISS indices
+- **Current design:** Acceptable for ~1M paper corpora
+
+## Validation
+
+After a build completes, run:
+
+```bash
+./validate_build.sh /path/to/workspace
+```
+
+This checks:
+1. All segment files consumed (directory empty)
+2. FAISS indices exist with non-trivial size
+3. SQLite `in_index` flags match FAISS `ntotal`
+
+## Future Work
+
+1. **Dead-letter queue** for permanently failing segments
+2. **Prometheus metrics** for monitoring
+3. **Sharded FAISS** for parallel consumer ingestion
+4. **Incremental updates** without full rebuild
+5. **Better error recovery** with automatic backoff
 
 ---
 
-**Analysis Date**: December 1, 2025  
-**Branch**: `fix/multi-node-producer-consumer`  
-**Status**: Analysis Complete, Implementation Pending
+**Codebase:** `src/litkit/`  
+**Branch:** `feature/multi-producer-sqlite`  
+**Status:** Production-ready for multi-node builds
