@@ -35,7 +35,7 @@ fi
 : "${YES:=1}"                                # 1 = auto-confirm rebuild prompts
 
 # Corpus source (exactly one)
-: "${MANIFEST:=/path/to/litkit/workspace/test.manifest}"
+: "${MANIFEST:=/path/to/litkit/workspace/small_test.manifest}"
 : "${TAR_DIR:=}"
 
 # Retrieval/ANN controls

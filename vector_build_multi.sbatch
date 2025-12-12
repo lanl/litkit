@@ -51,10 +51,11 @@ fi
 export LITKIT_REPO="/path/to/litkit"
 export LITKIT_WORKSPACE="${LITKIT_REPO}/workspace"
 
-# Manifest file: List of uncompressed tar files to process
-# Default: medium_test.manifest (~7 GB, 30-45 min)
-# Override: MANIFEST=large_test.manifest sbatch ... (185 GB, 3-5 hours)
+# MANIFEST options (uncomment one):
+#   medium_test.manifest  (~7 GB, 30-45 min)
+#   large_test.manifest   (~185 GB, 3-5 hours)
 export LITKIT_TAR_MANIFEST="${LITKIT_WORKSPACE}/${MANIFEST:-medium_test.manifest}"
+# export LITKIT_TAR_MANIFEST="${LITKIT_WORKSPACE}/${MANIFEST:-large_test.manifest}"
 
 # Container and CUDA setup for V100 nodes
 export IMG="${LITKIT_REPO}/sqfs/litkit-v0.3.34-aarch64-lean.sqfs"
