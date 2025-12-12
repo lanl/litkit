@@ -65,7 +65,7 @@ if [[ "$TARGET" == "gh" ]]; then : "${IVF_NLIST:=32768}"; else : "${IVF_NLIST:=1
 # -------------------- Paths & container --------------------
 BASE="/path/to"
 LITKIT_DIR="$BASE/litkit"
-IMG="$LITKIT_DIR/sqfs/litkit-v0.3.33-aarch64-lean.sqfs"
+IMG="$LITKIT_DIR/sqfs/litkit-v0.3.34-aarch64-lean.sqfs"
 CDI_SPEC_DIR="$BASE/$([[ "$TARGET" == "gh" ]] && echo cdi-grace || echo cdi-v100)"
 HF_HOST="$BASE/hf_cache_persist"
 WORKSPACE="$LITKIT_DIR/workspace"

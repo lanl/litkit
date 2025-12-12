@@ -50,7 +50,7 @@ fi
 
 # HPC paths
 export LITKIT_REPO="/path/to/litkit"
-export IMG="${LITKIT_REPO}/sqfs/litkit-v0.3.33-aarch64-lean.sqfs"
+export IMG="${LITKIT_REPO}/sqfs/litkit-v0.3.34-aarch64-lean.sqfs"
 export CDI_SPEC_DIR="/path/to/cdi-v100"
 export CUDA_BASE="/path/to/cuda-12.5-host/cuda-12.5"
 export CUDA_LIBA="${CUDA_BASE}/targets/sbsa-linux/lib"

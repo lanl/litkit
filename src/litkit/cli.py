@@ -445,21 +445,23 @@ BUDGET_TOKENS_OSS20B = 3000
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS papers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  doc_id TEXT,                      -- stable document identifier (pmcid or pmid or hash)
   pmid TEXT,
   pmcid TEXT,
   title TEXT,
   abstract TEXT,
-  in_index INTEGER DEFAULT 0        -- NEW: 0=not yet in FAISS, 1=added
+  in_index INTEGER DEFAULT 0        -- 0=not yet in FAISS, 1=added
 );
 CREATE TABLE IF NOT EXISTS chunks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   paper_id INTEGER NOT NULL,
   ord INTEGER NOT NULL,
   text TEXT NOT NULL,
-  in_index INTEGER DEFAULT 0,       -- NEW: 0=not yet in FAISS, 1=added
+  in_index INTEGER DEFAULT 0,       -- 0=not yet in FAISS, 1=added
   FOREIGN KEY(paper_id) REFERENCES papers(id)
 );
 CREATE INDEX IF NOT EXISTS chunks_paper_id ON chunks(paper_id);
+CREATE INDEX IF NOT EXISTS chunks_paper_ord ON chunks(paper_id, ord);
 CREATE TABLE IF NOT EXISTS files (
   path TEXT PRIMARY KEY,
   size INTEGER,
@@ -468,6 +470,7 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS papers_pmcid_uq ON papers(pmcid) WHERE pmcid <> '';
 CREATE UNIQUE INDEX IF NOT EXISTS papers_pmid_uq  ON papers(pmid)  WHERE pmid  <> '';
+CREATE UNIQUE INDEX IF NOT EXISTS papers_doc_id_uq ON papers(doc_id) WHERE doc_id <> '';
 """
 
 
@@ -622,13 +625,56 @@ def init_db(journal_mode: str, busy_timeout_ms: int):
 
 
 def _ensure_in_index_columns(conn):
-    """Idempotent migration: ensure `in_index` exists on {papers,chunks}."""
+    """Idempotent migration: ensure `in_index` and `doc_id` columns exist."""
     cur = conn.cursor()
     for table in ("papers", "chunks"):
         cols = {row[1] for row in cur.execute(f"PRAGMA table_info({table})")}
         if "in_index" not in cols:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN in_index INTEGER DEFAULT 0")
+    
+    # Ensure doc_id column exists on papers table (for multi-producer deduplication)
+    papers_cols = {row[1] for row in cur.execute("PRAGMA table_info(papers)")}
+    if "doc_id" not in papers_cols:
+        cur.execute("ALTER TABLE papers ADD COLUMN doc_id TEXT")
+        # Create unique index for doc_id if it doesn't exist
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS papers_doc_id_uq ON papers(doc_id) WHERE doc_id <> ''")
+    
     conn.commit()
+
+
+def _compute_doc_id(pmcid: str | None, pmid: str | None, title: str | None = None, abstract: str | None = None) -> str:
+    """Compute a stable document identifier for multi-producer deduplication.
+    
+    Priority:
+    1. pmcid (preferred - globally unique PubMed Central ID)
+    2. pmid (fallback - unique within PubMed)
+    3. hash of title+abstract (last resort for documents without standard IDs)
+    
+    Returns:
+        A string doc_id in format "pmc:<id>", "pmid:<id>", or "hash:<sha256[:16]>"
+    """
+    pmcid = (pmcid or "").strip()
+    pmid = (pmid or "").strip()
+    
+    if pmcid:
+        return f"pmc:{pmcid}"
+    if pmid:
+        return f"pmid:{pmid}"
+    
+    # Fall back to content hash
+    title = (title or "").strip()
+    abstract = (abstract or "").strip()
+    content = f"{title}\n{abstract}".strip()
+    
+    if not content:
+        # Extremely rare: no pmcid, pmid, title, or abstract
+        # Use a random UUID to avoid collisions
+        import uuid
+        return f"uuid:{uuid.uuid4().hex[:16]}"
+    
+    # Use SHA256 truncated to 16 chars for reasonable uniqueness + compactness
+    content_hash = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return f"hash:{content_hash}"
 
 
 def pack_paragraphs(
