@@ -138,8 +138,8 @@ cd /path/to/litkit
 module purge
 module load charliecloud/0.42
 
-# Build lean container (for production)
-just build-lean
+# Build container (Dockerfile.lean by default)
+just build
 
 # Output: sqfs/litkit-v0.3.33-aarch64-lean.sqfs
 ```
@@ -415,7 +415,7 @@ This is **expected behavior** with the current tar.gz scanning code. The scan ra
 ```bash
 # Rebuild the container
 cd /path/to/litkit
-just build-lean
+just build
 
 # Verify
 ls -la sqfs/litkit-v0.3.33-aarch64-lean.sqfs
@@ -468,7 +468,7 @@ git pull
 
 # 3. Rebuild container (if needed)
 module load charliecloud/0.42
-just build-lean
+just build
 
 # 4. Submit job
 sbatch -p gpu-v100 vector_build_single.sbatch
