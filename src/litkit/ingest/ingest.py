@@ -40,9 +40,11 @@ Notes:
 
 from __future__ import annotations
 
+import io
 import logging
 import tarfile
 from collections.abc import Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import IO, Any, TypedDict
@@ -473,6 +475,120 @@ def iter_tar_xml_streams(
         stack.close()
 
 
+# -------------------------------
+# Parallel XML parsing
+# -------------------------------
+def _parse_xml_bytes(data: bytes) -> ArticleMeta | None:
+    """Parse XML from bytes. Thread-safe worker function."""
+    try:
+        parser = etree.XMLParser(
+            recover=True,
+            huge_tree=True,
+            resolve_entities=False,
+            load_dtd=False,
+            no_network=True,
+            dtd_validation=False,
+        )
+        tree = etree.parse(io.BytesIO(data), parser=parser)
+    except Exception:
+        return None
+    return _parse_tree(tree)
+
+
+def parallel_iter_tar_articles(
+    tar_path: str | Path,
+    workers: int = 8,
+    exts: Iterable[str] = _XML_EXTS,
+) -> Iterator[ArticleMeta]:
+    """Iterate over articles in a tar file, parsing XML in parallel.
+
+    This function reads tar members sequentially (tar format requires this),
+    but parses the XML content in parallel using a thread pool. Results are
+    yielded as they complete (unordered).
+
+    Parameters
+    ----------
+    tar_path : str | Path
+        Path to tar file (compressed or uncompressed).
+    workers : int
+        Number of parallel parsing threads (default: 8).
+    exts : Iterable[str]
+        File extensions to consider as XML (default: .nxml, .xml).
+
+    Yields
+    ------
+    ArticleMeta
+        Parsed article metadata for each successfully parsed XML file.
+
+    Notes
+    -----
+    - Uncompressed .tar files allow faster I/O since no decompression is needed.
+    - XML parsing (lxml) releases the GIL during C operations, so threading
+      provides real parallelism.
+    - Results are yielded in completion order, not tar file order.
+    """
+    lower_exts = tuple(e.lower() for e in exts)
+
+    with _open_tar_safely(tar_path) as tf:
+        if tf is None:
+            return
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {}  # future -> member_name (for debugging)
+            pending_count = 0
+            max_pending = workers * 4  # limit memory: ~4 XMLs per worker in flight
+
+            while True:
+                # Submit new work while under the limit
+                while pending_count < max_pending:
+                    try:
+                        m = tf.next()
+                    except (tarfile.TarError, OSError) as e:
+                        logger.warning("[tar] error iterating %s: %s", tar_path, e)
+                        m = None
+                    if m is None:
+                        break  # EOF or error
+                    if not (m.isfile() and m.name.lower().endswith(lower_exts)):
+                        continue
+                    try:
+                        f = tf.extractfile(m)
+                        if f is None:
+                            continue
+                        data = f.read()
+                        f.close()
+                    except (tarfile.TarError, OSError) as e:
+                        logger.warning("[tar] cannot extract %s: %s", m.name, e)
+                        continue
+
+                    fut = pool.submit(_parse_xml_bytes, data)
+                    futures[fut] = m.name
+                    pending_count += 1
+
+                if not futures:
+                    break  # no more work
+
+                # Yield completed results
+                done_futures = [f for f in futures if f.done()]
+                if not done_futures:
+                    # Wait for at least one to complete
+                    import concurrent.futures
+                    done, _ = concurrent.futures.wait(
+                        futures.keys(),
+                        return_when=concurrent.futures.FIRST_COMPLETED
+                    )
+                    done_futures = list(done)
+
+                for fut in done_futures:
+                    name = futures.pop(fut)
+                    pending_count -= 1
+                    try:
+                        result = fut.result()
+                        if result is not None:
+                            yield result
+                    except Exception as e:
+                        logger.warning("[parse] error parsing %s: %s", name, e)
+
+
 # Public API
 __all__ = [
     "ArticleMeta",
@@ -490,4 +606,5 @@ __all__ = [
     "iter_tar_xml_member_names",
     "count_tar_xml_members",
     "iter_tar_xml_streams",
+    "parallel_iter_tar_articles",
 ]

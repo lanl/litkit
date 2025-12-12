@@ -71,9 +71,12 @@ from litkit.formatting.answers import (
 )
 from litkit.frontload.cap import cap_chunks_per_paper
 from litkit.ingest.ingest import (
+    ArticleMeta,
     count_tar_xml_members,
     iter_tar_paths,
     iter_tar_xml_streams,
+    pack_paragraphs as ingest_pack_paragraphs,
+    parallel_iter_tar_articles,
     parse_xml_fileobj,
 )
 
@@ -4284,6 +4287,13 @@ def main():
         "--paper-embed-bs", type=int, default=16, help="Batch size for SPECTER2 (papers)."
     )
     ap.add_argument("--chunk-embed-bs", type=int, default=64, help="Batch size for SBERT (chunks).")
+    ap.add_argument(
+        "--parse-workers",
+        type=int,
+        default=8,
+        help="Number of parallel XML parsing workers (default: 8). "
+        "Higher values improve tar scanning throughput on multi-core systems.",
+    )
 
     # LLM options
     ap.add_argument(
