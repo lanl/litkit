@@ -181,6 +181,23 @@ ch-image build -f Dockerfile.lean -t litkit-lean .
 ch-convert litkit-lean sqfs/litkit-v0.3.33-aarch64-lean.sqfs
 ```
 
+### Updating the Dependency Lockfile
+
+If you modify `pyproject.toml` (add/remove dependencies), regenerate `uv.lock` before rebuilding:
+
+```bash
+# On HPC frontend (login node)
+cd /path/to/litkit
+
+# Ensure uv is installed
+python3.12 -m pip install --user uv
+
+# Regenerate lockfile
+~/.local/bin/uv lock --python 3.12
+```
+
+The `uv.lock` file ensures reproducible dependency resolution during container builds.
+
 ---
 
 ## Running Single-Node Builds
