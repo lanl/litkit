@@ -761,6 +761,107 @@ class _SegmentWriter:
             _maybe_fsync_dir(final)
 
 
+class ProducerCoordinator:
+    """Manages producer completion signaling for multi-node coordination."""
+    
+    def __init__(self, outdir: Path, shard_id: int, num_shards: int):
+        self.outdir = Path(outdir)
+        self.shard_id = int(shard_id)
+        self.num_shards = int(num_shards)
+        self.marker_file = self.outdir / f".shard_{self.shard_id:02d}_complete"
+    
+    def mark_complete(self):
+        """Signal that this producer shard has finished processing."""
+        self.outdir.mkdir(parents=True, exist_ok=True)
+        tmp = self.marker_file.with_suffix(".tmp")
+        
+        marker_data = {
+            "shard_id": self.shard_id,
+            "num_shards": self.num_shards,
+            "timestamp": time.time(),
+            "hostname": socket.gethostname(),
+            "pid": os.getpid()
+        }
+        
+        with open(tmp, "w") as f:
+            f.write(json.dumps(marker_data, indent=2))
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        
+        os.replace(tmp, self.marker_file)
+        _maybe_fsync_dir(self.marker_file)
+        _eprint(f"[producer] Shard {self.shard_id}/{self.num_shards} marked complete")
+
+
+class ConsumerCoordinator:
+    """Manages consumer polling for producer completion in multi-node scenarios."""
+    
+    def __init__(self, outdir: Path, num_shards: int):
+        self.outdir = Path(outdir)
+        self.num_shards = int(num_shards)
+    
+    def count_complete_shards(self) -> int:
+        """Return the number of producer shards that have completed."""
+        if not self.outdir.exists():
+            return 0
+        
+        complete = 0
+        for i in range(self.num_shards):
+            marker = self.outdir / f".shard_{i:02d}_complete"
+            if marker.exists():
+                complete += 1
+        return complete
+    
+    def all_producers_complete(self) -> bool:
+        """Check if all producer shards have completed."""
+        return self.count_complete_shards() == self.num_shards
+    
+    def wait_for_completion(
+        self, 
+        poll_interval: float = 10.0, 
+        timeout: float = 14400.0,
+        progress_callback=None
+    ) -> bool:
+        """Wait for all producers to signal completion.
+        
+        Args:
+            poll_interval: How often to check for completion (seconds)
+            timeout: Maximum time to wait (seconds), default 4 hours
+            progress_callback: Optional function called with (complete, total) each poll
+        
+        Returns:
+            True if all completed within timeout, False if timed out
+        """
+        start = time.time()
+        last_report = 0.0
+        report_interval = 60.0  # Report progress every minute
+        
+        while time.time() - start < timeout:
+            complete = self.count_complete_shards()
+            
+            if progress_callback:
+                progress_callback(complete, self.num_shards)
+            
+            # Periodic progress report
+            now = time.time()
+            if (now - last_report) >= report_interval:
+                _eprint(f"[consumer] Waiting for producers: {complete}/{self.num_shards} complete")
+                last_report = now
+            
+            if complete == self.num_shards:
+                _eprint(f"[consumer] All {self.num_shards} producers complete!")
+                return True
+            
+            time.sleep(poll_interval)
+        
+        complete = self.count_complete_shards()
+        _eprint(f"[consumer] TIMEOUT after {timeout}s: only {complete}/{self.num_shards} producers complete")
+        return False
+
+
 # --- lightweight progress line (stderr), dependency-free ---
 class _Progress:
     def __init__(
@@ -1334,7 +1435,7 @@ def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int =
                 continue
         try:
             with np.load(tmp, mmap_mode="r") as z:
-                if "kind" in z.files and str(z["kind"]).strip() != "papers":
+                if "kind" in z.files and str(z["kind"].item()).strip() != "papers":
                     raise ValueError("wrong segment kind for paper ingester")
                 if "ids" in z and ("vecs" in z or "emb" in z):
                     ids = np.ascontiguousarray(z["ids"].astype(np.int64))
@@ -1369,10 +1470,12 @@ def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int =
             if added:
                 if saved:
                     with FileLock(DB_LOCK):
-                        _mark_in_index(cur, "papers", [int(i) for i in ids_added]) if ids_added else None
+                        if len(ids_added) > 0:
+                            _mark_in_index(cur, "papers", [int(i) for i in ids_added])
                         conn.commit()
                 else:
-                    _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
+                    if len(ids_added) > 0:
+                        _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
 
             added_total += int(added or 0)
             batch_counter += 1
@@ -1413,7 +1516,7 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
     if not isinstance(chunk_index, faiss.IndexIDMap2):
         chunk_index = faiss.IndexIDMap2(chunk_index)
 
-    # Accept both our writer’s names and generic .npz containing {'ids','vecs'}.
+    # Accept both our writer's names and generic .npz containing {'ids','vecs'}.
     # Also consider files already in the ".ingesting" state.
     cand = sorted(
         list(outdir.glob("chunks_*.npz"))  # new style
@@ -1446,7 +1549,7 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
         try:
             with np.load(tmp, mmap_mode="r") as z:
                 # Reject wrong-kind files (old .seg has 'kind')
-                if "kind" in z.files and str(z["kind"]).strip() != "chunks":
+                if "kind" in z.files and str(z["kind"].item()).strip() != "chunks":
                     raise ValueError("wrong segment kind for chunk ingester")
                 if "ids" in z and "vecs" in z:
                     ids = np.ascontiguousarray(z["ids"].astype(np.int64))
@@ -1481,10 +1584,12 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
             if added:
                 if saved:
                     with FileLock(DB_LOCK):
-                        _mark_in_index(cur, "chunks", [int(i) for i in ids_added]) if ids_added else None
+                        if len(ids_added) > 0:
+                            _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
                         conn.commit()
                 else:
-                    _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
+                    if len(ids_added) > 0:
+                        _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
 
             added_total += int(added)
             batch_counter += 1
@@ -1937,6 +2042,7 @@ def build_or_update_indices(args):
     * --rebuild: wipe DB & indices, then rebuild from scratch (writer creates indices).
     * --update : append-only update (skip previously seen files).
     * --build-only: ingest/build but do not run a query.
+    * --consume-only: skip tar scanning and embedding, only ingest segments in a polling loop.
 
     Writer vs Non-writer
     --------------------
@@ -1947,13 +2053,83 @@ def build_or_update_indices(args):
     need = args.rebuild or not (
         DB_PATH.exists() and PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists()
     )
-    if not need and not args.update and not args.build_only:
+    if not need and not args.update and not args.build_only and not args.consume_only and not args.init_indices_only:
         # nothing to do
         return
 
     _eprint(f"[build] using DB at {DB_PATH}")
     conn = init_db(args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
     cur = conn.cursor()
+
+    if args.init_indices_only:
+        if not args.faiss_writer:
+            raise ValueError("--init-indices-only requires --faiss-writer")
+        _eprint("[bootstrap] Creating empty FAISS indices...")
+        
+        paper_dim = 768  # SPECTER2 dimension
+        chunk_dim = 768  # SBERT dimension
+        
+        # Create paper index (always HNSW for papers)
+        paper_index = _hnsw_index(
+            paper_dim,
+            M=args.hnsw_m,
+            ef_construction=args.efconstruction,
+            ef_search=args.efsearch,
+        )
+        paper_index = faiss.IndexIDMap2(paper_index)
+        _ensure_parent(PAPER_INDEX_PATH)
+        with FileLock(FAISS_LOCK):
+            _faiss_save_force(paper_index, PAPER_INDEX_PATH)
+        
+        # Create chunk index (FLAT or IVF-PQ based on args)
+        if args.chunks_index == "flat":
+            chunk_index = _flat_ip_index(chunk_dim)
+        else:  # ivfpq
+            m_safe = _safe_pq_m(chunk_dim, args.pq_m)
+            chunk_index = _ivfpq_index(chunk_dim, nlist=args.ivf_nlist, m=m_safe)
+        
+        chunk_index = faiss.IndexIDMap2(chunk_index)
+        _ensure_parent(CHUNK_INDEX_PATH)
+        with FileLock(FAISS_LOCK):
+            _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+        
+        _eprint("[bootstrap] Empty indices created. Exiting.")
+        return
+
+    if args.consume_only:
+        if not args.faiss_writer:
+            raise ValueError("--consume-only requires --faiss-writer")
+        _eprint("[consumer] Starting consume-only mode")
+        seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
+        paper_index = _faiss_load(PAPER_INDEX_PATH)
+        chunk_index = _faiss_load(CHUNK_INDEX_PATH)
+        
+        consumer_coordinator = ConsumerCoordinator(seg_dir, args.num_shards)
+        
+        def progress_callback(complete, total):
+            _eprint(f"[consumer] Progress: {complete}/{total} producers complete")
+        
+        while not consumer_coordinator.all_producers_complete():
+            p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
+            c_added = _ingest_chunk_segments(conn, chunk_index, seg_dir)
+            
+            if p_added or c_added:
+                _eprint(f"[consumer] Ingested {p_added} paper vectors and {c_added} chunk vectors")
+            else:
+                _eprint("[consumer] No new segments found, waiting for producers to complete...")
+            
+            # Wait for completion or timeout
+            if consumer_coordinator.wait_for_completion(poll_interval=30, timeout=600, progress_callback=progress_callback):
+                _eprint("[consumer] All producers have completed")
+                break
+        
+        # Final ingestion pass after all producers have completed
+        p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
+        c_added = _ingest_chunk_segments(conn, chunk_index, seg_dir)
+        _eprint(f"[consumer] Final ingestion: {p_added} paper vectors and {c_added} chunk vectors")
+        
+        _eprint("[consumer] Consume-only mode completed")
+        return  # End consume-only mode
 
     # Embedders
     paper_embedder, _paper_cfg = make_paper_embedder()
@@ -2335,13 +2511,71 @@ def build_or_update_indices(args):
                         _clear_chunk_trained_flag()
 
     def _shard_filter(paths, shard_id, num_shards):
-        """Deterministically assign files to a shard by hashing path (mod num_shards).
-        Streaming (no global sort/materialization here).
+        """Deterministically assign tar files to shards using size-aware bin-packing
+        to balance load across producers.
+        
+        Algorithm:
+        1. Stat each tar file from the manifest to get sizes
+        2. Sort by size (largest first) for better packing
+        3. Greedy bin-packing: assign each tar to the shard with smallest current load
+        4. Yield only the tars assigned to this shard
+        
+        Falls back to hash-based sharding if stat fails (errors out loudly per user request).
         """
-        for p in paths:
-            h = int(hashlib.md5(str(p).encode("utf-8")).hexdigest(), 16)
-            if h % num_shards == shard_id:
-                yield p
+        # Materialize the path list for sorting
+        paths_list = list(paths)
+        
+        if not paths_list:
+            return
+        
+        # Collect sizes for load balancing
+        paths_with_sizes = []
+        for p in paths_list:
+            try:
+                size = p.stat().st_size
+                paths_with_sizes.append((p, size))
+            except Exception as e:
+                # User requested: fail loudly if a manifest file is unreadable
+                raise RuntimeError(f"Cannot stat tar file {p}: {e}") from e
+        
+        if not paths_with_sizes:
+            return  # all files failed stat (already raised above)
+        
+        # Sort by size (largest first) for better bin-packing
+        paths_with_sizes.sort(key=lambda x: x[1], reverse=True)
+        
+        # Greedy bin-packing: assign each tar to the shard with smallest current load
+        shard_loads = [0] * num_shards
+        shard_assignments = [[] for _ in range(num_shards)]
+        
+        for tar_path, size in paths_with_sizes:
+            # Find shard with minimum load
+            min_shard = min(range(num_shards), key=lambda i: shard_loads[i])
+            shard_assignments[min_shard].append((tar_path, size))
+            shard_loads[min_shard] += size
+        
+        # Log shard assignments (shows load balance across all shards)
+        if not QUIET:
+            _eprint(f"\n[shard] Load-balanced tar distribution across {num_shards} shard(s):")
+            for i in range(num_shards):
+                count = len(shard_assignments[i])
+                load_gb = shard_loads[i] / (1024**3)
+                marker = " <-- THIS SHARD" if i == shard_id else ""
+                _eprint(f"[shard]   Shard {i}/{num_shards}: {count} tar files, {load_gb:.2f} GB{marker}")
+                
+                # Show first few files for this shard if it's the current one
+                if i == shard_id and shard_assignments[i]:
+                    _eprint(f"[shard]   Files assigned to shard {shard_id}:")
+                    for j, (tar_p, tar_sz) in enumerate(shard_assignments[i][:5]):
+                        sz_gb = tar_sz / (1024**3)
+                        _eprint(f"[shard]     - {tar_p.name} ({sz_gb:.2f} GB)")
+                    if len(shard_assignments[i]) > 5:
+                        remaining = len(shard_assignments[i]) - 5
+                        _eprint(f"[shard]     ... and {remaining} more file(s)")
+        
+        # Yield only the tars assigned to this shard
+        for tar_path, _ in shard_assignments[shard_id]:
+            yield tar_path
 
     use_tar = (getattr(args, "tar_dir", None) is not None) or (
         getattr(args, "tar_manifest", None) is not None
@@ -2820,7 +3054,14 @@ def build_or_update_indices(args):
     # Final commit + ensure on-disk indices are current *before* sanity
     conn.commit()
 
-    if args.faiss_writer:
+    # Write completion marker for producer
+    if args.embed_producer:
+        seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
+        producer_coordinator = ProducerCoordinator(seg_dir, args.shard_id, args.num_shards)
+        producer_coordinator.mark_complete()
+        _eprint(f"[producer] Shard {args.shard_id}/{args.num_shards} marked complete")
+
+    if args.faiss_writer and not args.consume_only:
         seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
 
         if args.consume_segments and seg_dir and Path(seg_dir).exists():
@@ -3919,6 +4160,12 @@ def main():
     ap.add_argument(
         "--build-only", action="store_true", help="Only (re)build indexes; do not run a query"
     )
+    ap.add_argument(
+        "--init-indices-only",
+        action="store_true",
+        help="Create empty FAISS indices and exit immediately (for multi-node bootstrap). "
+        "Requires --faiss-writer. Does not process any documents.",
+    )
     ap.add_argument("--update", action="store_true", help="Append-only update (skip seen files)")
     ap.add_argument(
         "--rebuild",
@@ -4007,6 +4254,12 @@ def main():
         help="Writer: also consume any pending segment files at the end of a build.",
     )
     ap.add_argument(
+        "--consume-only",
+        action="store_true",
+        help="Consumer-only mode: skip tar scanning and embedding, only ingest segments in a polling loop. "
+        "Requires --faiss-writer. Typically used on a dedicated consumer node in multi-node setups.",
+    )
+    ap.add_argument(
         "--embed-outdir",
         type=Path,
         default=None,
@@ -4091,7 +4344,7 @@ def main():
         or args.embed_producer
         or args.faiss_writer
         or (not _vector_store_exists())
-    )
+    ) and not args.init_indices_only  # Bootstrap doesn't need corpus
 
     # --- helper: determine if a directory contains .tar.gz files ---
     def _has_tars(p: Path) -> bool:

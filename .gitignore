@@ -11,9 +11,31 @@ sqfs/
 wheels/
 
 # HF models and runtime artifacts
-workspace/
-workspace/**/
+# Ignore workspace contents except manifest and test files
+workspace/*
 
-# SLURM logs
-/litkit-build.*.out
-/litkit-build.*.err
+# Track manifest files (tar.gz file lists)
+!workspace/*.manifest
+
+# Track test files (prompts and expected responses)
+!workspace/question.txt
+!workspace/answer.md
+
+# Track directory itself
+!workspace/.gitkeep
+
+# Explicitly ignore large directories
+workspace/emb_segments/
+workspace/indices/
+workspace/sqlite/
+workspace/hf_cache/
+workspace/pmcoa_links/
+workspace/.ch-mnt/
+
+# SLURM logs (all patterns)
+litkit-build.*.out
+litkit-build.*.err
+litkit_multi_*.out
+litkit_multi_*.err
+*.out
+*.err

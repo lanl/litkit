@@ -1,0 +1,8 @@
+# Large-scale multi-node test manifest
+# ~30 GB total data across 3 producers for sustained parallel GPU activity
+# Each producer will have ~10-12 GB of tar files to process
+
+# Selected baseline files (largest ones for continuous GPU work):
+/path/to/PMC-OA/oa_comm_xml.PMC007xxxxxx.baseline.2025-06-26.tar.gz
+/path/to/PMC-OA/oa_comm_xml.PMC008xxxxxx.baseline.2025-06-26.tar.gz
+/path/to/PMC-OA/oa_comm_xml.PMC009xxxxxx.baseline.2025-06-26.tar.gz
