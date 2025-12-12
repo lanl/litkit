@@ -2391,15 +2391,11 @@ def _ingest_article(
         if pid_row:
             pid = pid_row[0]
         else:
-            doc_id = _compute_doc_id(pmcid, pmid, meta["title"], meta["abstract"])
             cur.execute(
-                "INSERT OR IGNORE INTO papers(doc_id, pmid, pmcid, title, abstract) VALUES (?,?,?,?,?)",
-                (doc_id, pmid, pmcid, meta["title"], meta["abstract"]),
+                "INSERT INTO papers(pmid, pmcid, title, abstract) VALUES (?,?,?,?)",
+                (pmid, pmcid, meta["title"], meta["abstract"]),
             )
-            if cur.rowcount == 0:
-                pid = cur.execute("SELECT id FROM papers WHERE doc_id = ?", (doc_id,)).fetchone()[0]
-            else:
-                pid = cur.lastrowid
+            pid = cur.lastrowid
 
         seen_this_path = (
             cur.execute("SELECT 1 FROM files WHERE path=?", (file_path,)).fetchone()
@@ -3305,15 +3301,11 @@ def build_or_update_indices(args):
                         if pid_row:
                             pid = pid_row[0]
                         else:
-                            doc_id = _compute_doc_id(pmcid, pmid, meta["title"], meta["abstract"])
                             cur.execute(
-                                "INSERT OR IGNORE INTO papers(doc_id, pmid, pmcid, title, abstract) VALUES (?,?,?,?,?)",
-                                (doc_id, pmid, pmcid, meta["title"], meta["abstract"]),
+                                "INSERT INTO papers(pmid, pmcid, title, abstract) VALUES (?,?,?,?)",
+                                (pmid, pmcid, meta["title"], meta["abstract"]),
                             )
-                            if cur.rowcount == 0:
-                                pid = cur.execute("SELECT id FROM papers WHERE doc_id = ?", (doc_id,)).fetchone()[0]
-                            else:
-                                pid = cur.lastrowid
+                            pid = cur.lastrowid
 
                         seen_this_path = (
                             cur.execute("SELECT 1 FROM files WHERE path=?", (str(f),)).fetchone()
