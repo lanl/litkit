@@ -1,3 +1,5 @@
+> **TODO**: This document is outdated and should be updated after the next code review. Many of the bugs described here have been fixed in the `feature/multi-producer-sqlite` branch.
+
 # LitKit Multi-Node Producer-Consumer Analysis - Summary
 
 ## Overview
