@@ -499,7 +499,7 @@ def parallel_iter_tar_articles(
     tar_path: str | Path,
     workers: int = 8,
     exts: Iterable[str] = _XML_EXTS,
-) -> Iterator[ArticleMeta]:
+) -> Iterator[tuple[str, ArticleMeta]]:
     """Iterate over articles in a tar file, parsing XML in parallel.
 
     This function reads tar members sequentially (tar format requires this),
@@ -517,8 +517,8 @@ def parallel_iter_tar_articles(
 
     Yields
     ------
-    ArticleMeta
-        Parsed article metadata for each successfully parsed XML file.
+    tuple[str, ArticleMeta]
+        (member_name, parsed_metadata) for each successfully parsed XML file.
 
     Notes
     -----
@@ -584,7 +584,7 @@ def parallel_iter_tar_articles(
                     try:
                         result = fut.result()
                         if result is not None:
-                            yield result
+                            yield (name, result)
                     except Exception as e:
                         logger.warning("[parse] error parsing %s: %s", name, e)
 
