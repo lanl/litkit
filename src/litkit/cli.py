@@ -2391,11 +2391,15 @@ def _ingest_article(
         if pid_row:
             pid = pid_row[0]
         else:
+            doc_id = _compute_doc_id(pmcid, pmid, meta["title"], meta["abstract"])
             cur.execute(
-                "INSERT INTO papers(doc_id, pmid, pmcid, title, abstract) VALUES (?,?,?,?,?)",
-                (_compute_doc_id(pmcid, pmid, meta["title"], meta["abstract"]), pmid, pmcid, meta["title"], meta["abstract"]),
+                "INSERT OR IGNORE INTO papers(doc_id, pmid, pmcid, title, abstract) VALUES (?,?,?,?,?)",
+                (doc_id, pmid, pmcid, meta["title"], meta["abstract"]),
             )
-            pid = cur.lastrowid
+            if cur.rowcount == 0:
+                pid = cur.execute("SELECT id FROM papers WHERE doc_id = ?", (doc_id,)).fetchone()[0]
+            else:
+                pid = cur.lastrowid
 
         seen_this_path = (
             cur.execute("SELECT 1 FROM files WHERE path=?", (file_path,)).fetchone()
@@ -2690,7 +2694,9 @@ def build_or_update_indices(args):
                 _eprint("[consumer] No new segments found, waiting for producers to complete...")
             
             # Wait for completion or timeout
-            if consumer_coordinator.wait_for_completion(poll_interval=30, timeout=600, progress_callback=progress_callback):
+            # Timeout set to 6 hours (21600s) for large corpus processing
+            # Producers processing ~180GB of tar files can take 2-4 hours
+            if consumer_coordinator.wait_for_completion(poll_interval=30, timeout=21600, progress_callback=progress_callback):
                 _eprint("[consumer] All producers have completed")
                 break
         
@@ -3299,11 +3305,15 @@ def build_or_update_indices(args):
                         if pid_row:
                             pid = pid_row[0]
                         else:
+                            doc_id = _compute_doc_id(pmcid, pmid, meta["title"], meta["abstract"])
                             cur.execute(
-                                "INSERT INTO papers(doc_id, pmid, pmcid, title, abstract) VALUES (?,?,?,?,?)",
-                                (_compute_doc_id(pmcid, pmid, meta["title"], meta["abstract"]), pmid, pmcid, meta["title"], meta["abstract"]),
+                                "INSERT OR IGNORE INTO papers(doc_id, pmid, pmcid, title, abstract) VALUES (?,?,?,?,?)",
+                                (doc_id, pmid, pmcid, meta["title"], meta["abstract"]),
                             )
-                            pid = cur.lastrowid
+                            if cur.rowcount == 0:
+                                pid = cur.execute("SELECT id FROM papers WHERE doc_id = ?", (doc_id,)).fetchone()[0]
+                            else:
+                                pid = cur.lastrowid
 
                         seen_this_path = (
                             cur.execute("SELECT 1 FROM files WHERE path=?", (str(f),)).fetchone()
