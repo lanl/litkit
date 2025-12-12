@@ -193,6 +193,118 @@ git checkout feature/parallel-tar-ingestion
 
 ---
 
+---
+
+## Why Was This Bottleneck Not Noticed Earlier?
+
+### 1. The Design Was Reasonable for Small-Scale Testing
+
+The original code was developed on:
+- Local SSDs (fast I/O)
+- Small tar files (few thousand papers)
+- Focus on correctness, not throughput
+
+At 50 papers/sec (reasonable for SSD + lxml), a 10,000-paper tar file takes ~3 minutes. Nobody notices.
+
+### 2. The Corpus Scale Changed, The Architecture Didn't
+
+PMC-OA baseline files have **550,000+ papers** per tar. That's 50-100x larger than typical test files. The sequential tar.gz reader that was "good enough" for development became the bottleneck at scale.
+
+### 3. HPC Lustre Is Slow for Sequential Reads
+
+Lustre is optimized for **large parallel I/O**, not sequential streaming of compressed archives. The 2-5 papers/sec observed is probably:
+- 50% gzip decompression (CPU-bound)
+- 50% lxml parsing (CPU-bound)
+- I/O itself might be fine, but we're CPU-bound on a single core
+
+### 4. Focus Was on GPU, Not Pre-GPU Pipeline
+
+Effort was spent on:
+- Multi-GPU embedding pool ✓
+- Multi-node producer/consumer ✓
+- FAISS index building ✓
+
+But the **data preparation pipeline** (tar→XML→chunks) was treated as "simple" and left single-threaded.
+
+### 5. Lesson Learned
+
+When scaling to HPC:
+1. Profile the **entire pipeline**, not just the GPU
+2. Parallel filesystems (Lustre/GPFS) have different characteristics than local SSDs
+3. CPU-bound preprocessing (parsing, decompression) can dominate wall-clock time
+
+---
+
+## Other Potential Bottlenecks (After Tar Fix)
+
+### 1. SQLite Writes (Producers) - Risk: Medium
+
+Currently inserting papers/chunks row-by-row. At 30-60 papers/sec, that's ~500-1000 INSERT/sec. SQLite on Lustre might struggle.
+
+**Mitigation**: Batch INSERTs with `executemany` (e.g., 1000 rows per call).
+
+### 2. Consumer Segment Ingestion - Risk: Medium-High
+
+Consumer currently does:
+```
+for each segment:
+    FAISS add_with_ids()
+    SQLite UPDATE in_index=1
+    faiss.write_index() [sometimes]
+```
+
+At high segment throughput, this could become the bottleneck.
+
+**Mitigation**: Batch multiple segments before writing indices.
+
+### 3. FAISS Index Scaling - Risk: Low
+
+Using `--chunks-index flat` for simplicity. FLAT has O(n) search but **O(1) add**. Building scales linearly.
+
+---
+
+## Database Lock Errors (Observed 2025-12-11)
+
+During large-scale testing, we observed transient SQLite lock errors:
+```
+[segments] ERROR ingesting chunks_sh00_1765493063_000001.npz: OperationalError: database is locked
+```
+
+**These are benign:**
+- Only 2 errors over 2 hours of operation
+- Segment files remain on disk and are retried on next consumer poll
+- Expected behavior on Lustre with concurrent access
+- The 300-second busy_timeout handles most contention
+
+---
+
+## Test Run Results (2025-12-11, Job 16802995)
+
+### Configuration
+- 3 nodes: 2 producers (gpu-node1, gpu-node3), 1 consumer (gpu-node4)
+- Manifest: 3 tar files (~30 GB total)
+- Runtime: ~2 hours observed, job still running
+
+### Observations
+
+**Multi-node parallelism confirmed:**
+```
+[scan] oa_comm_xml.PMC008xxxxxx: 3001/550499  (0.5%)  2.3/s  ← Producer 1 (gpu-node1)
+[scan] oa_comm_xml.PMC009xxxxxx: 5221/604299  (0.9%)  4.5/s  ← Producer 0 (gpu-node3)
+```
+
+**GPU bursts working correctly:**
+```
+[progress] Embedding chunks (producer, 20022): completed in 89s — 222.8/s
+```
+
+**Bottleneck confirmed:**
+- Scan rate: 2-5 papers/sec (single-threaded)
+- GPU burst: ~90 seconds
+- Inter-burst gap: ~7-10 minutes (waiting for 20k chunks to accumulate)
+
+---
+
 ## References
 
 - HPC V100 nodes: 32 CPUs, 2 GPUs each
