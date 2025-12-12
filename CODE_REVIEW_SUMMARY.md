@@ -145,16 +145,13 @@ Question → SPECTER2 (Stage 1) → SBERT (Stage 2) → LLM → Answer
 3. Remaps chunk/file `paper_id` references to main DB IDs
 4. Deletes shard DBs after successful merge
 
-## Document ID Scheme
+## Deduplication
 
-Papers are deduplicated across shards using a stable `doc_id`:
+Papers are deduplicated across shards using SQLite unique indexes:
+- `papers_pmcid_uq` — unique on `pmcid` (preferred)
+- `papers_pmid_uq` — unique on `pmid` (fallback)
 
-| Priority | Format | Example |
-|----------|--------|---------|
-| 1 | `pmc:{pmcid}` | `pmc:PMC1234567` |
-| 2 | `pmid:{pmid}` | `pmid:12345678` |
-| 3 | `hash:{sha256[:16]}` | `hash:a1b2c3d4e5f6g7h8` |
-| 4 | `uuid:{random}` | `uuid:f47ac10b58cc4372` |
+When merging shard databases, the consumer uses these indexes to prevent duplicates. If a paper has neither pmcid nor pmid, no cross-shard deduplication occurs (rare edge case).
 
 ## FAISS Index Types
 

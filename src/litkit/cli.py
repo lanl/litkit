@@ -828,41 +828,6 @@ def _ensure_in_index_columns(conn):
     conn.commit()
 
 
-def _compute_doc_id(pmcid: str | None, pmid: str | None, title: str | None = None, abstract: str | None = None) -> str:
-    """Compute a stable document identifier for multi-producer deduplication.
-    
-    Priority:
-    1. pmcid (preferred - globally unique PubMed Central ID)
-    2. pmid (fallback - unique within PubMed)
-    3. hash of title+abstract (last resort for documents without standard IDs)
-    
-    Returns:
-        A string doc_id in format "pmc:<id>", "pmid:<id>", or "hash:<sha256[:16]>"
-    """
-    pmcid = (pmcid or "").strip()
-    pmid = (pmid or "").strip()
-    
-    if pmcid:
-        return f"pmc:{pmcid}"
-    if pmid:
-        return f"pmid:{pmid}"
-    
-    # Fall back to content hash
-    title = (title or "").strip()
-    abstract = (abstract or "").strip()
-    content = f"{title}\n{abstract}".strip()
-    
-    if not content:
-        # Extremely rare: no pmcid, pmid, title, or abstract
-        # Use a random UUID to avoid collisions
-        import uuid
-        return f"uuid:{uuid.uuid4().hex[:16]}"
-    
-    # Use SHA256 truncated to 16 chars for reasonable uniqueness + compactness
-    content_hash = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
-    return f"hash:{content_hash}"
-
-
 def pack_paragraphs(
     paras, max_chars=CHUNK_TARGET_CHARS, min_chars=BODY_MIN_CHARS, overlap_chars=CHUNK_OVERLAP_CHARS
 ):
