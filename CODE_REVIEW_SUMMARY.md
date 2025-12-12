@@ -13,15 +13,15 @@ LitKit is a two-stage RAG (Retrieval-Augmented Generation) pipeline designed for
 │                         MULTI-NODE ARCHITECTURE                         │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐               │
-│   │  Producer 0  │   │  Producer 1  │   │  Producer 2  │  (N-1 nodes)  │
-│   │  (GPU Node)  │   │  (GPU Node)  │   │  (GPU Node)  │               │
-│   │              │   │              │   │              │               │
-│   │ • Parse XML  │   │ • Parse XML  │   │ • Parse XML  │               │
-│   │ • Embed docs │   │ • Embed docs │   │ • Embed docs │               │
-│   │ • Write .npz │   │ • Write .npz │   │ • Write .npz │               │
-│   │ • Shard DB   │   │ • Shard DB   │   │ • Shard DB   │               │
-│   └──────┬───────┘   └──────┬───────┘   └──────┬───────┘               │
+│   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐                │
+│   │  Producer 0  │   │  Producer 1  │   │  Producer 2  │  (N-1 nodes)   │
+│   │  (GPU Node)  │   │  (GPU Node)  │   │  (GPU Node)  │                │
+│   │              │   │              │   │              │                │
+│   │ • Parse XML  │   │ • Parse XML  │   │ • Parse XML  │                │
+│   │ • Embed docs │   │ • Embed docs │   │ • Embed docs │                │
+│   │ • Write .npz │   │ • Write .npz │   │ • Write .npz │                │
+│   │ • Shard DB   │   │ • Shard DB   │   │ • Shard DB   │                │
+│   └──────┬───────┘   └──────┬───────┘   └──────┬───────┘                │
 │          │                  │                  │                        │
 │          └──────────────────┼──────────────────┘                        │
 │                             │                                           │
