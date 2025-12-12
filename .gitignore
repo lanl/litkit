@@ -39,3 +39,6 @@ litkit_multi_*.out
 litkit_multi_*.err
 *.out
 *.err
+
+# Generated documentation
+*.pdf

@@ -93,6 +93,25 @@ litkit --help
 litkit --version
 ```
 
+## Generating PDF Documentation
+
+To create a combined PDF of all documentation:
+
+```bash
+# Install prerequisites (macOS)
+brew install pandoc
+brew install --cask basictex
+sudo tlmgr update --self
+sudo tlmgr install xetex collection-fontsrecommended
+
+# Generate combined PDF
+pandoc README.md LITKIT_MAC_GUIDE.md LITKIT_CLUSTER_GUIDE.md \
+  --pdf-engine=xelatex \
+  --toc --number-sections \
+  -V geometry:margin=1in \
+  -o litkit_documentation.pdf
+```
+
 ## License
 
 Proprietary — LANL
