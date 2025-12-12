@@ -42,6 +42,7 @@ import time
 import unicodedata
 from pathlib import Path
 from contextlib import contextmanager, nullcontext
+from typing import Iterator
 
 
 # Third-party import used early in XML parsing utilities.
@@ -2085,6 +2086,286 @@ def register_file(cur, fpath: str, paper_id: int, st):
         "INSERT OR REPLACE INTO files(path, size, mtime, paper_id) VALUES (?,?,?,?)",
         (fpath, st.st_size, st.st_mtime, paper_id),
     )
+
+
+# -------------------- Ingest helper for parallel/sequential paths --------------------
+
+class _IngestContext:
+    """Holds shared state for article ingestion across parallel and sequential paths."""
+    
+    def __init__(
+        self,
+        conn,
+        cur,
+        args,
+        paper_embedder,
+        chunk_embedder,
+        paper_index,
+        chunk_index,
+    ):
+        self.conn = conn
+        self.cur = cur
+        self.args = args
+        self.paper_embedder = paper_embedder
+        self.chunk_embedder = chunk_embedder
+        self.paper_index = paper_index
+        self.chunk_index = chunk_index
+        
+        # Buffers for batching
+        self.paper_ids_buf: list[int] = []
+        self.paper_texts_buf: list[str] = []
+        self.chunk_ids_buf: list[int] = []
+        self.chunk_texts_buf: list[str] = []
+        
+        # Counters
+        self.papers_added_total = 0
+        self.chunks_added_total = 0
+
+
+def _ingest_article(
+    ctx: _IngestContext,
+    meta: ArticleMeta,
+    file_path: str,
+    st: SimpleNamespace,
+) -> bool:
+    """Ingest a single parsed article into the database and embedding buffers.
+    
+    Args:
+        ctx: Shared ingest context with DB connection, embedders, indices, and buffers
+        meta: Parsed article metadata from parse_xml_fileobj()
+        file_path: Canonical path string (e.g., "tar://foo.tar!/member.nxml")
+        st: SimpleNamespace with .st_size and .st_mtime attributes
+    
+    Returns:
+        True if successfully ingested, False on error
+    """
+    cur = ctx.cur
+    conn = ctx.conn
+    args = ctx.args
+    
+    try:
+        pmcid = (meta["pmcid"] or "").strip()
+        pmid = (meta["pmid"] or "").strip()
+
+        pid_row = None
+        if pmcid:
+            pid_row = cur.execute(
+                "SELECT id FROM papers WHERE pmcid=?", (pmcid,)
+            ).fetchone()
+        if (pid_row is None) and pmid:
+            pid_row = cur.execute(
+                "SELECT id FROM papers WHERE pmid=?", (pmid,)
+            ).fetchone()
+        if pid_row:
+            pid = pid_row[0]
+        else:
+            cur.execute(
+                "INSERT INTO papers(pmid, pmcid, title, abstract) VALUES (?,?,?,?)",
+                (pmid, pmcid, meta["title"], meta["abstract"]),
+            )
+            pid = cur.lastrowid
+
+        seen_this_path = (
+            cur.execute("SELECT 1 FROM files WHERE path=?", (file_path,)).fetchone()
+            is not None
+        )
+        if seen_this_path:
+            if args.faiss_writer:
+                with FileLock(FAISS_LOCK):
+                    if not isinstance(ctx.paper_index, faiss.IndexIDMap2):
+                        ctx.paper_index = faiss.IndexIDMap2(ctx.paper_index)
+                    selp = _make_id_selector([pid])
+                    _safe_remove_ids(ctx.paper_index, selp)
+                    _faiss_save_force(ctx.paper_index, PAPER_INDEX_PATH)
+
+                old_ids = [
+                    row[0]
+                    for row in cur.execute(
+                        "SELECT id FROM chunks WHERE paper_id=?", (pid,)
+                    )
+                ]
+                if old_ids:
+                    with FileLock(FAISS_LOCK):
+                        if not isinstance(ctx.chunk_index, faiss.IndexIDMap2):
+                            ctx.chunk_index = faiss.IndexIDMap2(ctx.chunk_index)
+                        selc = _make_id_selector(old_ids)
+                        _safe_remove_ids(ctx.chunk_index, selc)
+                        _faiss_save_force(ctx.chunk_index, CHUNK_INDEX_PATH)
+            with FileLock(DB_LOCK):
+                cur.execute("DELETE FROM chunks WHERE paper_id=?", (pid,))
+                cur.execute("UPDATE papers SET in_index=0 WHERE id=?", (pid,))
+
+        register_file(cur, file_path, pid, st)
+
+        ta = (meta["title"] or "").strip()
+        ab = (meta["abstract"] or "").strip()
+        ta_ab = (ta + " " + ab).strip() or (
+            meta["paragraphs"][0][:800] if meta["paragraphs"] else "untitled"
+        )
+        ctx.paper_ids_buf.append(pid)
+        ctx.paper_texts_buf.append(ta_ab)
+
+        proposed_chunks = []
+        if ta_ab:
+            proposed_chunks.append((-1, ta_ab))
+
+        paras = meta["paragraphs"] or ([ab] if ab else [])
+        chunks = (
+            pack_paragraphs(
+                paras,
+                max_chars=int(
+                    getattr(args, "chunk_target_chars", CHUNK_TARGET_CHARS)
+                ),
+                min_chars=int(getattr(args, "chunk_min_chars", BODY_MIN_CHARS)),
+                overlap_chars=int(
+                    getattr(args, "chunk_overlap", CHUNK_OVERLAP_CHARS)
+                ),
+            )
+            if paras
+            else []
+        )
+        for ord_i, ch in enumerate(chunks):
+            proposed_chunks.append((ord_i, ch))
+
+        for ord_i, text_i in proposed_chunks:
+            cur.execute(
+                "INSERT INTO chunks(paper_id, ord, text) VALUES (?,?,?)",
+                (pid, ord_i, text_i),
+            )
+            cid = cur.lastrowid
+            ctx.chunk_ids_buf.append(cid)
+            ctx.chunk_texts_buf.append(text_i)
+
+        # Flush paper batch if needed
+        if len(ctx.paper_ids_buf) >= PAPER_BATCH:
+            _flush_paper_batch(ctx)
+
+        # Flush chunk batch if needed
+        if len(ctx.chunk_ids_buf) >= CHUNK_BATCH:
+            _flush_chunk_batch(ctx)
+
+        return True
+
+    except Exception as e:
+        _eprint(f"[ingest] ERROR {file_path}: {e.__class__.__name__}: {e}")
+        try:
+            with FileLock(DB_LOCK):
+                conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def _flush_paper_batch(ctx: _IngestContext) -> None:
+    """Embed and persist the current paper buffer."""
+    if not ctx.paper_ids_buf:
+        return
+    
+    u_ids, u_texts = _dedupe_ids_and_texts(ctx.paper_ids_buf, ctx.paper_texts_buf)
+
+    if paper_seg_writer is not None:
+        Xp = ctx.paper_embedder.encode(
+            u_texts,
+            progress_label=f"Embedding papers (producer, {len(u_texts)})",
+            batch_size=ctx.args.paper_embed_bs,
+            progress_done_summary=False,
+        )
+        paper_seg_writer.write(
+            ids=np.asarray(u_ids, dtype=np.int64), vecs=Xp
+        )
+        ctx.conn.commit()
+        ctx.papers_added_total += len(u_ids)
+
+    elif ctx.args.faiss_writer:
+        Xp = ctx.paper_embedder.encode(
+            u_texts,
+            progress_label=f"Embedding papers (batch of {len(u_texts)})",
+            batch_size=ctx.args.paper_embed_bs,
+            progress_done_summary=False,
+        )
+        prior_ntotal = int(getattr(ctx.paper_index, "ntotal", 0) or 0)
+        sel = _make_id_selector(u_ids)
+        with FileLock(FAISS_LOCK):
+            _safe_remove_ids(ctx.paper_index, sel)
+            added, ids_added = _add_with_ids_dedup(ctx.paper_index, u_ids, Xp)
+            saved = False
+            if added:
+                if prior_ntotal == 0:
+                    saved = _faiss_save_force(ctx.paper_index, PAPER_INDEX_PATH)
+                else:
+                    saved = _faiss_save(ctx.paper_index, PAPER_INDEX_PATH)
+        if added:
+            if saved:
+                with FileLock(DB_LOCK):
+                    _mark_in_index(ctx.cur, "papers", [int(i) for i in ids_added])
+                    _flush_pending_marks(ctx.cur)
+                    ctx.conn.commit()
+            else:
+                _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
+        ctx.papers_added_total += int(added)
+
+    else:
+        ctx.conn.commit()
+        ctx.papers_added_total += len(u_ids)
+
+    ctx.paper_ids_buf.clear()
+    ctx.paper_texts_buf.clear()
+
+
+def _flush_chunk_batch(ctx: _IngestContext) -> None:
+    """Embed and persist the current chunk buffer."""
+    if not ctx.chunk_ids_buf:
+        return
+    
+    u_ids, u_texts = _dedupe_ids_and_texts(ctx.chunk_ids_buf, ctx.chunk_texts_buf)
+
+    if chunk_seg_writer is not None:
+        Xc = ctx.chunk_embedder.encode(
+            u_texts,
+            progress_label=f"Embedding chunks (producer, {len(u_texts)})",
+            batch_size=ctx.args.chunk_embed_bs,
+            progress_done_summary=False,
+        )
+        chunk_seg_writer.write(
+            ids=np.asarray(u_ids, dtype=np.int64), vecs=Xc
+        )
+        ctx.conn.commit()
+        ctx.chunks_added_total += len(u_ids)
+
+    elif ctx.args.faiss_writer:
+        Xc = ctx.chunk_embedder.encode(
+            u_texts,
+            progress_label=f"Embedding chunks (batch of {len(u_texts)})",
+            batch_size=ctx.args.chunk_embed_bs,
+            progress_done_summary=False,
+        )
+        prior_ntotal = int(getattr(ctx.chunk_index, "ntotal", 0) or 0)
+        sel = _make_id_selector(u_ids)
+        with FileLock(FAISS_LOCK):
+            _safe_remove_ids(ctx.chunk_index, sel)
+            added, ids_added = _add_with_ids_dedup(ctx.chunk_index, u_ids, Xc)
+            saved = False
+            if added:
+                if prior_ntotal == 0:
+                    saved = _faiss_save_force(ctx.chunk_index, CHUNK_INDEX_PATH)
+                else:
+                    saved = _faiss_save(ctx.chunk_index, CHUNK_INDEX_PATH)
+        if added:
+            if saved:
+                with FileLock(DB_LOCK):
+                    _mark_in_index(ctx.cur, "chunks", [int(i) for i in ids_added])
+                    _flush_pending_marks(ctx.cur)
+                    ctx.conn.commit()
+            else:
+                _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
+        ctx.chunks_added_total += int(added)
+
+    else:
+        ctx.conn.commit()
+        ctx.chunks_added_total += len(u_ids)
+
+    ctx.chunk_ids_buf.clear()
+    ctx.chunk_texts_buf.clear()
 
 
 def build_or_update_indices(args):

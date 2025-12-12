@@ -12,8 +12,9 @@ A step-by-step guide for running LitKit on an HPC cluster using Charliecloud con
 6. [Running Multi-Node Builds](#running-multi-node-builds)
 7. [Querying Your Literature](#querying-your-literature)
 8. [Monitoring GPU Usage](#monitoring-gpu-usage)
-9. [Troubleshooting](#troubleshooting)
-10. [Command Reference](#command-reference)
+9. [Performance Tuning](#performance-tuning)
+10. [Troubleshooting](#troubleshooting)
+11. [Command Reference](#command-reference)
 
 ---
 
@@ -366,6 +367,45 @@ done"
 
 ---
 
+## Performance Tuning
+
+### Parallel XML Parsing
+
+For **uncompressed tar files** (`.tar` but not `.tar.gz`), LitKit can parse XML files in parallel using multiple CPU cores. This significantly improves ingestion throughput on multi-core systems.
+
+```bash
+# Use 16 parallel XML parsing workers (for uncompressed .tar files)
+litkit --faiss-writer --build-only --rebuild --yes \
+       --parse-workers 16 \
+       --tar-manifest /workspace/pmcoa_uncompressed.manifest
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--parse-workers` | 8 | Number of parallel XML parsing workers |
+
+**Notes:**
+- Parallel parsing **only works with uncompressed `.tar` files**
+- Compressed `.tar.gz` files always use sequential parsing (decompression is inherently serial)
+- Higher values help on nodes with many CPU cores (e.g., GH200's 72 ARM cores)
+- On V100 nodes (32 CPUs), `--parse-workers 8` is usually sufficient
+
+### Converting .tar.gz to .tar for Faster Ingestion
+
+To benefit from parallel parsing, you can decompress your tar archives:
+
+```bash
+# Decompress a single archive
+gunzip -k /path/to/PMC-OA/oa_comm_xml.PMC007xxxxxx.baseline.2025-06-26.tar.gz
+
+# Or create an uncompressed copy
+zcat file.tar.gz > file.tar
+```
+
+**Trade-off**: Uncompressed files are ~3-5x larger but can be parsed in parallel.
+
+---
+
 ## Troubleshooting
 
 ### "pam_slurm_adopt" error when SSH to node
@@ -406,9 +446,11 @@ export LITKIT_SQLITE_BUSY_TIMEOUT_MS=300000  # 5 minutes
 
 ### Low GPU utilization (bursty pattern)
 
-This is **expected behavior** with the current tar.gz scanning code. The scan rate is 2-5 papers/sec (single-threaded), creating long gaps between GPU embedding bursts.
+This pattern occurs when using compressed `.tar.gz` files, which require single-threaded decompression.
 
-**See:** `PARALLEL_TAR_INGESTION.md` for the planned fix.
+**Solutions:**
+1. **Decompress archives** to `.tar` format and use `--parse-workers 16` (see [Performance Tuning](#performance-tuning))
+2. **Use multiple producer nodes** to parallelize across tar files (see [Running Multi-Node Builds](#running-multi-node-builds))
 
 ### Container not found
 
