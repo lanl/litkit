@@ -238,6 +238,174 @@ This checks:
 2. FAISS indices exist with non-trivial size
 3. SQLite `in_index` flags match FAISS `ntotal`
 
+## Scaling to Full PMC-OA Corpus
+
+The full PMC-OA corpus contains ~4 million papers. This section provides guidance on processing it efficiently.
+
+### Corpus Statistics
+
+| Metric | Estimate |
+|--------|----------|
+| Papers | ~4,000,000 |
+| Chunks (@ ~10/paper) | ~40,000,000 |
+| Paper embeddings | ~4M × 768 × 4 bytes ≈ **12 GB** |
+| Chunk embeddings | ~40M × 768 × 4 bytes ≈ **120 GB** |
+| SQLite database | ~5-10 GB |
+| Total storage | ~150-200 GB |
+
+### Hardware Requirements
+
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| **Consumer RAM** | 32 GB | 64+ GB |
+| **Consumer storage** | 250 GB (Lustre) | 500 GB SSD/NVMe |
+| **Producer GPUs** | V100 (32GB) × 2 | A100 × 2-4 |
+| **Network** | Shared filesystem | Lustre/GPFS preferred |
+
+### Configuration Tuning for 4M Papers
+
+```bash
+# Increase IVF nlist for better recall at 40M chunks
+--ivf-nlist 65536        # Default is 16384; increase for large corpora
+
+# More nprobe for higher recall (at cost of latency)
+--nprobe 128             # Default is sqrt(nlist) ≈ 256
+
+# Longer SQLite busy timeout for shared filesystem
+export LITKIT_SQLITE_BUSY_TIMEOUT_MS=300000   # 5 minutes
+
+# Larger segment files reduce filesystem overhead
+export LITKIT_EMBED_SEGMENT_SIZE=262144       # 256K vectors/file
+
+# Less frequent FAISS saves (reduces I/O)
+export LITKIT_SAVE_EVERY_SEC=600              # Save every 10 min
+```
+
+### Node Configurations
+
+#### HPC (2-4 nodes)
+
+With limited nodes, maximize GPU utilization:
+
+```bash
+# 4-node setup: 3 producers + 1 consumer
+#SBATCH --nodes=4
+#SBATCH --gres=gpu:2              # 2 GPUs per node
+--embed-workers 2                  # Match GPU count
+--parse-workers 16                 # Parallel XML parsing
+```
+
+**Estimated build time:** 8-12 hours
+
+#### Large Cluster (8+ nodes)
+
+With more nodes, producer parallelism dominates:
+
+```bash
+# 16-node setup: 15 producers + 1 consumer
+#SBATCH --nodes=16
+#SBATCH --gres=gpu:4              # 4 GPUs per node (if available)
+--embed-workers 4                  # Match GPU count
+--parse-workers 32                 # More parallel parsing
+```
+
+**Estimated build time:** 2-4 hours
+
+#### Very Large Cluster (32+ nodes)
+
+At this scale, consumer ingestion becomes the bottleneck:
+
+```bash
+# 32-node setup: 31 producers + 1 consumer
+# Consumer takes ~4 hours regardless of producer count
+```
+
+**Estimated build time:** ~4 hours (consumer-limited)
+
+### Estimated Build Times
+
+| Nodes | Producers | Estimated Time | Notes |
+|-------|-----------|----------------|-------|
+| 2 | 1 | 20-30 hours | Single producer, very slow |
+| 4 | 3 | 8-12 hours | Good for HPC |
+| 8 | 7 | 4-6 hours | Sweet spot |
+| 16 | 15 | 3-4 hours | Consumer starts to bottleneck |
+| 32+ | 31+ | ~4 hours | Consumer-limited |
+
+### Consumer Bottleneck Analysis
+
+The consumer must:
+1. Ingest all `.npz` segments (~500-1000 files)
+2. Merge all shard databases (~N files)
+3. Run backfill for any gaps
+4. Build/update HNSW index for 4M papers
+
+**Time breakdown (estimated for 4M papers):**
+- Segment ingestion: ~2 hours
+- DB merge: ~30 minutes
+- Backfill: ~1 hour
+- HNSW updates: ~30 minutes
+
+**Total consumer time:** ~4 hours (regardless of producer count)
+
+### Strategies to Reduce Consumer Time
+
+1. **Use FLAT for chunks during initial build, then train IVF-PQ:**
+   ```bash
+   # First pass: FLAT (faster, no training)
+   --chunks-index flat
+   
+   # Later: rebuild with trained IVF-PQ for query performance
+   --chunks-index ivfpq --rebuild
+   ```
+
+2. **Skip IVF-PQ training if corpus is < 50M chunks:**
+   - FLAT index is acceptable for 40M chunks
+   - Search is O(N) but still fast on modern hardware
+   - Use for initial deployment, optimize later
+
+3. **Future: Sharded FAISS (not yet implemented)**
+   - Multiple consumers, each owning a shard
+   - Would reduce ingestion to ~1 hour
+   - Requires query-time shard federation
+
+### Quick Reference: Full Corpus Build
+
+```bash
+# Producer nodes (run on N-1 nodes)
+litkit \
+    --embed-producer \
+    --build-only \
+    --shard-id $SLURM_NODEID \
+    --num-shards $((SLURM_NNODES - 1)) \
+    --ivf-nlist 65536 \
+    --embed-devices "cuda:0,cuda:1" \
+    --embed-workers 2 \
+    --parse-workers 16 \
+    --tar-manifest /path/to/full_corpus.manifest
+
+# Consumer node (run on 1 dedicated node)
+litkit \
+    --faiss-writer \
+    --consume-only \
+    --num-shards $((SLURM_NNODES - 1)) \
+    --ivf-nlist 65536
+```
+
+### Post-Build Validation
+
+```bash
+# Verify the build
+./validate_build.sh /path/to/workspace
+
+# Expected output for full corpus:
+#   Papers: 4000000 / 4000000 indexed
+#   Chunks: 40000000 / 40000000 indexed
+#   ✅ BUILD VALIDATION PASSED
+```
+
+---
+
 ## Future Work
 
 1. **Dead-letter queue** for permanently failing segments
@@ -250,4 +418,4 @@ This checks:
 
 **Codebase:** `src/litkit/`  
 **Branch:** `feature/multi-producer-sqlite`  
-**Status:** Production-ready for multi-node builds
+**Status:** Production-ready for full PMC-OA corpus (~4M papers)
