@@ -52,8 +52,9 @@ export LITKIT_REPO="/path/to/litkit"
 export LITKIT_WORKSPACE="${LITKIT_REPO}/workspace"
 
 # Manifest file: List of uncompressed tar files to process
-# Using /path/to/PMC-OA for uncompressed tar files (faster random access)
-export LITKIT_TAR_MANIFEST="${LITKIT_WORKSPACE}/vast_uncompressed.manifest"
+# Default: medium_test.manifest (~7 GB, 30-45 min)
+# Override: MANIFEST=large_test.manifest sbatch ... (185 GB, 3-5 hours)
+export LITKIT_TAR_MANIFEST="${LITKIT_WORKSPACE}/${MANIFEST:-medium_test.manifest}"
 
 # Container and CUDA setup for V100 nodes
 export IMG="${LITKIT_REPO}/sqfs/litkit-v0.3.34-aarch64-lean.sqfs"
@@ -121,7 +122,7 @@ run_producer() {
             --embed-devices "cuda:0,cuda:1" \
             --embed-workers 2 \
             --parse-workers $PARSE_WORKERS \
-            --tar-manifest "/workspace/vast_uncompressed.manifest"
+            --tar-manifest "/workspace/${MANIFEST:-medium_test.manifest}"
     
     echo "[Producer $node_id] Completed"
 }
@@ -205,7 +206,7 @@ srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
         --faiss-writer \
         --consume-only \
         --embed-outdir "/workspace/emb_segments" \
-        --tar-manifest "/workspace/vast_uncompressed.manifest" \
+        --tar-manifest "/workspace/${MANIFEST:-medium_test.manifest}" \
         --papers-index hnsw \
         --chunks-index flat \
         --num-shards $((SLURM_NNODES - 1))
