@@ -2030,6 +2030,55 @@ def already_processed(cur, fpath: str, st) -> bool:
     return size == st.st_size and abs(mtime - st.st_mtime) < 1e-6
 
 
+def _is_uncompressed_tar(tar_path: Path) -> bool:
+    """Detect if a tar file is uncompressed (no .gz/.bz2/.xz suffix)."""
+    name = tar_path.name.lower()
+    return name.endswith(".tar") and not any(
+        name.endswith(ext) for ext in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".txz")
+    )
+
+
+def iter_tar_articles(
+    tar_path: Path,
+    parse_workers: int = 8,
+) -> Iterator[tuple[TarMemberMeta | SimpleNamespace, ArticleMeta]]:
+    """Unified iterator over articles in a tar file.
+    
+    For uncompressed .tar files (when parse_workers > 1), uses parallel XML parsing.
+    For compressed .tar.gz/.tar.bz2 files, uses sequential parsing.
+    
+    Yields:
+        (member_meta, article_meta) tuples where:
+        - member_meta has .name, .size, .mtime attributes
+        - article_meta is the parsed ArticleMeta dict
+    """
+    use_parallel = parse_workers > 1 and _is_uncompressed_tar(tar_path)
+    
+    if use_parallel:
+        # Parallel path for uncompressed tars
+        _eprint(f"[scan] using parallel XML parsing ({parse_workers} workers) for {tar_path.name}")
+        for member_meta, article_meta in parallel_iter_tar_articles(tar_path, workers=parse_workers):
+            yield member_meta, article_meta
+    else:
+        # Sequential path for compressed tars (or when parallel disabled)
+        for tarinfo, fobj in iter_tar_xml_streams(tar_path):
+            try:
+                article_meta = parse_xml_fileobj(fobj)
+                if article_meta is not None:
+                    # Wrap TarInfo in SimpleNamespace for consistent interface
+                    member_meta = SimpleNamespace(
+                        name=tarinfo.name,
+                        size=int(getattr(tarinfo, "size", 0)),
+                        mtime=float(getattr(tarinfo, "mtime", 0.0) or 0.0),
+                    )
+                    yield member_meta, article_meta
+            finally:
+                try:
+                    fobj.close()
+                except Exception:
+                    pass
+
+
 def register_file(cur, fpath: str, paper_id: int, st):
     """Insert/replace the (path, size, mtime, paper_id) record in files table."""
     cur.execute(
