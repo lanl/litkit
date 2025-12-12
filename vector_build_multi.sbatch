@@ -51,9 +51,9 @@ fi
 export LITKIT_REPO="/path/to/litkit"
 export LITKIT_WORKSPACE="${LITKIT_REPO}/workspace"
 
-# Manifest file: List of specific tar.gz files to process
-# Located in workspace for easy git tracking and container access
-export LITKIT_TAR_MANIFEST="${LITKIT_WORKSPACE}/test.manifest"
+# Manifest file: List of uncompressed tar files to process
+# Using /path/to/PMC-OA for uncompressed tar files (faster random access)
+export LITKIT_TAR_MANIFEST="${LITKIT_WORKSPACE}/vast_uncompressed.manifest"
 
 # Container and CUDA setup for V100 nodes
 export IMG="${LITKIT_REPO}/sqfs/litkit-v0.3.33-aarch64-lean.sqfs"
@@ -62,6 +62,9 @@ export CUDA_BASE="/path/to/cuda-12.5-host/cuda-12.5"
 export CUDA_LIBA="${CUDA_BASE}/targets/sbsa-linux/lib"
 export CUDA_LIBB="${CUDA_BASE}/lib64"
 export HF_HOST="/path/to/hf_cache_persist"
+
+# Parallel parsing workers per producer (use available CPUs)
+export PARSE_WORKERS=16
 
 # Ensure directories exist on Lustre
 mkdir -p "${LITKIT_WORKSPACE}/emb_segments"
@@ -79,13 +82,15 @@ echo "Nodelist: $SLURM_NODELIST"
 echo "Workspace: $LITKIT_WORKSPACE"
 echo "TAR manifest: $LITKIT_TAR_MANIFEST"
 echo "Container: $IMG"
+echo "Parse workers per producer: $PARSE_WORKERS"
+echo "Chunks index: flat (no IVF-PQ training)"
 echo "======================================"
 
 # Function to run producer in Charliecloud container
 run_producer() {
     local node_id=$1
     local target_node=$2
-    echo "[Producer $node_id] Starting on $target_node"
+    echo "[Producer $node_id] Starting on $target_node with $PARSE_WORKERS parse workers"
     
     srun -N1 -n1 -w "$target_node" "$CHRUN" \
         --unset-env='*' \
@@ -115,7 +120,8 @@ run_producer() {
             --chunk-embed-bs 64 \
             --embed-devices "cuda:0,cuda:1" \
             --embed-workers 2 \
-            --tar-manifest "/workspace/test.manifest"
+            --parse-workers $PARSE_WORKERS \
+            --tar-manifest "/workspace/vast_uncompressed.manifest"
     
     echo "[Producer $node_id] Completed"
 }
@@ -130,6 +136,7 @@ CONSUMER_NODE="${NODELIST[$((SLURM_NNODES - 1))]}"
 echo ""
 echo "=== Bootstrapping Empty FAISS Indices ==="
 echo "Running fast bootstrap on consumer node: $CONSUMER_NODE"
+echo "Using --chunks-index flat (no IVF-PQ training)"
 echo "This should complete in < 30 seconds..."
 
 srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
@@ -198,9 +205,9 @@ srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
         --faiss-writer \
         --consume-only \
         --embed-outdir "/workspace/emb_segments" \
-        --tar-manifest "/workspace/test.manifest" \
+        --tar-manifest "/workspace/vast_uncompressed.manifest" \
         --papers-index hnsw \
-        --chunks-index ivfpq \
+        --chunks-index flat \
         --num-shards $((SLURM_NNODES - 1))
 
 # Wait for all background jobs to finish
