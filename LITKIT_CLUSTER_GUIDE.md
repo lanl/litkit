@@ -132,6 +132,35 @@ cd /path/to/litkit
 
 ## Building the Container
 
+### Rebuilding from Scratch
+
+If you need to rebuild the container after code changes:
+
+```bash
+# On HPC login node
+cd /path/to/litkit
+git pull
+
+# Get an interactive compute node (just is only available there)
+salloc -p gpu-v100 -N 1 --time=2:00:00 --cpus-per-task=16
+
+# SSH to allocated node
+ssh gpu-node1  # replace with your allocated node
+
+# On compute node:
+cd /path/to/litkit
+module purge
+module load charliecloud/0.42
+
+# Clean build cache and rebuild (~30-60 min)
+just reset
+just build
+
+# Exit and release allocation
+exit
+scancel <jobid>
+```
+
 ### Using the Justfile (Recommended)
 
 ```bash
