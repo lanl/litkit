@@ -302,6 +302,192 @@ DB_FILENAME = os.environ.get("LITKIT_DB_FILE", "litkit.sqlite3")
 DB_PATH = SQLITE_DIR / DB_FILENAME
 CKPT_PATH = SQLITE_DIR / "build_checkpoint.json"
 
+
+def _shard_db_path(shard_id: int) -> Path:
+    """Return path to shard-specific SQLite database for producer mode."""
+    return SQLITE_DIR / f"litkit_shard_{shard_id:02d}.sqlite3"
+
+
+def _list_shard_dbs() -> list[Path]:
+    """List all shard SQLite databases in the sqlite directory."""
+    return sorted(SQLITE_DIR.glob("litkit_shard_*.sqlite3"))
+
+
+def merge_shard_databases(main_conn, delete_after_merge: bool = True) -> dict[str, int]:
+    """Merge all per-shard SQLite databases into the main database.
+    
+    Uses INSERT OR IGNORE on doc_id for idempotent paper merging, ensuring
+    that duplicate papers (same doc_id) from different shards are not duplicated.
+    
+    Args:
+        main_conn: Connection to the main litkit.sqlite3 database
+        delete_after_merge: If True, delete shard DBs after successful merge
+    
+    Returns:
+        Dict with merge statistics: {"papers": N, "chunks": M, "files": F, "shards": S}
+    """
+    shard_dbs = _list_shard_dbs()
+    if not shard_dbs:
+        return {"papers": 0, "chunks": 0, "files": 0, "shards": 0}
+    
+    _eprint(f"[merge] Found {len(shard_dbs)} shard database(s) to merge")
+    
+    stats = {"papers": 0, "chunks": 0, "files": 0, "shards": 0}
+    main_cur = main_conn.cursor()
+    
+    for shard_db in shard_dbs:
+        _eprint(f"[merge] Processing {shard_db.name}...")
+        
+        try:
+            shard_conn = sqlite3.connect(shard_db, isolation_level="DEFERRED")
+            shard_cur = shard_conn.cursor()
+            
+            # 1) Merge papers using doc_id for deduplication
+            # First, get all papers from shard
+            shard_papers = shard_cur.execute("""
+                SELECT doc_id, pmid, pmcid, title, abstract, in_index
+                FROM papers WHERE doc_id IS NOT NULL AND doc_id != ''
+            """).fetchall()
+            
+            papers_merged = 0
+            for row in shard_papers:
+                doc_id, pmid, pmcid, title, abstract, in_index = row
+                
+                # Check if this doc_id already exists in main DB
+                existing = main_cur.execute(
+                    "SELECT id FROM papers WHERE doc_id = ?", (doc_id,)
+                ).fetchone()
+                
+                if existing is None:
+                    # Insert new paper
+                    main_cur.execute("""
+                        INSERT INTO papers(doc_id, pmid, pmcid, title, abstract, in_index)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (doc_id, pmid, pmcid, title, abstract, 0))  # in_index=0, will be backfilled
+                    papers_merged += 1
+            
+            stats["papers"] += papers_merged
+            
+            # 2) Build doc_id -> main paper_id mapping for chunk/file remapping
+            # This handles both newly inserted and existing papers
+            doc_id_to_main_pid = {}
+            for row in shard_papers:
+                doc_id = row[0]
+                main_row = main_cur.execute(
+                    "SELECT id FROM papers WHERE doc_id = ?", (doc_id,)
+                ).fetchone()
+                if main_row:
+                    doc_id_to_main_pid[doc_id] = main_row[0]
+            
+            # 3) Merge chunks - need to remap paper_id and handle (paper_id, ord) uniqueness
+            # Get shard paper_id -> doc_id mapping
+            shard_pid_to_docid = {
+                row[0]: row[1] for row in shard_cur.execute(
+                    "SELECT id, doc_id FROM papers WHERE doc_id IS NOT NULL AND doc_id != ''"
+                ).fetchall()
+            }
+            
+            shard_chunks = shard_cur.execute("""
+                SELECT paper_id, ord, text, in_index FROM chunks
+            """).fetchall()
+            
+            chunks_merged = 0
+            for shard_pid, ord_val, text, in_index in shard_chunks:
+                doc_id = shard_pid_to_docid.get(shard_pid)
+                if doc_id is None:
+                    continue  # Orphan chunk, skip
+                
+                main_pid = doc_id_to_main_pid.get(doc_id)
+                if main_pid is None:
+                    continue  # Paper not in main DB, skip
+                
+                # Check if this (paper_id, ord) combination already exists
+                existing_chunk = main_cur.execute(
+                    "SELECT id FROM chunks WHERE paper_id = ? AND ord = ?",
+                    (main_pid, ord_val)
+                ).fetchone()
+                
+                if existing_chunk is None:
+                    main_cur.execute("""
+                        INSERT INTO chunks(paper_id, ord, text, in_index)
+                        VALUES (?, ?, ?, ?)
+                    """, (main_pid, ord_val, text, 0))  # in_index=0, will be backfilled
+                    chunks_merged += 1
+            
+            stats["chunks"] += chunks_merged
+            
+            # 4) Merge files table - remap paper_id
+            shard_files = shard_cur.execute("""
+                SELECT path, size, mtime, paper_id FROM files
+            """).fetchall()
+            
+            files_merged = 0
+            for path, size, mtime, shard_pid in shard_files:
+                doc_id = shard_pid_to_docid.get(shard_pid)
+                if doc_id is None:
+                    continue
+                
+                main_pid = doc_id_to_main_pid.get(doc_id)
+                if main_pid is None:
+                    continue
+                
+                # Use INSERT OR REPLACE to handle path conflicts
+                main_cur.execute("""
+                    INSERT OR REPLACE INTO files(path, size, mtime, paper_id)
+                    VALUES (?, ?, ?, ?)
+                """, (path, size, mtime, main_pid))
+                files_merged += 1
+            
+            stats["files"] += files_merged
+            stats["shards"] += 1
+            
+            shard_conn.close()
+            
+            _eprint(f"[merge] {shard_db.name}: {papers_merged} papers, {chunks_merged} chunks, {files_merged} files")
+            
+            # Delete shard DB after successful merge
+            if delete_after_merge:
+                try:
+                    shard_db.unlink()
+                    _eprint(f"[merge] Deleted {shard_db.name}")
+                except Exception as e:
+                    _eprint(f"[merge] WARNING: could not delete {shard_db.name}: {e}")
+            
+        except Exception as e:
+            _eprint(f"[merge] ERROR processing {shard_db.name}: {e.__class__.__name__}: {e}")
+            # Continue with next shard
+    
+    # Commit all changes
+    main_conn.commit()
+    
+    _eprint(f"[merge] Complete: {stats['papers']} papers, {stats['chunks']} chunks, {stats['files']} files from {stats['shards']} shard(s)")
+    return stats
+
+
+def init_shard_db(shard_id: int, journal_mode: str, busy_timeout_ms: int):
+    """Initialize a shard-specific SQLite database for producer mode.
+    
+    Each producer writes to its own shard DB to avoid lock contention.
+    The consumer later merges all shard DBs into the main database.
+    """
+    shard_path = _shard_db_path(shard_id)
+    _eprint(f"[db] Producer shard {shard_id}: using {shard_path}")
+    
+    conn = sqlite3.connect(shard_path, isolation_level="DEFERRED", timeout=busy_timeout_ms / 1000.0)
+    
+    mode = (journal_mode or "TRUNCATE").upper()
+    conn.execute(f"PRAGMA journal_mode={mode};")
+    conn.execute("PRAGMA synchronous=FULL;")
+    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)};")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    
+    conn.executescript(SCHEMA)
+    _ensure_in_index_columns(conn)
+    conn.commit()
+    
+    return conn
+
+
 PROMPT_HEADROOM_TOKENS = int(os.environ.get("LITKIT_PROMPT_HEADROOM_TOKENS", "200"))
 
 
