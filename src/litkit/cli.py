@@ -2623,8 +2623,13 @@ def build_or_update_indices(args):
         # nothing to do
         return
 
-    _eprint(f"[build] using DB at {DB_PATH}")
-    conn = init_db(args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
+    # Use shard-specific DB for producers (lock-free parallel writes)
+    if args.embed_producer and not args.faiss_writer:
+        _eprint(f"[build] Producer mode: using shard-specific DB for shard {args.shard_id}")
+        conn = init_shard_db(args.shard_id, args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
+    else:
+        _eprint(f"[build] using DB at {DB_PATH}")
+        conn = init_db(args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
     cur = conn.cursor()
 
     if args.init_indices_only:
@@ -2688,6 +2693,15 @@ def build_or_update_indices(args):
             if consumer_coordinator.wait_for_completion(poll_interval=30, timeout=600, progress_callback=progress_callback):
                 _eprint("[consumer] All producers have completed")
                 break
+        
+        # Merge all shard databases into the main database
+        # This must happen after all producers complete but before segment ingestion
+        # so that the consumer has a unified view of all papers/chunks for backfill
+        _eprint("[consumer] Merging shard databases...")
+        merge_stats = merge_shard_databases(conn, delete_after_merge=True)
+        if merge_stats["shards"] > 0:
+            _eprint(f"[consumer] Merged {merge_stats['shards']} shard DB(s): "
+                    f"{merge_stats['papers']} papers, {merge_stats['chunks']} chunks, {merge_stats['files']} files")
         
         # Final ingestion pass after all producers have completed
         p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
