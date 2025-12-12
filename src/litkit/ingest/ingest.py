@@ -495,11 +495,21 @@ def _parse_xml_bytes(data: bytes) -> ArticleMeta | None:
     return _parse_tree(tree)
 
 
+class TarMemberMeta:
+    """Minimal file metadata from a tar member, used for checkpointing."""
+    __slots__ = ("name", "size", "mtime")
+
+    def __init__(self, name: str, size: int, mtime: float):
+        self.name = name
+        self.size = size
+        self.mtime = mtime
+
+
 def parallel_iter_tar_articles(
     tar_path: str | Path,
     workers: int = 8,
     exts: Iterable[str] = _XML_EXTS,
-) -> Iterator[tuple[str, ArticleMeta]]:
+) -> Iterator[tuple[TarMemberMeta, ArticleMeta]]:
     """Iterate over articles in a tar file, parsing XML in parallel.
 
     This function reads tar members sequentially (tar format requires this),
@@ -517,8 +527,9 @@ def parallel_iter_tar_articles(
 
     Yields
     ------
-    tuple[str, ArticleMeta]
-        (member_name, parsed_metadata) for each successfully parsed XML file.
+    tuple[TarMemberMeta, ArticleMeta]
+        (member_meta, parsed_article) for each successfully parsed XML file.
+        member_meta contains name, size, mtime for checkpointing.
 
     Notes
     -----
@@ -560,8 +571,13 @@ def parallel_iter_tar_articles(
                         logger.warning("[tar] cannot extract %s: %s", m.name, e)
                         continue
 
+                    meta = TarMemberMeta(
+                        name=m.name,
+                        size=int(getattr(m, "size", 0)),
+                        mtime=float(getattr(m, "mtime", 0.0) or 0.0),
+                    )
                     fut = pool.submit(_parse_xml_bytes, data)
-                    futures[fut] = m.name
+                    futures[fut] = meta
                     pending_count += 1
 
                 if not futures:
@@ -579,19 +595,20 @@ def parallel_iter_tar_articles(
                     done_futures = list(done)
 
                 for fut in done_futures:
-                    name = futures.pop(fut)
+                    meta = futures.pop(fut)
                     pending_count -= 1
                     try:
                         result = fut.result()
                         if result is not None:
-                            yield (name, result)
+                            yield (meta, result)
                     except Exception as e:
-                        logger.warning("[parse] error parsing %s: %s", name, e)
+                        logger.warning("[parse] error parsing %s: %s", meta.name, e)
 
 
 # Public API
 __all__ = [
     "ArticleMeta",
+    "TarMemberMeta",
     # constants
     "CHUNK_TARGET_CHARS",
     "BODY_MIN_CHARS",

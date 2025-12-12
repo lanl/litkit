@@ -72,6 +72,7 @@ from litkit.formatting.answers import (
 from litkit.frontload.cap import cap_chunks_per_paper
 from litkit.ingest.ingest import (
     ArticleMeta,
+    TarMemberMeta,
     count_tar_xml_members,
     iter_tar_paths,
     iter_tar_xml_streams,
