@@ -2206,8 +2206,8 @@ def _ingest_article(
             pid = pid_row[0]
         else:
             cur.execute(
-                "INSERT INTO papers(pmid, pmcid, title, abstract) VALUES (?,?,?,?)",
-                (pmid, pmcid, meta["title"], meta["abstract"]),
+                "INSERT INTO papers(doc_id, pmid, pmcid, title, abstract) VALUES (?,?,?,?,?)",
+                (_compute_doc_id(pmcid, pmid, meta["title"], meta["abstract"]), pmid, pmcid, meta["title"], meta["abstract"]),
             )
             pid = cur.lastrowid
 
@@ -3100,8 +3100,8 @@ def build_or_update_indices(args):
                             pid = pid_row[0]
                         else:
                             cur.execute(
-                                "INSERT INTO papers(pmid, pmcid, title, abstract) VALUES (?,?,?,?)",
-                                (pmid, pmcid, meta["title"], meta["abstract"]),
+                                "INSERT INTO papers(doc_id, pmid, pmcid, title, abstract) VALUES (?,?,?,?,?)",
+                                (_compute_doc_id(pmcid, pmid, meta["title"], meta["abstract"]), pmid, pmcid, meta["title"], meta["abstract"]),
                             )
                             pid = cur.lastrowid
 
