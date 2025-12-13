@@ -881,6 +881,37 @@ def _dedupe_ids_and_texts(ids: list[int], texts: list[str]) -> tuple[list[int], 
     return out_ids, out_texts
 
 
+def _dedupe_papers_with_doc_ids(
+    ids: list[int], texts: list[str], doc_ids: list[str]
+) -> tuple[list[int], list[str], list[str]]:
+    """Keep the first occurrence of each id; return aligned id/text/doc_id lists."""
+    out_ids, out_texts, out_doc_ids, seen = [], [], [], set()
+    for i, t, d in zip(ids, texts, doc_ids, strict=False):
+        if i in seen:
+            continue
+        seen.add(i)
+        out_ids.append(i)
+        out_texts.append(t)
+        out_doc_ids.append(d)
+    return out_ids, out_texts, out_doc_ids
+
+
+def _dedupe_chunks_with_doc_ids(
+    ids: list[int], texts: list[str], paper_doc_ids: list[str], ords: list[int]
+) -> tuple[list[int], list[str], list[str], list[int]]:
+    """Keep the first occurrence of each id; return aligned id/text/paper_doc_id/ord lists."""
+    out_ids, out_texts, out_doc_ids, out_ords, seen = [], [], [], [], set()
+    for i, t, d, o in zip(ids, texts, paper_doc_ids, ords, strict=False):
+        if i in seen:
+            continue
+        seen.add(i)
+        out_ids.append(i)
+        out_texts.append(t)
+        out_doc_ids.append(d)
+        out_ords.append(o)
+    return out_ids, out_texts, out_doc_ids, out_ords
+
+
 # -------------------- Embedders --------------------
 import faiss
 import numpy as np
@@ -3627,6 +3658,7 @@ def build_or_update_indices(args):
                         )
                         paper_ids_buf.append(pid)
                         paper_texts_buf.append(ta_ab)
+                        paper_doc_ids_buf.append(doc_id)
 
                         proposed_chunks = []
                         if ta_ab:
@@ -3658,9 +3690,13 @@ def build_or_update_indices(args):
                             cid = cur.lastrowid
                             chunk_ids_buf.append(cid)
                             chunk_texts_buf.append(text_i)
+                            chunk_paper_doc_ids_buf.append(doc_id)
+                            chunk_ords_buf.append(ord_i)
 
                         if len(paper_ids_buf) >= PAPER_BATCH:
-                            u_ids, u_texts = _dedupe_ids_and_texts(paper_ids_buf, paper_texts_buf)
+                            u_ids, u_texts, u_doc_ids = _dedupe_papers_with_doc_ids(
+                                paper_ids_buf, paper_texts_buf, paper_doc_ids_buf
+                            )
 
                             if paper_seg_writer is not None:
                                 Xp = paper_embedder.encode(
@@ -3669,9 +3705,7 @@ def build_or_update_indices(args):
                                     batch_size=args.paper_embed_bs,
                                     progress_done_summary=False,
                                 )
-                                paper_seg_writer.write(
-                                    ids=np.asarray(u_ids, dtype=np.int64), vecs=Xp
-                                )
+                                paper_seg_writer.write(doc_ids=u_doc_ids, vecs=Xp)
                                 conn.commit()
                                 papers_added_total += len(u_ids)
 
@@ -3710,9 +3744,12 @@ def build_or_update_indices(args):
 
                             paper_ids_buf.clear()
                             paper_texts_buf.clear()
+                            paper_doc_ids_buf.clear()
 
                         if len(chunk_ids_buf) >= CHUNK_BATCH:
-                            u_ids, u_texts = _dedupe_ids_and_texts(chunk_ids_buf, chunk_texts_buf)
+                            u_ids, u_texts, u_paper_doc_ids, u_ords = _dedupe_chunks_with_doc_ids(
+                                chunk_ids_buf, chunk_texts_buf, chunk_paper_doc_ids_buf, chunk_ords_buf
+                            )
 
                             if chunk_seg_writer is not None:
                                 Xc = chunk_embedder.encode(
@@ -3722,7 +3759,7 @@ def build_or_update_indices(args):
                                     progress_done_summary=False,
                                 )
                                 chunk_seg_writer.write(
-                                    ids=np.asarray(u_ids, dtype=np.int64), vecs=Xc
+                                    paper_doc_ids=u_paper_doc_ids, ords=u_ords, vecs=Xc
                                 )
                                 conn.commit()
                                 chunks_added_total += len(u_ids)
@@ -3763,6 +3800,8 @@ def build_or_update_indices(args):
 
                             chunk_ids_buf.clear()
                             chunk_texts_buf.clear()
+                            chunk_paper_doc_ids_buf.clear()
+                            chunk_ords_buf.clear()
 
                         # ---------- END INGEST BODY ----------
 
@@ -3876,33 +3915,40 @@ def build_or_update_indices(args):
 
         # papers: embed and write segment file(s)
         if paper_ids_buf:
-            u_ids, u_texts = _dedupe_ids_and_texts(paper_ids_buf, paper_texts_buf)
+            u_ids, u_texts, u_doc_ids = _dedupe_papers_with_doc_ids(
+                paper_ids_buf, paper_texts_buf, paper_doc_ids_buf
+            )
             Xp = paper_embedder.encode(
                 u_texts,
                 progress_label=f"Embedding papers (producer, {len(u_texts)})",
                 batch_size=args.paper_embed_bs,
             )
             assert paper_seg_writer is not None, "producer mode requires paper_seg_writer"
-            paper_seg_writer.write(ids=np.asarray(u_ids, dtype=np.int64), vecs=Xp)
+            paper_seg_writer.write(doc_ids=u_doc_ids, vecs=Xp)
             conn.commit()
             papers_added_total += len(u_ids)
         paper_ids_buf.clear()
         paper_texts_buf.clear()
+        paper_doc_ids_buf.clear()
 
         # chunks: embed and write segment file(s)
         if chunk_ids_buf:
-            u_ids, u_texts = _dedupe_ids_and_texts(chunk_ids_buf, chunk_texts_buf)
+            u_ids, u_texts, u_paper_doc_ids, u_ords = _dedupe_chunks_with_doc_ids(
+                chunk_ids_buf, chunk_texts_buf, chunk_paper_doc_ids_buf, chunk_ords_buf
+            )
             Xc = chunk_embedder.encode(
                 u_texts,
                 progress_label=f"Embedding chunks (producer, {len(u_texts)})",
                 batch_size=args.chunk_embed_bs,
             )
             assert chunk_seg_writer is not None, "producer mode requires chunk_seg_writer"
-            chunk_seg_writer.write(ids=np.asarray(u_ids, dtype=np.int64), vecs=Xc)
+            chunk_seg_writer.write(paper_doc_ids=u_paper_doc_ids, ords=u_ords, vecs=Xc)
             conn.commit()
             chunks_added_total += len(u_ids)
         chunk_ids_buf.clear()
         chunk_texts_buf.clear()
+        chunk_paper_doc_ids_buf.clear()
+        chunk_ords_buf.clear()
 
     else:
         # ---- plain reader: DB only ----
