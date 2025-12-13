@@ -1,10 +1,10 @@
 # Tiny test manifest for debugging multi-node merge
 # 7 small author-specific uncompressed tar files for quick testing
 # Estimated: ~few hundred papers, ~5-10 minutes processing time
-/path/to/litkit/workspace/tar_files/blinov_ml.tar
-/path/to/litkit/workspace/tar_files/faeder_jr.tar
-/path/to/litkit/workspace/tar_files/hlavacek_ws.tar
-/path/to/litkit/workspace/tar_files/perelson_as.tar
-/path/to/litkit/workspace/tar_files/savageau_ma.tar
-/path/to/litkit/workspace/tar_files/stites_ec.tar
-/path/to/litkit/workspace/tar_files/voit_eo.tar
+/path/to/test_tar_shards/blinov_ml.tar
+/path/to/test_tar_shards/faeder_jr.tar
+/path/to/test_tar_shards/hlavacek_ws.tar
+/path/to/test_tar_shards/perelson_as.tar
+/path/to/test_tar_shards/savageau_ma.tar
+/path/to/test_tar_shards/stites_ec.tar
+/path/to/test_tar_shards/voit_eo.tar
