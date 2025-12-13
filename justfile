@@ -2,7 +2,7 @@
 # Flavors:
 #   - lean:  No CUDA userspace in image. At runtime you must provide host NVIDIA
 #            device nodes (via CDI) and host CUDA libs (via module + bind).
-#   - nv:    CUDA userspace injected into the squashed image at export time.
+#   - fat:   CUDA userspace injected into the squashed image at export time.
 #            Simpler to run, but less portable: baked libs must be <= site driver.
 #
 # What we build here (defaults):
@@ -33,8 +33,8 @@
 #     import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())
 #     PY
 #
-# (D) Produce an nv/fat image (libs baked, less portable; only if you know targets)
-#     FLAVOR=nv DOCKERFILE=Dockerfile.fat INJECT_NVIDIA=1 just build
+# (D) Produce a fat image (libs baked, less portable; only if you know targets)
+#     FLAVOR=fat DOCKERFILE=Dockerfile.fat INJECT_NVIDIA=1 just build
 #     # ch-fromhost --nvidia runs during export; build where the driver matches targets.
 #
 # Notes:
@@ -50,7 +50,7 @@ set shell := ['bash', '-l', '-c']
 
 # ---- Paths & tags ----
 arch := env("ARCH", "aarch64")
-flavor := env("FLAVOR", "lean")           # nv | lean
+flavor := env("FLAVOR", "lean")           # fat | lean
 tag := "v0.3.34-" + arch + "-" + flavor
 name := "litkit"
 sqfs-path := "./sqfs" / name + "-" + tag + ".sqfs"
