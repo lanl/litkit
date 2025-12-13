@@ -2,11 +2,11 @@
 # Flavors:
 #   - lean:  No CUDA userspace in image. At runtime you must provide host NVIDIA
 #            device nodes (via CDI) and host CUDA libs (via module + bind).
-#   - fat:   CUDA userspace injected into the squashed image at export time.
+#   - nv:    CUDA userspace injected into the squashed image at export time.
 #            Simpler to run, but less portable: baked libs must be <= site driver.
 #
 # What we build here (defaults):
-#   DOCKERFILE=Dockerfile.lean -> FLAVOR=lean, INJECT_NVIDIA=0
+#   FLAVOR=lean, INJECT_NVIDIA=0, DOCKERFILE=Dockerfile.lean
 #   -> Torch 2.5.1 (cp312, CUDA 12.5 toolchain) wheel is produced/used offline.
 #
 # Prereqs on the host:
@@ -19,7 +19,7 @@
 # Typical workflows:
 #
 # (A) Build lean image (no libs baked, recommended for portability)
-#     DOCKERFILE=Dockerfile.lean just release
+#     FLAVOR=lean INJECT_NVIDIA=0 DOCKERFILE=Dockerfile.lean just release
 #
 # (B) Run CPU-only (test)
 #     just run python -c 'import sys; print(sys.version)'
@@ -33,8 +33,8 @@
 #     import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())
 #     PY
 #
-# (D) Produce a fat image (libs baked, less portable; only if you know targets)
-#     DOCKERFILE=Dockerfile.fat just build
+# (D) Produce an nv/fat image (libs baked, less portable; only if you know targets)
+#     FLAVOR=nv DOCKERFILE=Dockerfile.fat INJECT_NVIDIA=1 just build
 #     # ch-fromhost --nvidia runs during export; build where the driver matches targets.
 #
 # Notes:
@@ -50,23 +50,16 @@ set shell := ['bash', '-l', '-c']
 
 # ---- Paths & tags ----
 arch := env("ARCH", "aarch64")
-
-# Select which Dockerfile to use (flavor is auto-derived from suffix: .lean or .fat)
-dockerfile := env("DOCKERFILE", "Dockerfile.lean")
-
-# Derive flavor from Dockerfile suffix: Dockerfile.fat -> "fat", else "lean"
-# FLAVOR env var can override if explicitly set
-_auto_flavor := if dockerfile =~ "\.fat$" { "fat" } else { "lean" }
-flavor := env("FLAVOR", _auto_flavor)     # fat | lean
-
+flavor := env("FLAVOR", "lean")           # nv | lean
 tag := "v0.3.34-" + arch + "-" + flavor
 name := "litkit"
 sqfs-path := "./sqfs" / name + "-" + tag + ".sqfs"
 
-# Whether to inject host NVIDIA libs on export (1=yes for fat, 0=no for lean)
-# Auto-set based on flavor unless explicitly overridden
-_auto_inject := if flavor == "fat" { "1" } else { "0" }
-inject-nvidia := env("INJECT_NVIDIA", _auto_inject)
+# Select which Dockerfile to use
+dockerfile := env("DOCKERFILE", "Dockerfile.lean")
+
+# Whether to inject host NVIDIA libs on export (1=yes, 0=no)
+inject-nvidia := env("INJECT_NVIDIA", "0")
 run-nvidia := env("RUN_NVIDIA", "0")
 
 # Where we stash team wheels (host)
