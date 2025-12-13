@@ -963,6 +963,101 @@ class _SegmentWriter:
             _maybe_fsync_dir(final)
 
 
+# -------------------- Build Metadata (shard consistency) --------------------
+BUILD_META_FILE = ".build_meta.json"
+
+
+def _write_build_meta(seg_dir: Path, num_shards: int, manifest_path: str | None = None) -> None:
+    """Write build metadata to segment directory for shard consistency checking."""
+    seg_dir = Path(seg_dir)
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = seg_dir / BUILD_META_FILE
+    
+    meta = {
+        "num_shards": num_shards,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "timestamp": int(time.time()),
+        "hostname": socket.gethostname(),
+        "manifest": manifest_path,
+    }
+    
+    tmp = meta_path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        f.write(json.dumps(meta, indent=2))
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    os.replace(tmp, meta_path)
+    _maybe_fsync_dir(meta_path)
+    _eprint(f"[build] Wrote build metadata: num_shards={num_shards}")
+
+
+def _read_build_meta(seg_dir: Path) -> dict | None:
+    """Read build metadata from segment directory. Returns None if not found."""
+    meta_path = Path(seg_dir) / BUILD_META_FILE
+    if not meta_path.exists():
+        return None
+    try:
+        return json.loads(meta_path.read_text())
+    except Exception as e:
+        _eprint(f"[build] WARNING: could not read {meta_path}: {e}")
+        return None
+
+
+def _has_segment_files(seg_dir: Path) -> bool:
+    """Check if segment directory has any .npz files (indicating prior work)."""
+    seg_dir = Path(seg_dir)
+    if not seg_dir.exists():
+        return False
+    return bool(list(seg_dir.glob("*.npz")) or list(seg_dir.glob(".shard_*_complete")))
+
+
+def _validate_shard_consistency(seg_dir: Path, current_num_shards: int) -> None:
+    """Validate that current shard count matches any existing build.
+    
+    Raises SystemExit if there's a mismatch to prevent data corruption.
+    """
+    seg_dir = Path(seg_dir)
+    meta = _read_build_meta(seg_dir)
+    has_segments = _has_segment_files(seg_dir)
+    
+    if meta is not None:
+        stored_shards = meta.get("num_shards")
+        if stored_shards is not None and stored_shards != current_num_shards:
+            started_at = meta.get("started_at", "unknown")
+            raise SystemExit(
+                f"\n[ERROR] Shard count mismatch!\n"
+                f"  Existing build: {stored_shards} shards (started {started_at})\n"
+                f"  Current request: {current_num_shards} shards\n"
+                f"\n"
+                f"Options:\n"
+                f"  1. Resume with matching shard count:\n"
+                f"       sbatch -N{stored_shards + 1} vector_build_multi.sbatch\n"
+                f"       (N = num_shards + 1 for the consumer node)\n"
+                f"\n"
+                f"  2. Start fresh (DELETES ALL EXISTING WORK):\n"
+                f"       rm -rf {seg_dir}/*\n"
+                f"       rm -rf {SQLITE_DIR}/*\n"
+                f"       rm -rf {INDICES_DIR}/*\n"
+                f"       # Then resubmit your job\n"
+            )
+        # Shard count matches, good to proceed
+        return
+    
+    # No metadata file
+    if has_segments:
+        # Legacy case: segments exist but no metadata
+        _eprint(
+            f"[build] WARNING: Found segment files but no {BUILD_META_FILE}. "
+            f"Assuming current shard count ({current_num_shards}) is correct. "
+            f"Writing metadata for future runs."
+        )
+        _write_build_meta(seg_dir, current_num_shards)
+    # else: Fresh start, metadata will be written by the first producer
+
+
 class ProducerCoordinator:
     """Manages producer completion signaling for multi-node coordination."""
     
@@ -2587,6 +2682,18 @@ def build_or_update_indices(args):
     if not need and not args.update and not args.build_only and not args.consume_only and not args.init_indices_only:
         # nothing to do
         return
+
+    # Validate shard count consistency BEFORE any work begins
+    if args.num_shards > 1:
+        seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
+        _validate_shard_consistency(seg_dir, args.num_shards)
+        
+        # Write build metadata if this is a fresh start (producer 0 writes it)
+        if args.embed_producer and args.shard_id == 0:
+            meta = _read_build_meta(seg_dir)
+            if meta is None:
+                manifest_path = str(args.tar_manifest) if args.tar_manifest else None
+                _write_build_meta(seg_dir, args.num_shards, manifest_path)
 
     # Use shard-specific DB for producers (lock-free parallel writes)
     if args.embed_producer and not args.faiss_writer:
