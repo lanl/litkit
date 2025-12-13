@@ -123,7 +123,8 @@ RUN set -e; \
 FROM ghcr.io/astral-sh/uv:0.9.0-bookworm AS runtime
 
 # Ensure a CPython 3.12 is available for uv-managed tool envs
-ENV PATH="/root/.local/bin:${PATH}"
+# Set PATH explicitly to silence Charliecloud "warning: $PATH not set"
+ENV PATH="/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 RUN uv python install 3.12
 
 RUN mkdir -p /workspace /data/pmc_oa /data/test_tar_shards /opt/wheels /host_cache

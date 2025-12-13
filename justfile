@@ -33,8 +33,8 @@
 #     import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())
 #     PY
 #
-# (D) Produce an nv image (libs baked, less portable; only if you know targets)
-#     FLAVOR=nv DOCKERFILE=Dockerfile INJECT_NVIDIA=1 just build
+# (D) Produce an nv/fat image (libs baked, less portable; only if you know targets)
+#     FLAVOR=nv DOCKERFILE=Dockerfile.fat INJECT_NVIDIA=1 just build
 #     # ch-fromhost --nvidia runs during export; build where the driver matches targets.
 #
 # Notes:

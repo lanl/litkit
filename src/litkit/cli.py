@@ -359,12 +359,18 @@ def merge_shard_databases(main_conn, delete_after_merge: bool = True) -> dict[st
                 ).fetchone()
                 
                 if existing is None:
-                    # Insert new paper
-                    main_cur.execute("""
-                        INSERT INTO papers(doc_id, pmid, pmcid, title, abstract, in_index)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (doc_id, pmid, pmcid, title, abstract, 0))  # in_index=0, will be backfilled
-                    papers_merged += 1
+                    # Insert new paper (handle duplicate pmid/pmcid gracefully)
+                    try:
+                        main_cur.execute("""
+                            INSERT INTO papers(doc_id, pmid, pmcid, title, abstract, in_index)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, (doc_id, pmid, pmcid, title, abstract, 0))  # in_index=0, will be backfilled
+                        papers_merged += 1
+                    except sqlite3.IntegrityError as e:
+                        # Duplicate pmid/pmcid from another shard - skip silently
+                        # This can happen when tar files contain overlapping papers
+                        _eprint(f"[merge] Skipping duplicate paper: pmid={pmid} pmcid={pmcid} ({e})")
+                        continue
             
             stats["papers"] += papers_merged
             
