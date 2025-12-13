@@ -51,11 +51,12 @@ fi
 export LITKIT_REPO="/path/to/litkit"
 export LITKIT_WORKSPACE="${LITKIT_REPO}/workspace"
 
-# MANIFEST options (uncomment one):
+# MANIFEST selection (edit this ONE LINE to change which manifest is used):
+#   tiny_test.manifest    (~few MB, 5-10 min) - for debugging merge logic
 #   medium_test.manifest  (~7 GB, 30-45 min)
 #   large_test.manifest   (~185 GB, 3-5 hours)
-export LITKIT_TAR_MANIFEST="${LITKIT_WORKSPACE}/${MANIFEST:-medium_test.manifest}"
-# export LITKIT_TAR_MANIFEST="${LITKIT_WORKSPACE}/${MANIFEST:-large_test.manifest}"
+MANIFEST_FILE="${MANIFEST:-tiny_test.manifest}"
+export LITKIT_TAR_MANIFEST="${LITKIT_WORKSPACE}/${MANIFEST_FILE}"
 
 # Container and CUDA setup for V100 nodes
 export IMG="${LITKIT_REPO}/sqfs/litkit-v0.3.34-aarch64-lean.sqfs"
@@ -76,6 +77,14 @@ mkdir -p "${LITKIT_WORKSPACE}/indices"
 # Lustre-optimized settings
 export LITKIT_SQLITE_BUSY_TIMEOUT_MS=300000
 export LITKIT_SAVE_EVERY_SEC=300
+
+# Fail-fast: Multi-node build requires at least 2 nodes (1 producer + 1 consumer)
+if [[ "$SLURM_NNODES" -lt 2 ]]; then
+    echo "FATAL: vector_build_multi.sbatch requires at least 2 nodes (-N2 or higher)." >&2
+    echo "       With -N1, there are 0 producers and the consumer waits forever." >&2
+    echo "       Use vector_build_single.sbatch for single-node builds." >&2
+    exit 2
+fi
 
 echo "=== Multi-Node Litkit Build Starting ==="
 echo "Job ID: $SLURM_JOB_ID"
@@ -123,7 +132,7 @@ run_producer() {
             --embed-devices "cuda:0,cuda:1" \
             --embed-workers 2 \
             --parse-workers $PARSE_WORKERS \
-            --tar-manifest "/workspace/${MANIFEST:-medium_test.manifest}"
+            --tar-manifest "/workspace/${MANIFEST_FILE}"
     
     echo "[Producer $node_id] Completed"
 }
@@ -207,7 +216,7 @@ srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
         --faiss-writer \
         --consume-only \
         --embed-outdir "/workspace/emb_segments" \
-        --tar-manifest "/workspace/${MANIFEST:-medium_test.manifest}" \
+        --tar-manifest "/workspace/${MANIFEST_FILE}" \
         --papers-index hnsw \
         --chunks-index flat \
         --num-shards $((SLURM_NNODES - 1))

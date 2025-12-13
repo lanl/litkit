@@ -967,14 +967,22 @@ class _SegmentWriter:
 BUILD_META_FILE = ".build_meta.json"
 
 
-def _write_build_meta(seg_dir: Path, num_shards: int, manifest_path: str | None = None) -> None:
-    """Write build metadata to segment directory for shard consistency checking."""
+def _write_build_meta(seg_dir: Path, num_shards: int, manifest_path: str | None = None, *, mode: str = "single") -> None:
+    """Write build metadata to segment directory for shard consistency checking.
+    
+    Args:
+        seg_dir: Directory to write metadata to
+        num_shards: Number of producer shards (0 or 1 for single-node mode)
+        manifest_path: Optional path to the tar manifest file
+        mode: Build mode - "single" for single-node, "multi" for multi-node producer/consumer
+    """
     seg_dir = Path(seg_dir)
     seg_dir.mkdir(parents=True, exist_ok=True)
     meta_path = seg_dir / BUILD_META_FILE
     
     meta = {
         "num_shards": num_shards,
+        "mode": mode,  # "single" or "multi"
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "timestamp": int(time.time()),
         "hostname": socket.gethostname(),
@@ -991,7 +999,7 @@ def _write_build_meta(seg_dir: Path, num_shards: int, manifest_path: str | None 
             pass
     os.replace(tmp, meta_path)
     _maybe_fsync_dir(meta_path)
-    _eprint(f"[build] Wrote build metadata: num_shards={num_shards}")
+    _eprint(f"[build] Wrote build metadata: mode={mode}, num_shards={num_shards}")
 
 
 def _read_build_meta(seg_dir: Path) -> dict | None:
@@ -1014,8 +1022,13 @@ def _has_segment_files(seg_dir: Path) -> bool:
     return bool(list(seg_dir.glob("*.npz")) or list(seg_dir.glob(".shard_*_complete")))
 
 
-def _validate_shard_consistency(seg_dir: Path, current_num_shards: int) -> None:
-    """Validate that current shard count matches any existing build.
+def _validate_shard_consistency(seg_dir: Path, current_num_shards: int, *, current_mode: str = "single") -> None:
+    """Validate that current shard count and mode match any existing build.
+    
+    Args:
+        seg_dir: Directory containing build metadata and segments
+        current_num_shards: Number of producer shards for this run
+        current_mode: Build mode - "single" for single-node, "multi" for multi-node
     
     Raises SystemExit if there's a mismatch to prevent data corruption.
     """
@@ -1025,8 +1038,51 @@ def _validate_shard_consistency(seg_dir: Path, current_num_shards: int) -> None:
     
     if meta is not None:
         stored_shards = meta.get("num_shards")
-        if stored_shards is not None and stored_shards != current_num_shards:
-            started_at = meta.get("started_at", "unknown")
+        stored_mode = meta.get("mode", "single")  # Default to "single" for legacy builds
+        started_at = meta.get("started_at", "unknown")
+        
+        # Check for mode mismatch (prevents resuming multi-node with single-node or vice versa)
+        if stored_mode != current_mode:
+            if stored_mode == "multi" and current_mode == "single":
+                raise SystemExit(
+                    f"\n[ERROR] Build mode mismatch!\n"
+                    f"  Existing build: multi-node ({stored_shards} shards, started {started_at})\n"
+                    f"  Current request: single-node\n"
+                    f"\n"
+                    f"You cannot resume a multi-node build with single-node mode.\n"
+                    f"\n"
+                    f"Options:\n"
+                    f"  1. Resume with multi-node:\n"
+                    f"       sbatch -N{stored_shards + 1} vector_build_multi.sbatch\n"
+                    f"       (N = num_shards + 1 for the consumer node)\n"
+                    f"\n"
+                    f"  2. Start fresh (DELETES ALL EXISTING WORK):\n"
+                    f"       rm -rf {seg_dir}/*\n"
+                    f"       rm -rf {SQLITE_DIR}/*\n"
+                    f"       rm -rf {INDICES_DIR}/*\n"
+                    f"       # Then resubmit your single-node job\n"
+                )
+            elif stored_mode == "single" and current_mode == "multi":
+                raise SystemExit(
+                    f"\n[ERROR] Build mode mismatch!\n"
+                    f"  Existing build: single-node (started {started_at})\n"
+                    f"  Current request: multi-node ({current_num_shards} shards)\n"
+                    f"\n"
+                    f"You cannot resume a single-node build with multi-node mode.\n"
+                    f"\n"
+                    f"Options:\n"
+                    f"  1. Resume with single-node:\n"
+                    f"       sbatch vector_build_single.sbatch\n"
+                    f"\n"
+                    f"  2. Start fresh (DELETES ALL EXISTING WORK):\n"
+                    f"       rm -rf {seg_dir}/*\n"
+                    f"       rm -rf {SQLITE_DIR}/*\n"
+                    f"       rm -rf {INDICES_DIR}/*\n"
+                    f"       # Then resubmit your multi-node job\n"
+                )
+        
+        # Check for shard count mismatch (only relevant for multi-node mode)
+        if current_mode == "multi" and stored_shards is not None and stored_shards != current_num_shards:
             raise SystemExit(
                 f"\n[ERROR] Shard count mismatch!\n"
                 f"  Existing build: {stored_shards} shards (started {started_at})\n"
@@ -1043,7 +1099,7 @@ def _validate_shard_consistency(seg_dir: Path, current_num_shards: int) -> None:
                 f"       rm -rf {INDICES_DIR}/*\n"
                 f"       # Then resubmit your job\n"
             )
-        # Shard count matches, good to proceed
+        # Mode and shard count match, good to proceed
         return
     
     # No metadata file
@@ -1051,10 +1107,10 @@ def _validate_shard_consistency(seg_dir: Path, current_num_shards: int) -> None:
         # Legacy case: segments exist but no metadata
         _eprint(
             f"[build] WARNING: Found segment files but no {BUILD_META_FILE}. "
-            f"Assuming current shard count ({current_num_shards}) is correct. "
+            f"Assuming current settings (mode={current_mode}, shards={current_num_shards}) are correct. "
             f"Writing metadata for future runs."
         )
-        _write_build_meta(seg_dir, current_num_shards)
+        _write_build_meta(seg_dir, current_num_shards, mode=current_mode)
     # else: Fresh start, metadata will be written by the first producer
 
 
@@ -2683,17 +2739,31 @@ def build_or_update_indices(args):
         # nothing to do
         return
 
-    # Validate shard count consistency BEFORE any work begins
-    if args.num_shards > 1:
-        seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
-        _validate_shard_consistency(seg_dir, args.num_shards)
-        
-        # Write build metadata if this is a fresh start (producer 0 writes it)
+    # Validate build mode and shard count consistency BEFORE any work begins
+    # Determine the build mode based on args
+    is_multi_node = args.num_shards > 1 or args.embed_producer or args.consume_only
+    build_mode = "multi" if is_multi_node else "single"
+    seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
+    
+    # Always validate if segment directory exists with prior work
+    if _has_segment_files(seg_dir) or _read_build_meta(seg_dir) is not None:
+        _validate_shard_consistency(seg_dir, args.num_shards, current_mode=build_mode)
+    
+    # Write build metadata if this is a fresh start
+    # For multi-node: producer 0 writes it; for single-node: the writer writes it
+    if is_multi_node:
         if args.embed_producer and args.shard_id == 0:
             meta = _read_build_meta(seg_dir)
             if meta is None:
                 manifest_path = str(args.tar_manifest) if args.tar_manifest else None
-                _write_build_meta(seg_dir, args.num_shards, manifest_path)
+                _write_build_meta(seg_dir, args.num_shards, manifest_path, mode="multi")
+    else:
+        # Single-node mode: write metadata if fresh start
+        if args.faiss_writer:
+            meta = _read_build_meta(seg_dir)
+            if meta is None and not args.init_indices_only:
+                manifest_path = str(args.tar_manifest) if args.tar_manifest else None
+                _write_build_meta(seg_dir, args.num_shards, manifest_path, mode="single")
 
     # Use shard-specific DB for producers (lock-free parallel writes)
     if args.embed_producer and not args.faiss_writer:
@@ -3359,6 +3429,12 @@ def build_or_update_indices(args):
                         # ---------- BEGIN INGEST BODY (same semantics; no member-based checkpointing here) ----------
                         pmcid = (meta["pmcid"] or "").strip()
                         pmid = (meta["pmid"] or "").strip()
+                        
+                        # Use file path as doc_id for deduplication across shards
+                        # Each tar member is unique, and load-balanced sharding ensures
+                        # each tar file goes to exactly one producer, so no cross-shard dupes.
+                        # The path is already in f = "tar://tpath!/m.name" format.
+                        doc_id = str(f)
 
                         pid_row = None
                         if pmcid:
@@ -3371,10 +3447,15 @@ def build_or_update_indices(args):
                             ).fetchone()
                         if pid_row:
                             pid = pid_row[0]
+                            # Update doc_id if missing (for legacy rows)
+                            cur.execute(
+                                "UPDATE papers SET doc_id = ? WHERE id = ? AND (doc_id IS NULL OR doc_id = '')",
+                                (doc_id, pid)
+                            )
                         else:
                             cur.execute(
-                                "INSERT INTO papers(pmid, pmcid, title, abstract) VALUES (?,?,?,?)",
-                                (pmid, pmcid, meta["title"], meta["abstract"]),
+                                "INSERT INTO papers(doc_id, pmid, pmcid, title, abstract) VALUES (?,?,?,?,?)",
+                                (doc_id, pmid, pmcid, meta["title"], meta["abstract"]),
                             )
                             pid = cur.lastrowid
 

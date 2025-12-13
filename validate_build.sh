@@ -51,32 +51,32 @@ if [[ ! -d "$INDICES_DIR" ]]; then
     ERRORS=$((ERRORS + 1))
 else
     # Check papers index
-    PAPERS_INDEX="${INDICES_DIR}/papers.index"
+    PAPERS_INDEX="${INDICES_DIR}/papers.faiss"
     if [[ -f "$PAPERS_INDEX" ]]; then
         SIZE=$(ls -lh "$PAPERS_INDEX" | awk '{print $5}')
         BYTES=$(stat -f%z "$PAPERS_INDEX" 2>/dev/null || stat -c%s "$PAPERS_INDEX" 2>/dev/null || echo 0)
         if [[ "$BYTES" -gt 1000 ]]; then
-            echo "  ✅ papers.index exists ($SIZE)"
+            echo "  ✅ papers.faiss exists ($SIZE)"
         else
-            echo "  ⚠️  papers.index exists but is very small ($SIZE)"
+            echo "  ⚠️  papers.faiss exists but is very small ($SIZE)"
         fi
     else
-        echo "  ❌ papers.index not found"
+        echo "  ❌ papers.faiss not found"
         ERRORS=$((ERRORS + 1))
     fi
 
     # Check chunks index
-    CHUNKS_INDEX="${INDICES_DIR}/chunks.index"
+    CHUNKS_INDEX="${INDICES_DIR}/chunks.faiss"
     if [[ -f "$CHUNKS_INDEX" ]]; then
         SIZE=$(ls -lh "$CHUNKS_INDEX" | awk '{print $5}')
         BYTES=$(stat -f%z "$CHUNKS_INDEX" 2>/dev/null || stat -c%s "$CHUNKS_INDEX" 2>/dev/null || echo 0)
         if [[ "$BYTES" -gt 1000 ]]; then
-            echo "  ✅ chunks.index exists ($SIZE)"
+            echo "  ✅ chunks.faiss exists ($SIZE)"
         else
-            echo "  ⚠️  chunks.index exists but is very small ($SIZE)"
+            echo "  ⚠️  chunks.faiss exists but is very small ($SIZE)"
         fi
     else
-        echo "  ❌ chunks.index not found"
+        echo "  ❌ chunks.faiss not found"
         ERRORS=$((ERRORS + 1))
     fi
 fi
