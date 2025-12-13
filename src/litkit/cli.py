@@ -2976,14 +2976,12 @@ def build_or_update_indices(args):
         def progress_callback(complete, total):
             _eprint(f"[consumer] Progress: {complete}/{total} producers complete")
         
+        # Wait for all producers to complete WITHOUT ingesting segments yet.
+        # We cannot ingest segments until the DB merge is complete, because
+        # segment files use doc_id (content-addressed) which must be resolved
+        # against the merged main database, not the empty initial DB.
         while not consumer_coordinator.all_producers_complete():
-            p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
-            c_added = _ingest_chunk_segments(conn, chunk_index, seg_dir)
-            
-            if p_added or c_added:
-                _eprint(f"[consumer] Ingested {p_added} paper vectors and {c_added} chunk vectors")
-            else:
-                _eprint("[consumer] No new segments found, waiting for producers to complete...")
+            _eprint("[consumer] Waiting for producers to complete...")
             
             # Wait for completion or timeout
             # Timeout set to 10 hours (36000s) to match the cluster's max job time
@@ -2991,19 +2989,28 @@ def build_or_update_indices(args):
                 _eprint("[consumer] All producers have completed")
                 break
         
-        # Merge all shard databases into the main database
-        # This must happen after all producers complete but before segment ingestion
-        # so that the consumer has a unified view of all papers/chunks for backfill
-        _eprint("[consumer] Merging shard databases...")
+        # Merge all shard databases into the main database FIRST.
+        # This populates the main DB with all papers/chunks so that
+        # doc_id → paper_id resolution works during segment ingestion.
+        _eprint("[consumer] All producers complete, merging shard databases...")
         merge_stats = merge_shard_databases(conn, delete_after_merge=True)
         if merge_stats["shards"] > 0:
             _eprint(f"[consumer] Merged {merge_stats['shards']} shard DB(s): "
                     f"{merge_stats['papers']} papers, {merge_stats['chunks']} chunks, {merge_stats['files']} files")
         
-        # Final ingestion pass after all producers have completed
+        # NOW ingest segments - the main DB has all the data for doc_id resolution
+        _eprint("[consumer] Ingesting embedding segments...")
         p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
         c_added = _ingest_chunk_segments(conn, chunk_index, seg_dir)
-        _eprint(f"[consumer] Final ingestion: {p_added} paper vectors and {c_added} chunk vectors")
+        _eprint(f"[consumer] Ingested {p_added} paper vectors and {c_added} chunk vectors")
+        
+        # Force save indices after ingestion
+        with FileLock(FAISS_LOCK):
+            _faiss_save_force(paper_index, PAPER_INDEX_PATH)
+            _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+        with FileLock(DB_LOCK):
+            _flush_pending_marks(conn.cursor())
+            conn.commit()
         
         _eprint("[consumer] Consume-only mode completed")
         return  # End consume-only mode
