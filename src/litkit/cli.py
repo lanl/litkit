@@ -922,6 +922,12 @@ def _pick_nprobe(nlist: int, user: int | None) -> int:
 
 
 class _SegmentWriter:
+    """Writes paper embedding segments to disk using doc_id (globally unique file path) for identification.
+    
+    Format: NPZ with keys 'doc_ids' (object array of strings), 'vecs' (float16/float32), 'dim', 'count'.
+    The doc_id is the canonical file path (e.g., "tar:///path/to/file.tar!/member.nxml") which is
+    globally unique across all shards and stable across DB merges.
+    """
     def __init__(self, outdir: Path, segment_size: int, dtype: str, shard_id: int, kind: str):
         self.outdir = Path(outdir)
         self.outdir.mkdir(parents=True, exist_ok=True)
@@ -937,15 +943,22 @@ class _SegmentWriter:
         self.seq += 1
         return p
 
-    def write(self, ids: np.ndarray, vecs: np.ndarray):
-        if ids.size == 0:
+    def write(self, doc_ids: list[str], vecs: np.ndarray):
+        """Write paper embeddings to segment file.
+        
+        Args:
+            doc_ids: List of doc_id strings (globally unique file paths)
+            vecs: Embedding vectors (N x dim)
+        """
+        if len(doc_ids) == 0:
             return
         if vecs.dtype != self.dtype:
             vecs = vecs.astype(self.dtype, copy=False)
 
-        for start in range(0, ids.shape[0], self.segment_size):
-            end = min(ids.shape[0], start + self.segment_size)
-            ids_i = np.ascontiguousarray(ids[start:end], dtype=np.int64)
+        N = len(doc_ids)
+        for start in range(0, N, self.segment_size):
+            end = min(N, start + self.segment_size)
+            doc_ids_i = np.array(doc_ids[start:end], dtype=object)
             vecs_i = np.ascontiguousarray(vecs[start:end])
             dim = vecs_i.shape[1]
 
@@ -956,7 +969,7 @@ class _SegmentWriter:
             final.parent.mkdir(parents=True, exist_ok=True)
             with open(tmp, "wb") as fh:
                 np.savez(
-                    fh, ids=ids_i, vecs=vecs_i, dim=np.int32(dim), count=np.int32(ids_i.shape[0])
+                    fh, doc_ids=doc_ids_i, vecs=vecs_i, dim=np.int32(dim), count=np.int32(len(doc_ids_i))
                 )
                 try:
                     if os.environ.get("LITKIT_SEGMENT_FSYNC_FILE", "1") == "1":
@@ -1518,10 +1531,17 @@ def _flush_pending_marks(cur):
 
 
 class _ChunkSegmentWriter:
-    """Writes chunk embedding segments to a single .npz file per segment:
-      keys: 'ids' (int64), 'vecs' (float16/float32), 'dim' (int32), 'count' (int32)
-    File name format:
-      chunks_sh{shard:02d}_{ts}_{seq:06d}.npz
+    """Writes chunk embedding segments to disk using (paper_doc_id, ord) for identification.
+    
+    Format: NPZ with keys:
+      - 'paper_doc_ids': object array of strings (parent paper's doc_id)
+      - 'ords': int32 array (chunk ordinal within paper: -1=title/abstract, 0,1,2...=body)
+      - 'vecs': float16/float32 embedding vectors
+      - 'dim': int32 embedding dimension
+      - 'count': int32 number of vectors
+    
+    The combination (paper_doc_id, ord) uniquely identifies a chunk globally across all shards.
+    File name format: chunks_sh{shard:02d}_{ts}_{seq:06d}.npz
     """
 
     def __init__(self, outdir: Path, segment_size: int, dtype: str, shard_id: int):
@@ -1538,17 +1558,25 @@ class _ChunkSegmentWriter:
         self.seq += 1
         return p
 
-    def write(self, ids: np.ndarray, vecs: np.ndarray):
-        if ids.size == 0:
+    def write(self, paper_doc_ids: list[str], ords: list[int], vecs: np.ndarray):
+        """Write chunk embeddings to segment file.
+        
+        Args:
+            paper_doc_ids: List of doc_id strings for each chunk's parent paper
+            ords: List of chunk ordinals (-1 for title/abstract, 0+ for body chunks)
+            vecs: Embedding vectors (N x dim)
+        """
+        if len(paper_doc_ids) == 0:
             return
-        assert ids.shape[0] == vecs.shape[0], "ids/vecs length mismatch"
+        assert len(paper_doc_ids) == len(ords) == vecs.shape[0], "paper_doc_ids/ords/vecs length mismatch"
         if vecs.dtype != self.dtype:
             vecs = vecs.astype(self.dtype, copy=False)
 
-        N = ids.shape[0]
+        N = len(paper_doc_ids)
         for start in range(0, N, self.segment_size):
             end = min(N, start + self.segment_size)
-            ids_i = np.ascontiguousarray(ids[start:end], dtype=np.int64)
+            doc_ids_i = np.array(paper_doc_ids[start:end], dtype=object)
+            ords_i = np.array(ords[start:end], dtype=np.int32)
             vecs_i = np.ascontiguousarray(vecs[start:end])
             dim = vecs_i.shape[1]
 
@@ -1558,7 +1586,8 @@ class _ChunkSegmentWriter:
             final.parent.mkdir(parents=True, exist_ok=True)
             with open(tmp, "wb") as fh:
                 np.savez(
-                    fh, ids=ids_i, vecs=vecs_i, dim=np.int32(dim), count=np.int32(ids_i.shape[0])
+                    fh, paper_doc_ids=doc_ids_i, ords=ords_i, vecs=vecs_i, 
+                    dim=np.int32(dim), count=np.int32(len(doc_ids_i))
                 )
                 try:
                     if os.environ.get("LITKIT_SEGMENT_FSYNC_FILE", "1") == "1":
@@ -1768,6 +1797,11 @@ def _segment_write(
 
 
 def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int = 2):
+    """Ingest paper embedding segments from producer nodes.
+    
+    Segments contain doc_ids (globally unique file paths) and embeddings.
+    At ingestion time, we resolve doc_id → paper_id using the merged main DB.
+    """
     outdir = Path(outdir)
     if not outdir.exists():
         return 0
@@ -1793,16 +1827,48 @@ def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int =
             except Exception:
                 continue
         try:
-            with np.load(tmp, mmap_mode="r") as z:
+            with np.load(tmp, mmap_mode="r", allow_pickle=True) as z:
                 if "kind" in z.files and str(z["kind"].item()).strip() != "papers":
                     raise ValueError("wrong segment kind for paper ingester")
-                if "ids" in z and ("vecs" in z or "emb" in z):
+                
+                # New format: doc_ids + vecs (content-addressed)
+                if "doc_ids" in z.files and "vecs" in z.files:
+                    doc_ids = z["doc_ids"]  # object array of strings
+                    X = np.ascontiguousarray(z["vecs"].astype(np.float32))
+                    
+                    # Resolve doc_id → paper_id from main DB
+                    resolved_ids = []
+                    valid_mask = []
+                    for i, doc_id in enumerate(doc_ids):
+                        doc_id_str = str(doc_id)
+                        row = cur.execute(
+                            "SELECT id FROM papers WHERE doc_id = ?", (doc_id_str,)
+                        ).fetchone()
+                        if row:
+                            resolved_ids.append(row[0])
+                            valid_mask.append(True)
+                        else:
+                            # Paper not in merged DB yet - skip this embedding
+                            valid_mask.append(False)
+                    
+                    if not resolved_ids:
+                        os.remove(tmp)
+                        continue
+                    
+                    # Filter to only valid entries
+                    valid_mask = np.array(valid_mask, dtype=bool)
+                    ids = np.array(resolved_ids, dtype=np.int64)
+                    X = X[valid_mask]
+                
+                # Legacy format: ids + vecs (shard-local IDs, deprecated)
+                elif "ids" in z.files and ("vecs" in z.files or "emb" in z.files):
                     ids = np.ascontiguousarray(z["ids"].astype(np.int64))
                     X = np.ascontiguousarray(
-                        (z["vecs"] if "vecs" in z else z["emb"]).astype(np.float32)
+                        (z["vecs"] if "vecs" in z.files else z["emb"]).astype(np.float32)
                     )
                 else:
-                    raise ValueError(f"Segment missing ids/vecs in {p.name}")
+                    raise ValueError(f"Segment missing doc_ids/vecs or ids/vecs in {p.name}")
+            
             if ids.size == 0:
                 os.remove(tmp)
                 continue
@@ -1858,7 +1924,11 @@ def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int =
 
 
 def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int = 2):
-    """Writer-only: scan `outdir` for chunk segment files and add them to FAISS.
+    """Ingest chunk embedding segments from producer nodes.
+    
+    Segments contain (paper_doc_id, ord) pairs and embeddings.
+    At ingestion time, we resolve (paper_doc_id, ord) → chunk_id using the merged main DB.
+    
     Safe file-handling:
       - rename "<file>.npz" -> "<file>.npz.ingesting" before reading (atomic)
       - if already ".npz.ingesting", read in place
@@ -1906,14 +1976,61 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
                 continue
 
         try:
-            with np.load(tmp, mmap_mode="r") as z:
+            with np.load(tmp, mmap_mode="r", allow_pickle=True) as z:
                 # Reject wrong-kind files (old .seg has 'kind')
                 if "kind" in z.files and str(z["kind"].item()).strip() != "chunks":
                     raise ValueError("wrong segment kind for chunk ingester")
-                if "ids" in z and "vecs" in z:
+                
+                # New format: paper_doc_ids + ords + vecs (content-addressed)
+                if "paper_doc_ids" in z.files and "ords" in z.files and "vecs" in z.files:
+                    paper_doc_ids = z["paper_doc_ids"]  # object array of strings
+                    ords = z["ords"]  # int32 array
+                    X = np.ascontiguousarray(z["vecs"].astype(np.float32))
+                    
+                    # Resolve (paper_doc_id, ord) → chunk_id from main DB
+                    resolved_ids = []
+                    valid_mask = []
+                    for i, (doc_id, ord_val) in enumerate(zip(paper_doc_ids, ords)):
+                        doc_id_str = str(doc_id)
+                        ord_int = int(ord_val)
+                        
+                        # First, get the paper_id from doc_id
+                        paper_row = cur.execute(
+                            "SELECT id FROM papers WHERE doc_id = ?", (doc_id_str,)
+                        ).fetchone()
+                        
+                        if paper_row:
+                            paper_id = paper_row[0]
+                            # Now get the chunk_id from (paper_id, ord)
+                            chunk_row = cur.execute(
+                                "SELECT id FROM chunks WHERE paper_id = ? AND ord = ?",
+                                (paper_id, ord_int)
+                            ).fetchone()
+                            
+                            if chunk_row:
+                                resolved_ids.append(chunk_row[0])
+                                valid_mask.append(True)
+                            else:
+                                # Chunk not in merged DB yet - skip this embedding
+                                valid_mask.append(False)
+                        else:
+                            # Paper not in merged DB yet - skip this embedding
+                            valid_mask.append(False)
+                    
+                    if not resolved_ids:
+                        os.remove(tmp)
+                        continue
+                    
+                    # Filter to only valid entries
+                    valid_mask = np.array(valid_mask, dtype=bool)
+                    ids = np.array(resolved_ids, dtype=np.int64)
+                    X = X[valid_mask]
+                
+                # Legacy format: ids + vecs (shard-local IDs, deprecated)
+                elif "ids" in z.files and "vecs" in z.files:
                     ids = np.ascontiguousarray(z["ids"].astype(np.int64))
                     X = np.ascontiguousarray(z["vecs"].astype(np.float32))
-                elif set(z.files) >= {"ids", "emb"}:
+                elif "ids" in z.files and "emb" in z.files:
                     ids = np.ascontiguousarray(z["ids"].astype(np.int64))
                     X = np.ascontiguousarray(z["emb"].astype(np.float32))
                 else:
@@ -3326,9 +3443,15 @@ def build_or_update_indices(args):
     ckpt_stream = ckpt.get("build_stream", {})
 
     paper_ids_buf, paper_texts_buf = [], []
+    paper_doc_ids_buf: list[str] = []  # Track doc_ids for content-addressed segments
     chunk_ids_buf, chunk_texts_buf = [], []
+    chunk_paper_doc_ids_buf: list[str] = []  # Track parent paper doc_ids for chunks
+    chunk_ords_buf: list[int] = []  # Track chunk ordinals within papers
     papers_added_total = 0
     chunks_added_total = 0
+    
+    # Track current paper's doc_id for chunk association
+    current_paper_doc_id: str | None = None
 
     for tpath in tar_paths:
         # Number of *persisted* members previously processed for this tar shard
