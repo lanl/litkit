@@ -35,7 +35,7 @@ fi
 : "${YES:=1}"                                # 1 = auto-confirm rebuild prompts
 
 # Corpus source (exactly one)
-: "${MANIFEST:=/path/to/litkit/workspace/test.manifest}"
+: "${MANIFEST:=/path/to/litkit/workspace/small_test.manifest}"
 : "${TAR_DIR:=}"
 
 # Retrieval/ANN controls
@@ -107,7 +107,7 @@ fi
 ### ----- CLUSTER PATHS --------------------------------------------------------
 BASE="/path/to"
 LITKIT_DIR="$BASE/litkit"
-IMG="$LITKIT_DIR/sqfs/litkit-v0.3.33-aarch64-lean.sqfs"   # keep in sync with your image
+IMG="$LITKIT_DIR/sqfs/litkit-v0.3.34-aarch64-lean.sqfs"   # keep in sync with your image
 if [[ "$TARGET" == "gh" ]]; then
   CDI_SPEC_DIR="$BASE/cdi-grace"
 else

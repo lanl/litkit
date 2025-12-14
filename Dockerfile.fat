@@ -124,7 +124,8 @@ RUN set -e; \
 # ==============================
 FROM ghcr.io/astral-sh/uv:0.9.0-bookworm AS runtime
 
-ENV PATH="/root/.local/bin:${PATH}"
+# Set PATH explicitly to silence Charliecloud "warning: $PATH not set"
+ENV PATH="/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 RUN uv python install 3.12
 
 # Bind points & wheel cache

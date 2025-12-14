@@ -1,0 +1,8 @@
+# Medium-scale multi-node test manifest
+# ~7 GB total - estimated 30-45 minutes with 3 producers
+# 4 uncompressed .tar files for good load distribution
+
+/path/to/PMC-OA/oa_noncomm_xml.PMC012xxxxxx.baseline.2025-06-26.tar
+/path/to/PMC-OA/oa_other_xml.PMC010xxxxxx.baseline.2025-06-26.tar
+/path/to/PMC-OA/oa_other_xml.PMC011xxxxxx.baseline.2025-06-26.tar
+/path/to/PMC-OA/oa_other_xml.PMC012xxxxxx.baseline.2025-06-26.tar

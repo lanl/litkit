@@ -1,0 +1,10 @@
+# Tiny test manifest for debugging multi-node merge
+# 7 small author-specific uncompressed tar files for quick testing
+# Estimated: ~few hundred papers, ~5-10 minutes processing time
+/path/to/PMC-OA/blinov_ml.tar
+/path/to/PMC-OA/faeder_jr.tar
+/path/to/PMC-OA/hlavacek_ws.tar
+/path/to/PMC-OA/perelson_as.tar
+/path/to/PMC-OA/savageau_ma.tar
+/path/to/PMC-OA/stites_ec.tar
+/path/to/PMC-OA/voit_eo.tar

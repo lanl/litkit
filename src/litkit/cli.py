@@ -302,6 +302,198 @@ DB_FILENAME = os.environ.get("LITKIT_DB_FILE", "litkit.sqlite3")
 DB_PATH = SQLITE_DIR / DB_FILENAME
 CKPT_PATH = SQLITE_DIR / "build_checkpoint.json"
 
+
+def _shard_db_path(shard_id: int) -> Path:
+    """Return path to shard-specific SQLite database for producer mode."""
+    return SQLITE_DIR / f"litkit_shard_{shard_id:02d}.sqlite3"
+
+
+def _list_shard_dbs() -> list[Path]:
+    """List all shard SQLite databases in the sqlite directory."""
+    return sorted(SQLITE_DIR.glob("litkit_shard_*.sqlite3"))
+
+
+def merge_shard_databases(main_conn, delete_after_merge: bool = True) -> dict[str, int]:
+    """Merge all per-shard SQLite databases into the main database.
+    
+    Uses INSERT OR IGNORE on doc_id for idempotent paper merging, ensuring
+    that duplicate papers (same doc_id) from different shards are not duplicated.
+    
+    Args:
+        main_conn: Connection to the main litkit.sqlite3 database
+        delete_after_merge: If True, delete shard DBs after successful merge
+    
+    Returns:
+        Dict with merge statistics: {"papers": N, "chunks": M, "files": F, "shards": S}
+    """
+    shard_dbs = _list_shard_dbs()
+    if not shard_dbs:
+        return {"papers": 0, "chunks": 0, "files": 0, "shards": 0}
+    
+    _eprint(f"[merge] Found {len(shard_dbs)} shard database(s) to merge")
+    
+    stats = {"papers": 0, "chunks": 0, "files": 0, "shards": 0}
+    main_cur = main_conn.cursor()
+    
+    for shard_db in shard_dbs:
+        _eprint(f"[merge] Processing {shard_db.name}...")
+        
+        try:
+            shard_conn = sqlite3.connect(shard_db, isolation_level="DEFERRED")
+            shard_cur = shard_conn.cursor()
+            
+            # 1) Merge papers using doc_id for deduplication
+            # First, get all papers from shard
+            shard_papers = shard_cur.execute("""
+                SELECT doc_id, pmid, pmcid, title, abstract, in_index
+                FROM papers WHERE doc_id IS NOT NULL AND doc_id != ''
+            """).fetchall()
+            
+            papers_merged = 0
+            for row in shard_papers:
+                doc_id, pmid, pmcid, title, abstract, in_index = row
+                
+                # Check if this doc_id already exists in main DB
+                existing = main_cur.execute(
+                    "SELECT id FROM papers WHERE doc_id = ?", (doc_id,)
+                ).fetchone()
+                
+                if existing is None:
+                    # Insert new paper (handle duplicate pmid/pmcid gracefully)
+                    try:
+                        main_cur.execute("""
+                            INSERT INTO papers(doc_id, pmid, pmcid, title, abstract, in_index)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, (doc_id, pmid, pmcid, title, abstract, 0))  # in_index=0, will be backfilled
+                        papers_merged += 1
+                    except sqlite3.IntegrityError as e:
+                        # Duplicate pmid/pmcid from another shard - skip silently
+                        # This can happen when tar files contain overlapping papers
+                        _eprint(f"[merge] Skipping duplicate paper: pmid={pmid} pmcid={pmcid} ({e})")
+                        continue
+            
+            stats["papers"] += papers_merged
+            
+            # 2) Build doc_id -> main paper_id mapping for chunk/file remapping
+            # This handles both newly inserted and existing papers
+            doc_id_to_main_pid = {}
+            for row in shard_papers:
+                doc_id = row[0]
+                main_row = main_cur.execute(
+                    "SELECT id FROM papers WHERE doc_id = ?", (doc_id,)
+                ).fetchone()
+                if main_row:
+                    doc_id_to_main_pid[doc_id] = main_row[0]
+            
+            # 3) Merge chunks - need to remap paper_id and handle (paper_id, ord) uniqueness
+            # Get shard paper_id -> doc_id mapping
+            shard_pid_to_docid = {
+                row[0]: row[1] for row in shard_cur.execute(
+                    "SELECT id, doc_id FROM papers WHERE doc_id IS NOT NULL AND doc_id != ''"
+                ).fetchall()
+            }
+            
+            shard_chunks = shard_cur.execute("""
+                SELECT paper_id, ord, text, in_index FROM chunks
+            """).fetchall()
+            
+            chunks_merged = 0
+            for shard_pid, ord_val, text, in_index in shard_chunks:
+                doc_id = shard_pid_to_docid.get(shard_pid)
+                if doc_id is None:
+                    continue  # Orphan chunk, skip
+                
+                main_pid = doc_id_to_main_pid.get(doc_id)
+                if main_pid is None:
+                    continue  # Paper not in main DB, skip
+                
+                # Check if this (paper_id, ord) combination already exists
+                existing_chunk = main_cur.execute(
+                    "SELECT id FROM chunks WHERE paper_id = ? AND ord = ?",
+                    (main_pid, ord_val)
+                ).fetchone()
+                
+                if existing_chunk is None:
+                    main_cur.execute("""
+                        INSERT INTO chunks(paper_id, ord, text, in_index)
+                        VALUES (?, ?, ?, ?)
+                    """, (main_pid, ord_val, text, 0))  # in_index=0, will be backfilled
+                    chunks_merged += 1
+            
+            stats["chunks"] += chunks_merged
+            
+            # 4) Merge files table - remap paper_id
+            shard_files = shard_cur.execute("""
+                SELECT path, size, mtime, paper_id FROM files
+            """).fetchall()
+            
+            files_merged = 0
+            for path, size, mtime, shard_pid in shard_files:
+                doc_id = shard_pid_to_docid.get(shard_pid)
+                if doc_id is None:
+                    continue
+                
+                main_pid = doc_id_to_main_pid.get(doc_id)
+                if main_pid is None:
+                    continue
+                
+                # Use INSERT OR REPLACE to handle path conflicts
+                main_cur.execute("""
+                    INSERT OR REPLACE INTO files(path, size, mtime, paper_id)
+                    VALUES (?, ?, ?, ?)
+                """, (path, size, mtime, main_pid))
+                files_merged += 1
+            
+            stats["files"] += files_merged
+            stats["shards"] += 1
+            
+            shard_conn.close()
+            
+            _eprint(f"[merge] {shard_db.name}: {papers_merged} papers, {chunks_merged} chunks, {files_merged} files")
+            
+            # Delete shard DB after successful merge
+            if delete_after_merge:
+                try:
+                    shard_db.unlink()
+                    _eprint(f"[merge] Deleted {shard_db.name}")
+                except Exception as e:
+                    _eprint(f"[merge] WARNING: could not delete {shard_db.name}: {e}")
+            
+        except Exception as e:
+            _eprint(f"[merge] ERROR processing {shard_db.name}: {e.__class__.__name__}: {e}")
+            # Continue with next shard
+    
+    # Commit all changes
+    main_conn.commit()
+    
+    _eprint(f"[merge] Complete: {stats['papers']} papers, {stats['chunks']} chunks, {stats['files']} files from {stats['shards']} shard(s)")
+    return stats
+
+
+def init_shard_db(shard_id: int, journal_mode: str, busy_timeout_ms: int):
+    """Initialize a shard-specific SQLite database for producer mode.
+    
+    Each producer writes to its own shard DB to avoid lock contention.
+    The consumer later merges all shard DBs into the main database.
+    """
+    shard_path = _shard_db_path(shard_id)
+    _eprint(f"[db] Producer shard {shard_id}: using {shard_path}")
+    
+    conn = sqlite3.connect(shard_path, isolation_level="DEFERRED", timeout=busy_timeout_ms / 1000.0)
+    
+    mode = (journal_mode or "TRUNCATE").upper()
+    conn.execute(f"PRAGMA journal_mode={mode};")
+    conn.execute("PRAGMA synchronous=FULL;")
+    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)};")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    
+    conn.executescript(SCHEMA)
+    _ensure_in_index_columns(conn)
+    conn.commit()
+    
+    return conn
+
+
 PROMPT_HEADROOM_TOKENS = int(os.environ.get("LITKIT_PROMPT_HEADROOM_TOKENS", "200"))
 
 
@@ -445,21 +637,23 @@ BUDGET_TOKENS_OSS20B = 3000
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS papers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  doc_id TEXT,                      -- stable document identifier (pmcid or pmid or hash)
   pmid TEXT,
   pmcid TEXT,
   title TEXT,
   abstract TEXT,
-  in_index INTEGER DEFAULT 0        -- NEW: 0=not yet in FAISS, 1=added
+  in_index INTEGER DEFAULT 0        -- 0=not yet in FAISS, 1=added
 );
 CREATE TABLE IF NOT EXISTS chunks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   paper_id INTEGER NOT NULL,
   ord INTEGER NOT NULL,
   text TEXT NOT NULL,
-  in_index INTEGER DEFAULT 0,       -- NEW: 0=not yet in FAISS, 1=added
+  in_index INTEGER DEFAULT 0,       -- 0=not yet in FAISS, 1=added
   FOREIGN KEY(paper_id) REFERENCES papers(id)
 );
 CREATE INDEX IF NOT EXISTS chunks_paper_id ON chunks(paper_id);
+CREATE INDEX IF NOT EXISTS chunks_paper_ord ON chunks(paper_id, ord);
 CREATE TABLE IF NOT EXISTS files (
   path TEXT PRIMARY KEY,
   size INTEGER,
@@ -468,6 +662,7 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS papers_pmcid_uq ON papers(pmcid) WHERE pmcid <> '';
 CREATE UNIQUE INDEX IF NOT EXISTS papers_pmid_uq  ON papers(pmid)  WHERE pmid  <> '';
+CREATE UNIQUE INDEX IF NOT EXISTS papers_doc_id_uq ON papers(doc_id) WHERE doc_id <> '';
 """
 
 
@@ -622,12 +817,20 @@ def init_db(journal_mode: str, busy_timeout_ms: int):
 
 
 def _ensure_in_index_columns(conn):
-    """Idempotent migration: ensure `in_index` exists on {papers,chunks}."""
+    """Idempotent migration: ensure `in_index` and `doc_id` columns exist."""
     cur = conn.cursor()
     for table in ("papers", "chunks"):
         cols = {row[1] for row in cur.execute(f"PRAGMA table_info({table})")}
         if "in_index" not in cols:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN in_index INTEGER DEFAULT 0")
+    
+    # Ensure doc_id column exists on papers table (for multi-producer deduplication)
+    papers_cols = {row[1] for row in cur.execute("PRAGMA table_info(papers)")}
+    if "doc_id" not in papers_cols:
+        cur.execute("ALTER TABLE papers ADD COLUMN doc_id TEXT")
+        # Create unique index for doc_id if it doesn't exist
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS papers_doc_id_uq ON papers(doc_id) WHERE doc_id <> ''")
+    
     conn.commit()
 
 
@@ -678,6 +881,37 @@ def _dedupe_ids_and_texts(ids: list[int], texts: list[str]) -> tuple[list[int], 
     return out_ids, out_texts
 
 
+def _dedupe_papers_with_doc_ids(
+    ids: list[int], texts: list[str], doc_ids: list[str]
+) -> tuple[list[int], list[str], list[str]]:
+    """Keep the first occurrence of each id; return aligned id/text/doc_id lists."""
+    out_ids, out_texts, out_doc_ids, seen = [], [], [], set()
+    for i, t, d in zip(ids, texts, doc_ids, strict=False):
+        if i in seen:
+            continue
+        seen.add(i)
+        out_ids.append(i)
+        out_texts.append(t)
+        out_doc_ids.append(d)
+    return out_ids, out_texts, out_doc_ids
+
+
+def _dedupe_chunks_with_doc_ids(
+    ids: list[int], texts: list[str], paper_doc_ids: list[str], ords: list[int]
+) -> tuple[list[int], list[str], list[str], list[int]]:
+    """Keep the first occurrence of each id; return aligned id/text/paper_doc_id/ord lists."""
+    out_ids, out_texts, out_doc_ids, out_ords, seen = [], [], [], [], set()
+    for i, t, d, o in zip(ids, texts, paper_doc_ids, ords, strict=False):
+        if i in seen:
+            continue
+        seen.add(i)
+        out_ids.append(i)
+        out_texts.append(t)
+        out_doc_ids.append(d)
+        out_ords.append(o)
+    return out_ids, out_texts, out_doc_ids, out_ords
+
+
 # -------------------- Embedders --------------------
 import faiss
 import numpy as np
@@ -719,6 +953,12 @@ def _pick_nprobe(nlist: int, user: int | None) -> int:
 
 
 class _SegmentWriter:
+    """Writes paper embedding segments to disk using doc_id (globally unique file path) for identification.
+    
+    Format: NPZ with keys 'doc_ids' (object array of strings), 'vecs' (float16/float32), 'dim', 'count'.
+    The doc_id is the canonical file path (e.g., "tar:///path/to/file.tar!/member.nxml") which is
+    globally unique across all shards and stable across DB merges.
+    """
     def __init__(self, outdir: Path, segment_size: int, dtype: str, shard_id: int, kind: str):
         self.outdir = Path(outdir)
         self.outdir.mkdir(parents=True, exist_ok=True)
@@ -734,15 +974,22 @@ class _SegmentWriter:
         self.seq += 1
         return p
 
-    def write(self, ids: np.ndarray, vecs: np.ndarray):
-        if ids.size == 0:
+    def write(self, doc_ids: list[str], vecs: np.ndarray):
+        """Write paper embeddings to segment file.
+        
+        Args:
+            doc_ids: List of doc_id strings (globally unique file paths)
+            vecs: Embedding vectors (N x dim)
+        """
+        if len(doc_ids) == 0:
             return
         if vecs.dtype != self.dtype:
             vecs = vecs.astype(self.dtype, copy=False)
 
-        for start in range(0, ids.shape[0], self.segment_size):
-            end = min(ids.shape[0], start + self.segment_size)
-            ids_i = np.ascontiguousarray(ids[start:end], dtype=np.int64)
+        N = len(doc_ids)
+        for start in range(0, N, self.segment_size):
+            end = min(N, start + self.segment_size)
+            doc_ids_i = np.array(doc_ids[start:end], dtype=object)
             vecs_i = np.ascontiguousarray(vecs[start:end])
             dim = vecs_i.shape[1]
 
@@ -753,7 +1000,7 @@ class _SegmentWriter:
             final.parent.mkdir(parents=True, exist_ok=True)
             with open(tmp, "wb") as fh:
                 np.savez(
-                    fh, ids=ids_i, vecs=vecs_i, dim=np.int32(dim), count=np.int32(ids_i.shape[0])
+                    fh, doc_ids=doc_ids_i, vecs=vecs_i, dim=np.int32(dim), count=np.int32(len(doc_ids_i))
                 )
                 try:
                     if os.environ.get("LITKIT_SEGMENT_FSYNC_FILE", "1") == "1":
@@ -764,6 +1011,157 @@ class _SegmentWriter:
 
             os.replace(tmp, final)
             _maybe_fsync_dir(final)
+
+
+# -------------------- Build Metadata (shard consistency) --------------------
+BUILD_META_FILE = ".build_meta.json"
+
+
+def _write_build_meta(seg_dir: Path, num_shards: int, manifest_path: str | None = None, *, mode: str = "single") -> None:
+    """Write build metadata to segment directory for shard consistency checking.
+    
+    Args:
+        seg_dir: Directory to write metadata to
+        num_shards: Number of producer shards (0 or 1 for single-node mode)
+        manifest_path: Optional path to the tar manifest file
+        mode: Build mode - "single" for single-node, "multi" for multi-node producer/consumer
+    """
+    seg_dir = Path(seg_dir)
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = seg_dir / BUILD_META_FILE
+    
+    meta = {
+        "num_shards": num_shards,
+        "mode": mode,  # "single" or "multi"
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "timestamp": int(time.time()),
+        "hostname": socket.gethostname(),
+        "manifest": manifest_path,
+    }
+    
+    tmp = meta_path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        f.write(json.dumps(meta, indent=2))
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    os.replace(tmp, meta_path)
+    _maybe_fsync_dir(meta_path)
+    _eprint(f"[build] Wrote build metadata: mode={mode}, num_shards={num_shards}")
+
+
+def _read_build_meta(seg_dir: Path) -> dict | None:
+    """Read build metadata from segment directory. Returns None if not found."""
+    meta_path = Path(seg_dir) / BUILD_META_FILE
+    if not meta_path.exists():
+        return None
+    try:
+        return json.loads(meta_path.read_text())
+    except Exception as e:
+        _eprint(f"[build] WARNING: could not read {meta_path}: {e}")
+        return None
+
+
+def _has_segment_files(seg_dir: Path) -> bool:
+    """Check if segment directory has any .npz files (indicating prior work)."""
+    seg_dir = Path(seg_dir)
+    if not seg_dir.exists():
+        return False
+    return bool(list(seg_dir.glob("*.npz")) or list(seg_dir.glob(".shard_*_complete")))
+
+
+def _validate_shard_consistency(seg_dir: Path, current_num_shards: int, *, current_mode: str = "single") -> None:
+    """Validate that current shard count and mode match any existing build.
+    
+    Args:
+        seg_dir: Directory containing build metadata and segments
+        current_num_shards: Number of producer shards for this run
+        current_mode: Build mode - "single" for single-node, "multi" for multi-node
+    
+    Raises SystemExit if there's a mismatch to prevent data corruption.
+    """
+    seg_dir = Path(seg_dir)
+    meta = _read_build_meta(seg_dir)
+    has_segments = _has_segment_files(seg_dir)
+    
+    if meta is not None:
+        stored_shards = meta.get("num_shards")
+        stored_mode = meta.get("mode", "single")  # Default to "single" for legacy builds
+        started_at = meta.get("started_at", "unknown")
+        
+        # Check for mode mismatch (prevents resuming multi-node with single-node or vice versa)
+        if stored_mode != current_mode:
+            if stored_mode == "multi" and current_mode == "single":
+                raise SystemExit(
+                    f"\n[ERROR] Build mode mismatch!\n"
+                    f"  Existing build: multi-node ({stored_shards} shards, started {started_at})\n"
+                    f"  Current request: single-node\n"
+                    f"\n"
+                    f"You cannot resume a multi-node build with single-node mode.\n"
+                    f"\n"
+                    f"Options:\n"
+                    f"  1. Resume with multi-node:\n"
+                    f"       sbatch -N{stored_shards + 1} vector_build_multi.sbatch\n"
+                    f"       (N = num_shards + 1 for the consumer node)\n"
+                    f"\n"
+                    f"  2. Start fresh (DELETES ALL EXISTING WORK):\n"
+                    f"       rm -rf {seg_dir}/*\n"
+                    f"       rm -rf {SQLITE_DIR}/*\n"
+                    f"       rm -rf {INDICES_DIR}/*\n"
+                    f"       # Then resubmit your single-node job\n"
+                )
+            elif stored_mode == "single" and current_mode == "multi":
+                raise SystemExit(
+                    f"\n[ERROR] Build mode mismatch!\n"
+                    f"  Existing build: single-node (started {started_at})\n"
+                    f"  Current request: multi-node ({current_num_shards} shards)\n"
+                    f"\n"
+                    f"You cannot resume a single-node build with multi-node mode.\n"
+                    f"\n"
+                    f"Options:\n"
+                    f"  1. Resume with single-node:\n"
+                    f"       sbatch vector_build_single.sbatch\n"
+                    f"\n"
+                    f"  2. Start fresh (DELETES ALL EXISTING WORK):\n"
+                    f"       rm -rf {seg_dir}/*\n"
+                    f"       rm -rf {SQLITE_DIR}/*\n"
+                    f"       rm -rf {INDICES_DIR}/*\n"
+                    f"       # Then resubmit your multi-node job\n"
+                )
+        
+        # Check for shard count mismatch (only relevant for multi-node mode)
+        if current_mode == "multi" and stored_shards is not None and stored_shards != current_num_shards:
+            raise SystemExit(
+                f"\n[ERROR] Shard count mismatch!\n"
+                f"  Existing build: {stored_shards} shards (started {started_at})\n"
+                f"  Current request: {current_num_shards} shards\n"
+                f"\n"
+                f"Options:\n"
+                f"  1. Resume with matching shard count:\n"
+                f"       sbatch -N{stored_shards + 1} vector_build_multi.sbatch\n"
+                f"       (N = num_shards + 1 for the consumer node)\n"
+                f"\n"
+                f"  2. Start fresh (DELETES ALL EXISTING WORK):\n"
+                f"       rm -rf {seg_dir}/*\n"
+                f"       rm -rf {SQLITE_DIR}/*\n"
+                f"       rm -rf {INDICES_DIR}/*\n"
+                f"       # Then resubmit your job\n"
+            )
+        # Mode and shard count match, good to proceed
+        return
+    
+    # No metadata file
+    if has_segments:
+        # Legacy case: segments exist but no metadata
+        _eprint(
+            f"[build] WARNING: Found segment files but no {BUILD_META_FILE}. "
+            f"Assuming current settings (mode={current_mode}, shards={current_num_shards}) are correct. "
+            f"Writing metadata for future runs."
+        )
+        _write_build_meta(seg_dir, current_num_shards, mode=current_mode)
+    # else: Fresh start, metadata will be written by the first producer
 
 
 class ProducerCoordinator:
@@ -1164,10 +1562,17 @@ def _flush_pending_marks(cur):
 
 
 class _ChunkSegmentWriter:
-    """Writes chunk embedding segments to a single .npz file per segment:
-      keys: 'ids' (int64), 'vecs' (float16/float32), 'dim' (int32), 'count' (int32)
-    File name format:
-      chunks_sh{shard:02d}_{ts}_{seq:06d}.npz
+    """Writes chunk embedding segments to disk using (paper_doc_id, ord) for identification.
+    
+    Format: NPZ with keys:
+      - 'paper_doc_ids': object array of strings (parent paper's doc_id)
+      - 'ords': int32 array (chunk ordinal within paper: -1=title/abstract, 0,1,2...=body)
+      - 'vecs': float16/float32 embedding vectors
+      - 'dim': int32 embedding dimension
+      - 'count': int32 number of vectors
+    
+    The combination (paper_doc_id, ord) uniquely identifies a chunk globally across all shards.
+    File name format: chunks_sh{shard:02d}_{ts}_{seq:06d}.npz
     """
 
     def __init__(self, outdir: Path, segment_size: int, dtype: str, shard_id: int):
@@ -1184,17 +1589,25 @@ class _ChunkSegmentWriter:
         self.seq += 1
         return p
 
-    def write(self, ids: np.ndarray, vecs: np.ndarray):
-        if ids.size == 0:
+    def write(self, paper_doc_ids: list[str], ords: list[int], vecs: np.ndarray):
+        """Write chunk embeddings to segment file.
+        
+        Args:
+            paper_doc_ids: List of doc_id strings for each chunk's parent paper
+            ords: List of chunk ordinals (-1 for title/abstract, 0+ for body chunks)
+            vecs: Embedding vectors (N x dim)
+        """
+        if len(paper_doc_ids) == 0:
             return
-        assert ids.shape[0] == vecs.shape[0], "ids/vecs length mismatch"
+        assert len(paper_doc_ids) == len(ords) == vecs.shape[0], "paper_doc_ids/ords/vecs length mismatch"
         if vecs.dtype != self.dtype:
             vecs = vecs.astype(self.dtype, copy=False)
 
-        N = ids.shape[0]
+        N = len(paper_doc_ids)
         for start in range(0, N, self.segment_size):
             end = min(N, start + self.segment_size)
-            ids_i = np.ascontiguousarray(ids[start:end], dtype=np.int64)
+            doc_ids_i = np.array(paper_doc_ids[start:end], dtype=object)
+            ords_i = np.array(ords[start:end], dtype=np.int32)
             vecs_i = np.ascontiguousarray(vecs[start:end])
             dim = vecs_i.shape[1]
 
@@ -1204,7 +1617,8 @@ class _ChunkSegmentWriter:
             final.parent.mkdir(parents=True, exist_ok=True)
             with open(tmp, "wb") as fh:
                 np.savez(
-                    fh, ids=ids_i, vecs=vecs_i, dim=np.int32(dim), count=np.int32(ids_i.shape[0])
+                    fh, paper_doc_ids=doc_ids_i, ords=ords_i, vecs=vecs_i, 
+                    dim=np.int32(dim), count=np.int32(len(doc_ids_i))
                 )
                 try:
                     if os.environ.get("LITKIT_SEGMENT_FSYNC_FILE", "1") == "1":
@@ -1414,6 +1828,11 @@ def _segment_write(
 
 
 def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int = 2):
+    """Ingest paper embedding segments from producer nodes.
+    
+    Segments contain doc_ids (globally unique file paths) and embeddings.
+    At ingestion time, we resolve doc_id → paper_id using the merged main DB.
+    """
     outdir = Path(outdir)
     if not outdir.exists():
         return 0
@@ -1439,16 +1858,48 @@ def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int =
             except Exception:
                 continue
         try:
-            with np.load(tmp, mmap_mode="r") as z:
+            with np.load(tmp, mmap_mode="r", allow_pickle=True) as z:
                 if "kind" in z.files and str(z["kind"].item()).strip() != "papers":
                     raise ValueError("wrong segment kind for paper ingester")
-                if "ids" in z and ("vecs" in z or "emb" in z):
+                
+                # New format: doc_ids + vecs (content-addressed)
+                if "doc_ids" in z.files and "vecs" in z.files:
+                    doc_ids = z["doc_ids"]  # object array of strings
+                    X = np.ascontiguousarray(z["vecs"].astype(np.float32))
+                    
+                    # Resolve doc_id → paper_id from main DB
+                    resolved_ids = []
+                    valid_mask = []
+                    for i, doc_id in enumerate(doc_ids):
+                        doc_id_str = str(doc_id)
+                        row = cur.execute(
+                            "SELECT id FROM papers WHERE doc_id = ?", (doc_id_str,)
+                        ).fetchone()
+                        if row:
+                            resolved_ids.append(row[0])
+                            valid_mask.append(True)
+                        else:
+                            # Paper not in merged DB yet - skip this embedding
+                            valid_mask.append(False)
+                    
+                    if not resolved_ids:
+                        os.remove(tmp)
+                        continue
+                    
+                    # Filter to only valid entries
+                    valid_mask = np.array(valid_mask, dtype=bool)
+                    ids = np.array(resolved_ids, dtype=np.int64)
+                    X = X[valid_mask]
+                
+                # Legacy format: ids + vecs (shard-local IDs, deprecated)
+                elif "ids" in z.files and ("vecs" in z.files or "emb" in z.files):
                     ids = np.ascontiguousarray(z["ids"].astype(np.int64))
                     X = np.ascontiguousarray(
-                        (z["vecs"] if "vecs" in z else z["emb"]).astype(np.float32)
+                        (z["vecs"] if "vecs" in z.files else z["emb"]).astype(np.float32)
                     )
                 else:
-                    raise ValueError(f"Segment missing ids/vecs in {p.name}")
+                    raise ValueError(f"Segment missing doc_ids/vecs or ids/vecs in {p.name}")
+            
             if ids.size == 0:
                 os.remove(tmp)
                 continue
@@ -1504,7 +1955,11 @@ def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int =
 
 
 def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int = 2):
-    """Writer-only: scan `outdir` for chunk segment files and add them to FAISS.
+    """Ingest chunk embedding segments from producer nodes.
+    
+    Segments contain (paper_doc_id, ord) pairs and embeddings.
+    At ingestion time, we resolve (paper_doc_id, ord) → chunk_id using the merged main DB.
+    
     Safe file-handling:
       - rename "<file>.npz" -> "<file>.npz.ingesting" before reading (atomic)
       - if already ".npz.ingesting", read in place
@@ -1552,14 +2007,61 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
                 continue
 
         try:
-            with np.load(tmp, mmap_mode="r") as z:
+            with np.load(tmp, mmap_mode="r", allow_pickle=True) as z:
                 # Reject wrong-kind files (old .seg has 'kind')
                 if "kind" in z.files and str(z["kind"].item()).strip() != "chunks":
                     raise ValueError("wrong segment kind for chunk ingester")
-                if "ids" in z and "vecs" in z:
+                
+                # New format: paper_doc_ids + ords + vecs (content-addressed)
+                if "paper_doc_ids" in z.files and "ords" in z.files and "vecs" in z.files:
+                    paper_doc_ids = z["paper_doc_ids"]  # object array of strings
+                    ords = z["ords"]  # int32 array
+                    X = np.ascontiguousarray(z["vecs"].astype(np.float32))
+                    
+                    # Resolve (paper_doc_id, ord) → chunk_id from main DB
+                    resolved_ids = []
+                    valid_mask = []
+                    for i, (doc_id, ord_val) in enumerate(zip(paper_doc_ids, ords)):
+                        doc_id_str = str(doc_id)
+                        ord_int = int(ord_val)
+                        
+                        # First, get the paper_id from doc_id
+                        paper_row = cur.execute(
+                            "SELECT id FROM papers WHERE doc_id = ?", (doc_id_str,)
+                        ).fetchone()
+                        
+                        if paper_row:
+                            paper_id = paper_row[0]
+                            # Now get the chunk_id from (paper_id, ord)
+                            chunk_row = cur.execute(
+                                "SELECT id FROM chunks WHERE paper_id = ? AND ord = ?",
+                                (paper_id, ord_int)
+                            ).fetchone()
+                            
+                            if chunk_row:
+                                resolved_ids.append(chunk_row[0])
+                                valid_mask.append(True)
+                            else:
+                                # Chunk not in merged DB yet - skip this embedding
+                                valid_mask.append(False)
+                        else:
+                            # Paper not in merged DB yet - skip this embedding
+                            valid_mask.append(False)
+                    
+                    if not resolved_ids:
+                        os.remove(tmp)
+                        continue
+                    
+                    # Filter to only valid entries
+                    valid_mask = np.array(valid_mask, dtype=bool)
+                    ids = np.array(resolved_ids, dtype=np.int64)
+                    X = X[valid_mask]
+                
+                # Legacy format: ids + vecs (shard-local IDs, deprecated)
+                elif "ids" in z.files and "vecs" in z.files:
                     ids = np.ascontiguousarray(z["ids"].astype(np.int64))
                     X = np.ascontiguousarray(z["vecs"].astype(np.float32))
-                elif set(z.files) >= {"ids", "emb"}:
+                elif "ids" in z.files and "emb" in z.files:
                     ids = np.ascontiguousarray(z["ids"].astype(np.int64))
                     X = np.ascontiguousarray(z["emb"].astype(np.float32))
                 else:
@@ -2391,8 +2893,39 @@ def build_or_update_indices(args):
         # nothing to do
         return
 
-    _eprint(f"[build] using DB at {DB_PATH}")
-    conn = init_db(args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
+    # Validate build mode and shard count consistency BEFORE any work begins
+    # Determine the build mode based on args
+    is_multi_node = args.num_shards > 1 or args.embed_producer or args.consume_only
+    build_mode = "multi" if is_multi_node else "single"
+    seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
+    
+    # Always validate if segment directory exists with prior work
+    if _has_segment_files(seg_dir) or _read_build_meta(seg_dir) is not None:
+        _validate_shard_consistency(seg_dir, args.num_shards, current_mode=build_mode)
+    
+    # Write build metadata if this is a fresh start
+    # For multi-node: producer 0 writes it; for single-node: the writer writes it
+    if is_multi_node:
+        if args.embed_producer and args.shard_id == 0:
+            meta = _read_build_meta(seg_dir)
+            if meta is None:
+                manifest_path = str(args.tar_manifest) if args.tar_manifest else None
+                _write_build_meta(seg_dir, args.num_shards, manifest_path, mode="multi")
+    else:
+        # Single-node mode: write metadata if fresh start
+        if args.faiss_writer:
+            meta = _read_build_meta(seg_dir)
+            if meta is None and not args.init_indices_only:
+                manifest_path = str(args.tar_manifest) if args.tar_manifest else None
+                _write_build_meta(seg_dir, args.num_shards, manifest_path, mode="single")
+
+    # Use shard-specific DB for producers (lock-free parallel writes)
+    if args.embed_producer and not args.faiss_writer:
+        _eprint(f"[build] Producer mode: using shard-specific DB for shard {args.shard_id}")
+        conn = init_shard_db(args.shard_id, args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
+    else:
+        _eprint(f"[build] using DB at {DB_PATH}")
+        conn = init_db(args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
     cur = conn.cursor()
 
     if args.init_indices_only:
@@ -2443,24 +2976,41 @@ def build_or_update_indices(args):
         def progress_callback(complete, total):
             _eprint(f"[consumer] Progress: {complete}/{total} producers complete")
         
+        # Wait for all producers to complete WITHOUT ingesting segments yet.
+        # We cannot ingest segments until the DB merge is complete, because
+        # segment files use doc_id (content-addressed) which must be resolved
+        # against the merged main database, not the empty initial DB.
         while not consumer_coordinator.all_producers_complete():
-            p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
-            c_added = _ingest_chunk_segments(conn, chunk_index, seg_dir)
-            
-            if p_added or c_added:
-                _eprint(f"[consumer] Ingested {p_added} paper vectors and {c_added} chunk vectors")
-            else:
-                _eprint("[consumer] No new segments found, waiting for producers to complete...")
+            _eprint("[consumer] Waiting for producers to complete...")
             
             # Wait for completion or timeout
-            if consumer_coordinator.wait_for_completion(poll_interval=30, timeout=600, progress_callback=progress_callback):
+            # Timeout set to 10 hours (36000s) to match the cluster's max job time
+            if consumer_coordinator.wait_for_completion(poll_interval=30, timeout=36000, progress_callback=progress_callback):
                 _eprint("[consumer] All producers have completed")
                 break
         
-        # Final ingestion pass after all producers have completed
+        # Merge all shard databases into the main database FIRST.
+        # This populates the main DB with all papers/chunks so that
+        # doc_id → paper_id resolution works during segment ingestion.
+        _eprint("[consumer] All producers complete, merging shard databases...")
+        merge_stats = merge_shard_databases(conn, delete_after_merge=True)
+        if merge_stats["shards"] > 0:
+            _eprint(f"[consumer] Merged {merge_stats['shards']} shard DB(s): "
+                    f"{merge_stats['papers']} papers, {merge_stats['chunks']} chunks, {merge_stats['files']} files")
+        
+        # NOW ingest segments - the main DB has all the data for doc_id resolution
+        _eprint("[consumer] Ingesting embedding segments...")
         p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
         c_added = _ingest_chunk_segments(conn, chunk_index, seg_dir)
-        _eprint(f"[consumer] Final ingestion: {p_added} paper vectors and {c_added} chunk vectors")
+        _eprint(f"[consumer] Ingested {p_added} paper vectors and {c_added} chunk vectors")
+        
+        # Force save indices after ingestion
+        with FileLock(FAISS_LOCK):
+            _faiss_save_force(paper_index, PAPER_INDEX_PATH)
+            _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+        with FileLock(DB_LOCK):
+            _flush_pending_marks(conn.cursor())
+            conn.commit()
         
         _eprint("[consumer] Consume-only mode completed")
         return  # End consume-only mode
@@ -2931,9 +3481,15 @@ def build_or_update_indices(args):
     ckpt_stream = ckpt.get("build_stream", {})
 
     paper_ids_buf, paper_texts_buf = [], []
+    paper_doc_ids_buf: list[str] = []  # Track doc_ids for content-addressed segments
     chunk_ids_buf, chunk_texts_buf = [], []
+    chunk_paper_doc_ids_buf: list[str] = []  # Track parent paper doc_ids for chunks
+    chunk_ords_buf: list[int] = []  # Track chunk ordinals within papers
     papers_added_total = 0
     chunks_added_total = 0
+    
+    # Track current paper's doc_id for chunk association
+    current_paper_doc_id: str | None = None
 
     for tpath in tar_paths:
         # Number of *persisted* members previously processed for this tar shard
@@ -3040,6 +3596,12 @@ def build_or_update_indices(args):
                         # ---------- BEGIN INGEST BODY (same semantics; no member-based checkpointing here) ----------
                         pmcid = (meta["pmcid"] or "").strip()
                         pmid = (meta["pmid"] or "").strip()
+                        
+                        # Use file path as doc_id for deduplication across shards
+                        # Each tar member is unique, and load-balanced sharding ensures
+                        # each tar file goes to exactly one producer, so no cross-shard dupes.
+                        # The path is already in f = "tar://tpath!/m.name" format.
+                        doc_id = str(f)
 
                         pid_row = None
                         if pmcid:
@@ -3052,10 +3614,15 @@ def build_or_update_indices(args):
                             ).fetchone()
                         if pid_row:
                             pid = pid_row[0]
+                            # Update doc_id if missing (for legacy rows)
+                            cur.execute(
+                                "UPDATE papers SET doc_id = ? WHERE id = ? AND (doc_id IS NULL OR doc_id = '')",
+                                (doc_id, pid)
+                            )
                         else:
                             cur.execute(
-                                "INSERT INTO papers(pmid, pmcid, title, abstract) VALUES (?,?,?,?)",
-                                (pmid, pmcid, meta["title"], meta["abstract"]),
+                                "INSERT INTO papers(doc_id, pmid, pmcid, title, abstract) VALUES (?,?,?,?,?)",
+                                (doc_id, pmid, pmcid, meta["title"], meta["abstract"]),
                             )
                             pid = cur.lastrowid
 
@@ -3098,6 +3665,7 @@ def build_or_update_indices(args):
                         )
                         paper_ids_buf.append(pid)
                         paper_texts_buf.append(ta_ab)
+                        paper_doc_ids_buf.append(doc_id)
 
                         proposed_chunks = []
                         if ta_ab:
@@ -3129,9 +3697,13 @@ def build_or_update_indices(args):
                             cid = cur.lastrowid
                             chunk_ids_buf.append(cid)
                             chunk_texts_buf.append(text_i)
+                            chunk_paper_doc_ids_buf.append(doc_id)
+                            chunk_ords_buf.append(ord_i)
 
                         if len(paper_ids_buf) >= PAPER_BATCH:
-                            u_ids, u_texts = _dedupe_ids_and_texts(paper_ids_buf, paper_texts_buf)
+                            u_ids, u_texts, u_doc_ids = _dedupe_papers_with_doc_ids(
+                                paper_ids_buf, paper_texts_buf, paper_doc_ids_buf
+                            )
 
                             if paper_seg_writer is not None:
                                 Xp = paper_embedder.encode(
@@ -3140,9 +3712,7 @@ def build_or_update_indices(args):
                                     batch_size=args.paper_embed_bs,
                                     progress_done_summary=False,
                                 )
-                                paper_seg_writer.write(
-                                    ids=np.asarray(u_ids, dtype=np.int64), vecs=Xp
-                                )
+                                paper_seg_writer.write(doc_ids=u_doc_ids, vecs=Xp)
                                 conn.commit()
                                 papers_added_total += len(u_ids)
 
@@ -3181,9 +3751,12 @@ def build_or_update_indices(args):
 
                             paper_ids_buf.clear()
                             paper_texts_buf.clear()
+                            paper_doc_ids_buf.clear()
 
                         if len(chunk_ids_buf) >= CHUNK_BATCH:
-                            u_ids, u_texts = _dedupe_ids_and_texts(chunk_ids_buf, chunk_texts_buf)
+                            u_ids, u_texts, u_paper_doc_ids, u_ords = _dedupe_chunks_with_doc_ids(
+                                chunk_ids_buf, chunk_texts_buf, chunk_paper_doc_ids_buf, chunk_ords_buf
+                            )
 
                             if chunk_seg_writer is not None:
                                 Xc = chunk_embedder.encode(
@@ -3193,7 +3766,7 @@ def build_or_update_indices(args):
                                     progress_done_summary=False,
                                 )
                                 chunk_seg_writer.write(
-                                    ids=np.asarray(u_ids, dtype=np.int64), vecs=Xc
+                                    paper_doc_ids=u_paper_doc_ids, ords=u_ords, vecs=Xc
                                 )
                                 conn.commit()
                                 chunks_added_total += len(u_ids)
@@ -3234,6 +3807,8 @@ def build_or_update_indices(args):
 
                             chunk_ids_buf.clear()
                             chunk_texts_buf.clear()
+                            chunk_paper_doc_ids_buf.clear()
+                            chunk_ords_buf.clear()
 
                         # ---------- END INGEST BODY ----------
 
@@ -3347,33 +3922,40 @@ def build_or_update_indices(args):
 
         # papers: embed and write segment file(s)
         if paper_ids_buf:
-            u_ids, u_texts = _dedupe_ids_and_texts(paper_ids_buf, paper_texts_buf)
+            u_ids, u_texts, u_doc_ids = _dedupe_papers_with_doc_ids(
+                paper_ids_buf, paper_texts_buf, paper_doc_ids_buf
+            )
             Xp = paper_embedder.encode(
                 u_texts,
                 progress_label=f"Embedding papers (producer, {len(u_texts)})",
                 batch_size=args.paper_embed_bs,
             )
             assert paper_seg_writer is not None, "producer mode requires paper_seg_writer"
-            paper_seg_writer.write(ids=np.asarray(u_ids, dtype=np.int64), vecs=Xp)
+            paper_seg_writer.write(doc_ids=u_doc_ids, vecs=Xp)
             conn.commit()
             papers_added_total += len(u_ids)
         paper_ids_buf.clear()
         paper_texts_buf.clear()
+        paper_doc_ids_buf.clear()
 
         # chunks: embed and write segment file(s)
         if chunk_ids_buf:
-            u_ids, u_texts = _dedupe_ids_and_texts(chunk_ids_buf, chunk_texts_buf)
+            u_ids, u_texts, u_paper_doc_ids, u_ords = _dedupe_chunks_with_doc_ids(
+                chunk_ids_buf, chunk_texts_buf, chunk_paper_doc_ids_buf, chunk_ords_buf
+            )
             Xc = chunk_embedder.encode(
                 u_texts,
                 progress_label=f"Embedding chunks (producer, {len(u_texts)})",
                 batch_size=args.chunk_embed_bs,
             )
             assert chunk_seg_writer is not None, "producer mode requires chunk_seg_writer"
-            chunk_seg_writer.write(ids=np.asarray(u_ids, dtype=np.int64), vecs=Xc)
+            chunk_seg_writer.write(paper_doc_ids=u_paper_doc_ids, ords=u_ords, vecs=Xc)
             conn.commit()
             chunks_added_total += len(u_ids)
         chunk_ids_buf.clear()
         chunk_texts_buf.clear()
+        chunk_paper_doc_ids_buf.clear()
+        chunk_ords_buf.clear()
 
     else:
         # ---- plain reader: DB only ----

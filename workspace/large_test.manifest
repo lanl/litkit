@@ -1,8 +1,14 @@
-# Large-scale multi-node test manifest
-# ~30 GB total data across 3 producers for sustained parallel GPU activity
-# Each producer will have ~10-12 GB of tar files to process
+# Full PMC-OA corpus manifest
+# ~185 GB total across all 9 tar files
+# Estimated 3-5 hours with 3 producers
+# All uncompressed .tar files - parallel XML parsing enabled
 
-# Selected baseline files (largest ones for continuous GPU work):
-/path/to/PMC-OA/oa_comm_xml.PMC007xxxxxx.baseline.2025-06-26.tar.gz
-/path/to/PMC-OA/oa_comm_xml.PMC008xxxxxx.baseline.2025-06-26.tar.gz
-/path/to/PMC-OA/oa_comm_xml.PMC009xxxxxx.baseline.2025-06-26.tar.gz
+/path/to/PMC-OA/oa_comm_xml.PMC010xxxxxx.baseline.2025-06-26.tar
+/path/to/PMC-OA/oa_comm_xml.PMC011xxxxxx.baseline.2025-06-26.tar
+/path/to/PMC-OA/oa_comm_xml.PMC012xxxxxx.baseline.2025-06-26.tar
+/path/to/PMC-OA/oa_noncomm_xml.PMC010xxxxxx.baseline.2025-06-26.tar
+/path/to/PMC-OA/oa_noncomm_xml.PMC011xxxxxx.baseline.2025-06-26.tar
+/path/to/PMC-OA/oa_noncomm_xml.PMC012xxxxxx.baseline.2025-06-26.tar
+/path/to/PMC-OA/oa_other_xml.PMC010xxxxxx.baseline.2025-06-26.tar
+/path/to/PMC-OA/oa_other_xml.PMC011xxxxxx.baseline.2025-06-26.tar
+/path/to/PMC-OA/oa_other_xml.PMC012xxxxxx.baseline.2025-06-26.tar
