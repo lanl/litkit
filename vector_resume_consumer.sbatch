@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
-#SBATCH --time=04:00:00
+#SBATCH --time=10:00:00
 #SBATCH --output=litkit_resume_%j.out
 #SBATCH --error=litkit_resume_%j.err
 #SBATCH --export=NONE
