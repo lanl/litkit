@@ -55,7 +55,7 @@ export LITKIT_WORKSPACE="${LITKIT_REPO}/workspace"
 #   tiny_test.manifest    (~few MB, 5-10 min) - for debugging merge logic
 #   medium_test.manifest  (~7 GB, 30-45 min)
 #   large_test.manifest   (~185 GB, 3-5 hours)
-MANIFEST_FILE="${MANIFEST:-tiny_test.manifest}"
+MANIFEST_FILE="${MANIFEST:-medium_test.manifest}"
 export LITKIT_TAR_MANIFEST="${LITKIT_WORKSPACE}/${MANIFEST_FILE}"
 
 # Container and CUDA setup for V100 nodes
