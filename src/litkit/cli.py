@@ -1827,11 +1827,45 @@ def _segment_write(
     return final
 
 
-def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int = 2):
+def preload_paper_id_map(conn) -> dict[str, int]:
+    """Preload doc_id → paper_id mapping for O(1) lookups during segment ingestion.
+    
+    Returns:
+        Dict mapping doc_id strings to paper_id integers.
+    """
+    cur = conn.cursor()
+    rows = cur.execute(
+        "SELECT doc_id, id FROM papers WHERE doc_id IS NOT NULL AND doc_id != ''"
+    ).fetchall()
+    return {str(doc_id): int(paper_id) for doc_id, paper_id in rows}
+
+
+def preload_chunk_id_map(conn) -> dict[tuple[int, int], int]:
+    """Preload (paper_id, ord) → chunk_id mapping for O(1) lookups during segment ingestion.
+    
+    Returns:
+        Dict mapping (paper_id, ord) tuples to chunk_id integers.
+    """
+    cur = conn.cursor()
+    rows = cur.execute("SELECT paper_id, ord, id FROM chunks").fetchall()
+    return {(int(paper_id), int(ord_val)): int(chunk_id) for paper_id, ord_val, chunk_id in rows}
+
+
+def _ingest_paper_segments(
+    conn, paper_index, outdir: Path, *, save_every: int = 2, paper_id_map: dict[str, int] | None = None
+):
     """Ingest paper embedding segments from producer nodes.
     
     Segments contain doc_ids (globally unique file paths) and embeddings.
     At ingestion time, we resolve doc_id → paper_id using the merged main DB.
+    
+    Args:
+        conn: SQLite connection to main database
+        paper_index: FAISS index for papers
+        outdir: Directory containing segment files
+        save_every: Save index every N segment files
+        paper_id_map: Optional preloaded doc_id → paper_id mapping for O(1) lookups.
+                      If None, will be loaded once at start.
     """
     outdir = Path(outdir)
     if not outdir.exists():
@@ -1844,6 +1878,12 @@ def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int =
     )
     if not cand:
         return 0
+    
+    # Preload paper_id_map once if not provided (O(1) lookups vs O(N) queries)
+    if paper_id_map is None:
+        paper_id_map = preload_paper_id_map(conn)
+        _eprint(f"[segments] preloaded {len(paper_id_map)} paper ID mappings")
+    
     cur = conn.cursor()
     added_total = 0
     batch_counter = 0
@@ -1867,16 +1907,14 @@ def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int =
                     doc_ids = z["doc_ids"]  # object array of strings
                     X = np.ascontiguousarray(z["vecs"].astype(np.float32))
                     
-                    # Resolve doc_id → paper_id from main DB
+                    # Resolve doc_id → paper_id using preloaded map (O(1) lookups)
                     resolved_ids = []
                     valid_mask = []
                     for i, doc_id in enumerate(doc_ids):
                         doc_id_str = str(doc_id)
-                        row = cur.execute(
-                            "SELECT id FROM papers WHERE doc_id = ?", (doc_id_str,)
-                        ).fetchone()
-                        if row:
-                            resolved_ids.append(row[0])
+                        paper_id = paper_id_map.get(doc_id_str)
+                        if paper_id is not None:
+                            resolved_ids.append(paper_id)
                             valid_mask.append(True)
                         else:
                             # Paper not in merged DB yet - skip this embedding
@@ -1954,7 +1992,11 @@ def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int =
     return added_total
 
 
-def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int = 2):
+def _ingest_chunk_segments(
+    conn, chunk_index, outdir: Path, *, save_every: int = 2,
+    paper_id_map: dict[str, int] | None = None,
+    chunk_id_map: dict[tuple[int, int], int] | None = None
+):
     """Ingest chunk embedding segments from producer nodes.
     
     Segments contain (paper_doc_id, ord) pairs and embeddings.
@@ -1965,6 +2007,16 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
       - if already ".npz.ingesting", read in place
       - on success, delete the .ingesting file
       - on failure, rename back so it can be retried next run
+
+    Args:
+        conn: SQLite connection to main database
+        chunk_index: FAISS index for chunks
+        outdir: Directory containing segment files
+        save_every: Save index every N segment files
+        paper_id_map: Optional preloaded doc_id → paper_id mapping for O(1) lookups.
+                      If None, will be loaded once at start.
+        chunk_id_map: Optional preloaded (paper_id, ord) → chunk_id mapping for O(1) lookups.
+                      If None, will be loaded once at start.
 
     Returns the number of vectors added.
     """
@@ -1986,6 +2038,14 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
     )
     if not cand:
         return 0
+
+    # Preload ID maps once if not provided (O(1) lookups vs O(N) queries)
+    if paper_id_map is None:
+        paper_id_map = preload_paper_id_map(conn)
+        _eprint(f"[segments] preloaded {len(paper_id_map)} paper ID mappings")
+    if chunk_id_map is None:
+        chunk_id_map = preload_chunk_id_map(conn)
+        _eprint(f"[segments] preloaded {len(chunk_id_map)} chunk ID mappings")
 
     cur = conn.cursor()
     added_total = 0
@@ -2018,28 +2078,22 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
                     ords = z["ords"]  # int32 array
                     X = np.ascontiguousarray(z["vecs"].astype(np.float32))
                     
-                    # Resolve (paper_doc_id, ord) → chunk_id from main DB
+                    # Resolve (paper_doc_id, ord) → chunk_id using preloaded maps (O(1) lookups)
                     resolved_ids = []
                     valid_mask = []
                     for i, (doc_id, ord_val) in enumerate(zip(paper_doc_ids, ords)):
                         doc_id_str = str(doc_id)
                         ord_int = int(ord_val)
                         
-                        # First, get the paper_id from doc_id
-                        paper_row = cur.execute(
-                            "SELECT id FROM papers WHERE doc_id = ?", (doc_id_str,)
-                        ).fetchone()
+                        # Get paper_id from preloaded map
+                        paper_id = paper_id_map.get(doc_id_str)
                         
-                        if paper_row:
-                            paper_id = paper_row[0]
-                            # Now get the chunk_id from (paper_id, ord)
-                            chunk_row = cur.execute(
-                                "SELECT id FROM chunks WHERE paper_id = ? AND ord = ?",
-                                (paper_id, ord_int)
-                            ).fetchone()
+                        if paper_id is not None:
+                            # Get chunk_id from preloaded map
+                            chunk_id = chunk_id_map.get((paper_id, ord_int))
                             
-                            if chunk_row:
-                                resolved_ids.append(chunk_row[0])
+                            if chunk_id is not None:
+                                resolved_ids.append(chunk_id)
                                 valid_mask.append(True)
                             else:
                                 # Chunk not in merged DB yet - skip this embedding
@@ -5260,12 +5314,13 @@ def main():
     DEFAULT_BUSY_TIMEOUT_MS = int(args.sqlite_busy_timeout_ms)
 
     # Do we need tar shards?
+    # Note: --consume-only doesn't need corpus (it only ingests pre-computed segments)
     needs_corpus = (
         args.rebuild
         or args.update
         or args.build_only
         or args.embed_producer
-        or args.faiss_writer
+        or (args.faiss_writer and not args.consume_only)  # consume-only skips tar scanning
         or (not _vector_store_exists())
     ) and not args.init_indices_only  # Bootstrap doesn't need corpus
 
