@@ -117,6 +117,7 @@ echo ""
     litkit \
         --faiss-writer \
         --consume-only \
+        --tar-manifest "/workspace/medium_test.manifest" \
         --embed-outdir "/workspace/emb_segments" \
         --papers-index hnsw \
         --chunks-index flat \
