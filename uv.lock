@@ -245,7 +245,7 @@ wheels = [
 
 [[package]]
 name = "litkit"
-version = "0.3.33"
+version = "0.3.34"
 source = { editable = "." }
 dependencies = [
     { name = "faiss-cpu", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
@@ -280,7 +280,7 @@ requires-dist = [
     { name = "safetensors", specifier = ">=0.4,<1" },
     { name = "sentence-transformers", specifier = ">=3.1,<4" },
     { name = "sympy", specifier = "==1.13.1" },
-    { name = "torch", path = "wheels/torch-2.5.1-cp312-cp312-linux_aarch64.whl" },
+    { name = "torch", specifier = "==2.5.1.*" },
     { name = "transformers", specifier = ">=4.44,<5" },
 ]
 provides-extras = ["dev"]
@@ -674,7 +674,7 @@ wheels = [
 [[package]]
 name = "torch"
 version = "2.5.1"
-source = { path = "wheels/torch-2.5.1-cp312-cp312-linux_aarch64.whl" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
     { name = "fsspec", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
@@ -685,23 +685,8 @@ dependencies = [
     { name = "typing-extensions", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { filename = "torch-2.5.1-cp312-cp312-linux_aarch64.whl", hash = "sha256:2e3e9e035b476dcea8f175cb9d42200f717a322dfb02118380930e48c68cec4b" },
+    { url = "https://files.pythonhosted.org/packages/6d/69/d8ada8b6e0a4257556d5b4ddeb4345ea8eeaaef3c98b60d1cca197c7ad8e/torch-2.5.1-cp312-cp312-manylinux2014_aarch64.whl", hash = "sha256:3f4b7f10a247e0dcd7ea97dc2d3bfbfc90302ed36d7f3952b0008d0df264e697", size = 91811673, upload-time = "2024-10-29T17:32:42.789Z" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "filelock" },
-    { name = "fsspec" },
-    { name = "jinja2" },
-    { name = "networkx" },
-    { name = "opt-einsum", marker = "extra == 'opt-einsum'", specifier = ">=3.3" },
-    { name = "optree", marker = "extra == 'optree'", specifier = ">=0.12.0" },
-    { name = "setuptools", marker = "python_full_version >= '3.12'" },
-    { name = "sympy", marker = "python_full_version == '3.8.*'", specifier = "==1.12.1" },
-    { name = "sympy", marker = "python_full_version >= '3.9'", specifier = "==1.13.1" },
-    { name = "typing-extensions", specifier = ">=4.8.0" },
-]
-provides-extras = ["opt-einsum", "optree"]
 
 [[package]]
 name = "tqdm"

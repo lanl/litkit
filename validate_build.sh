@@ -4,14 +4,11 @@
 # Usage:
 #   ./validate_build.sh                         # Uses default workspace path
 #   ./validate_build.sh /path/to/workspace      # Use custom workspace path
-#   ./validate_build.sh --quick                 # Quick smoke test with tiny_test.manifest
-#   ./validate_build.sh --quick /path/to/ws     # Quick test with custom workspace
 #
 # Run this after a multi-node build completes to verify:
 #   1. All segment files were consumed
 #   2. FAISS indices exist with non-trivial size
 #   3. SQLite database has all papers/chunks indexed
-#   4. (Quick mode) Expected counts match for tiny_test.manifest
 #
 # Exit codes:
 #   0 - All checks passed
@@ -27,17 +24,22 @@
 set -euo pipefail
 
 # --- Parse arguments ---
-QUICK_MODE=0
 WORKSPACE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --quick|-q)
-            QUICK_MODE=1
-            shift
-            ;;
         --help|-h)
-            grep '^#' "$0" | grep -v '^#!' | sed 's/^# //' | head -25
+            echo "Usage: ./validate_build.sh [workspace_path]"
+            echo ""
+            echo "Validates a litkit vector store build."
+            echo ""
+            echo "Arguments:"
+            echo "  workspace_path    Path to workspace (default: /path/to/litkit/workspace)"
+            echo ""
+            echo "Checks performed:"
+            echo "  1. Segment files consumed (emb_segments/ empty)"
+            echo "  2. FAISS indices exist and have reasonable size"
+            echo "  3. SQLite papers and chunks fully indexed"
             exit 0
             ;;
         *)
@@ -47,62 +49,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Default workspace path depends on OS
-if [[ "$(uname)" == "Darwin" ]]; then
-    WORKSPACE="${WORKSPACE:-$HOME/litkit_test_ws}"
-else
-    WORKSPACE="${WORKSPACE:-/path/to/litkit/workspace}"
-fi
-
-# --- Quick mode: run a fresh build with test manifest ---
-if [[ "$QUICK_MODE" -eq 1 ]]; then
-    echo "========================================"
-    echo "LitKit Quick Smoke Test"
-    echo "========================================"
-    
-    # Find script directory and project root
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    PROJECT_ROOT="$SCRIPT_DIR"
-    
-    # Auto-select manifest based on OS
-    if [[ "$(uname)" == "Darwin" ]]; then
-        MANIFEST="${PROJECT_ROOT}/workspace/mac_test.manifest"
-        echo "Detected macOS - using mac_test.manifest"
-    else
-        MANIFEST="${PROJECT_ROOT}/workspace/tiny_test.manifest"
-        echo "Detected Linux - using tiny_test.manifest"
-    fi
-    
-    if [[ ! -f "$MANIFEST" ]]; then
-        echo "❌ Manifest not found at $MANIFEST"
-        exit 2
-    fi
-    
-    # Create temp workspace for quick test
-    QUICK_WORKSPACE="${WORKSPACE}/quick_test_$(date +%s)"
-    echo "Using temp workspace: $QUICK_WORKSPACE"
-    mkdir -p "$QUICK_WORKSPACE"
-    
-    # Run a single-node build with tiny_test.manifest
-    echo ""
-    echo "=== Running single-node build with tiny_test.manifest ==="
-    LITKIT_WORKSPACE="$QUICK_WORKSPACE" \
-    LITKIT_ASSUME_YES=1 \
-    python -m litkit \
-        --tar-manifest "$MANIFEST" \
-        --faiss-writer \
-        --build-only \
-        --quiet \
-        2>&1 | tail -20 || {
-            echo "❌ Build failed"
-            rm -rf "$QUICK_WORKSPACE"
-            exit 1
-        }
-    
-    echo ""
-    echo "=== Validating quick build results ==="
-    WORKSPACE="$QUICK_WORKSPACE"
-fi
+# Default workspace path for cluster
+WORKSPACE="${WORKSPACE:-/path/to/litkit/workspace}"
 
 echo "========================================"
 echo "LitKit Build Validation"
@@ -256,8 +204,7 @@ else
     echo ""
     echo "=== Check 4: Regression Baseline ==="
     
-    # These are minimum expected counts; adjust if tiny_test.manifest changes
-    # Current tiny_test.manifest should produce at least 1 paper and some chunks
+    # These are minimum expected counts; adjust based on your corpus
     MIN_PAPERS=1
     MIN_CHUNKS=1
     
@@ -287,18 +234,6 @@ else
     ERRORS=$((ERRORS + 1))
 fi
 echo ""
-
-# --- Cleanup for quick mode ---
-if [[ "$QUICK_MODE" -eq 1 && -n "${QUICK_WORKSPACE:-}" ]]; then
-    echo "=== Cleanup ==="
-    if [[ "$ERRORS" -eq 0 ]]; then
-        rm -rf "$QUICK_WORKSPACE"
-        echo "  Removed temp workspace: $QUICK_WORKSPACE"
-    else
-        echo "  ⚠️  Keeping temp workspace for debugging: $QUICK_WORKSPACE"
-    fi
-    echo ""
-fi
 
 # --- Summary ---
 echo "========================================"

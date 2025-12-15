@@ -31,6 +31,7 @@ workspace/sqlite/
 workspace/hf_cache/
 workspace/pmcoa_links/
 workspace/.ch-mnt/
+workspace/tar_files/
 
 # SLURM logs (all patterns)
 litkit-build.*.out
