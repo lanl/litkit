@@ -47,10 +47,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Default workspace path (HPC cluster)
-WORKSPACE="${WORKSPACE:-/path/to/litkit/workspace}"
+# Default workspace path depends on OS
+if [[ "$(uname)" == "Darwin" ]]; then
+    WORKSPACE="${WORKSPACE:-$HOME/litkit_test_ws}"
+else
+    WORKSPACE="${WORKSPACE:-/path/to/litkit/workspace}"
+fi
 
-# --- Quick mode: run a fresh build with tiny_test.manifest ---
+# --- Quick mode: run a fresh build with test manifest ---
 if [[ "$QUICK_MODE" -eq 1 ]]; then
     echo "========================================"
     echo "LitKit Quick Smoke Test"
@@ -59,10 +63,18 @@ if [[ "$QUICK_MODE" -eq 1 ]]; then
     # Find script directory and project root
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     PROJECT_ROOT="$SCRIPT_DIR"
-    MANIFEST="${PROJECT_ROOT}/workspace/tiny_test.manifest"
+    
+    # Auto-select manifest based on OS
+    if [[ "$(uname)" == "Darwin" ]]; then
+        MANIFEST="${PROJECT_ROOT}/workspace/mac_test.manifest"
+        echo "Detected macOS - using mac_test.manifest"
+    else
+        MANIFEST="${PROJECT_ROOT}/workspace/tiny_test.manifest"
+        echo "Detected Linux - using tiny_test.manifest"
+    fi
     
     if [[ ! -f "$MANIFEST" ]]; then
-        echo "❌ tiny_test.manifest not found at $MANIFEST"
+        echo "❌ Manifest not found at $MANIFEST"
         exit 2
     fi
     

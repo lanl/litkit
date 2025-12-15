@@ -1,0 +1,10 @@
+# Mac test manifest for local development testing
+# Same 7 author-specific tar files as tiny_test.manifest, but with Mac paths
+# Use this for quick validation during refactor work
+tar_files/blinov_ml.tar
+tar_files/faeder_jr.tar
+tar_files/hlavacek_ws.tar
+tar_files/perelson_as.tar
+tar_files/savageau_ma.tar
+tar_files/stites_ec.tar
+tar_files/voit_eo.tar
