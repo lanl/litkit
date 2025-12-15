@@ -1,4 +1,28 @@
 # src/litkit/cli.py
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# SCOPE CONTRACT (Temporary — remove after refactor)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# cli.py is the CLI entrypoint ONLY. It should:
+#   ✓ Parse arguments (argparse)
+#   ✓ Construct config objects from args/env
+#   ✓ Call high-level orchestration functions
+#   ✓ Handle exit codes and user-facing error messages
+#
+# cli.py should NOT contain (these are extraction candidates):
+#   ✗ SQLite queries or schema logic         → move to litkit.db
+#   ✗ FAISS index operations                 → move to litkit.faiss_ops
+#   ✗ Tar scanning / file iteration          → already in litkit.ingest
+#   ✗ Embedding segment I/O                  → move to litkit.build.segments
+#   ✗ Producer/consumer coordination         → move to litkit.build.coordination
+#   ✗ Shard assignment / build metadata      → move to litkit.build.sharding
+#   ✗ Retrieval logic (search, lexical)      → move to litkit.retrieval
+#   ✗ LLM client / prompt packing            → move to litkit.llm
+#   ✗ Progress/logging utilities             → move to litkit.progress
+#
+# See docs/REFACTOR_ROADMAP.md for the full extraction plan.
+# ═══════════════════════════════════════════════════════════════════════════════
 
 import os
 import sys
