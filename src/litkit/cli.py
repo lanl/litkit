@@ -338,13 +338,17 @@ def merge_shard_databases(main_conn, delete_after_merge: bool = True) -> dict[st
     stats = {"papers": 0, "chunks": 0, "files": 0, "shards": 0}
     main_cur = main_conn.cursor()
     
-    for shard_db in shard_dbs:
+    for shard_idx, shard_db in enumerate(shard_dbs):
         _eprint(f"[merge] Processing {shard_db.name}...")
         t0 = time.time()
         
+        # Use unique alias per shard to avoid "database already in use" errors
+        shard_alias = f"shard_db_{shard_idx}"
+        # Use unique temp table name per shard for safety
+        temp_map_table = f"_shard_paper_map_{shard_idx}"
+        
         try:
             # ATTACH the shard database for bulk operations
-            shard_alias = "shard_db"
             main_cur.execute(f"ATTACH DATABASE ? AS {shard_alias}", (str(shard_db),))
             
             try:
@@ -369,8 +373,10 @@ def merge_shard_databases(main_conn, delete_after_merge: bool = True) -> dict[st
                 
                 # 2) BULK MERGE CHUNKS
                 # Create a temp table to map shard paper_id -> main paper_id via doc_id
+                # Drop first to ensure clean state (no IF NOT EXISTS to avoid stale data)
+                main_cur.execute(f"DROP TABLE IF EXISTS {temp_map_table}")
                 main_cur.execute(f"""
-                    CREATE TEMP TABLE IF NOT EXISTS _shard_paper_map AS
+                    CREATE TEMP TABLE {temp_map_table} AS
                     SELECT s.id AS shard_pid, m.id AS main_pid
                     FROM {shard_alias}.papers s
                     JOIN papers m ON m.doc_id = s.doc_id
@@ -382,7 +388,7 @@ def merge_shard_databases(main_conn, delete_after_merge: bool = True) -> dict[st
                     INSERT OR IGNORE INTO chunks(paper_id, ord, text, in_index)
                     SELECT pm.main_pid, sc.ord, sc.text, 0
                     FROM {shard_alias}.chunks sc
-                    JOIN _shard_paper_map pm ON pm.shard_pid = sc.paper_id
+                    JOIN {temp_map_table} pm ON pm.shard_pid = sc.paper_id
                     WHERE NOT EXISTS (
                         SELECT 1 FROM chunks mc 
                         WHERE mc.paper_id = pm.main_pid AND mc.ord = sc.ord
@@ -395,11 +401,11 @@ def merge_shard_databases(main_conn, delete_after_merge: bool = True) -> dict[st
                     INSERT OR REPLACE INTO files(path, size, mtime, paper_id)
                     SELECT sf.path, sf.size, sf.mtime, pm.main_pid
                     FROM {shard_alias}.files sf
-                    JOIN _shard_paper_map pm ON pm.shard_pid = sf.paper_id
+                    JOIN {temp_map_table} pm ON pm.shard_pid = sf.paper_id
                 """)
                 
-                # Drop temp table
-                main_cur.execute("DROP TABLE IF EXISTS _shard_paper_map")
+                # Drop temp table immediately after use
+                main_cur.execute(f"DROP TABLE IF EXISTS {temp_map_table}")
                 
                 # Count rows after merge for statistics
                 papers_after = main_cur.execute("SELECT COUNT(*) FROM papers").fetchone()[0]

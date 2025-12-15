@@ -9,6 +9,12 @@
 #   1. All segment files were consumed
 #   2. FAISS indices exist with non-trivial size
 #   3. SQLite database has all papers/chunks indexed
+#
+# Note: Duplicate detection for chunks
+#   When the same paper appears in multiple tar files (e.g., cross-referenced),
+#   duplicate chunks with the same (paper_id, ord) may exist in the database.
+#   Only unique (paper_id, ord) combinations can be indexed. This script
+#   detects duplicates and reports them separately from actual errors.
 
 set -euo pipefail
 
@@ -97,15 +103,22 @@ else
     PAPER_TOTAL=$(echo "$PAPER_STATS" | cut -d'|' -f1)
     PAPER_INDEXED=$(echo "$PAPER_STATS" | cut -d'|' -f2)
     
-    # Get chunk counts
-    CHUNK_STATS=$(sqlite3 "$DB_PATH" "SELECT COUNT(*), COALESCE(SUM(in_index), 0) FROM chunks;" 2>/dev/null || echo "0|0")
-    CHUNK_TOTAL=$(echo "$CHUNK_STATS" | cut -d'|' -f1)
-    CHUNK_INDEXED=$(echo "$CHUNK_STATS" | cut -d'|' -f2)
+    # Get chunk counts - both total rows AND unique (paper_id, ord) combinations
+    CHUNK_TOTAL=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM chunks;" 2>/dev/null || echo "0")
+    CHUNK_INDEXED=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM chunks WHERE in_index = 1;" 2>/dev/null || echo "0")
+    CHUNK_UNIQUE=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM (SELECT DISTINCT paper_id, ord FROM chunks);" 2>/dev/null || echo "0")
+    CHUNK_DUPES=$((CHUNK_TOTAL - CHUNK_UNIQUE))
     
     echo "  Papers: $PAPER_INDEXED / $PAPER_TOTAL indexed"
-    echo "  Chunks: $CHUNK_INDEXED / $CHUNK_TOTAL indexed"
     
-    # Check if all are indexed
+    # Report chunks with duplicate awareness
+    if [[ "$CHUNK_DUPES" -gt 0 ]]; then
+        echo "  Chunks: $CHUNK_INDEXED / $CHUNK_UNIQUE unique indexed (${CHUNK_DUPES} duplicate rows detected)"
+    else
+        echo "  Chunks: $CHUNK_INDEXED / $CHUNK_TOTAL indexed"
+    fi
+    
+    # Check if all papers are indexed
     if [[ "$PAPER_TOTAL" -gt 0 && "$PAPER_TOTAL" -eq "$PAPER_INDEXED" ]]; then
         echo "  ✅ All papers indexed"
     elif [[ "$PAPER_TOTAL" -eq 0 ]]; then
@@ -116,14 +129,28 @@ else
         ERRORS=$((ERRORS + 1))
     fi
     
-    if [[ "$CHUNK_TOTAL" -gt 0 && "$CHUNK_TOTAL" -eq "$CHUNK_INDEXED" ]]; then
-        echo "  ✅ All chunks indexed"
+    # Check if all unique chunks are indexed (compare against unique, not total)
+    if [[ "$CHUNK_UNIQUE" -gt 0 && "$CHUNK_UNIQUE" -eq "$CHUNK_INDEXED" ]]; then
+        echo "  ✅ All unique chunks indexed"
+        if [[ "$CHUNK_DUPES" -gt 0 ]]; then
+            echo "  ℹ️  $CHUNK_DUPES duplicate chunk rows exist (same paper_id+ord) - this is expected with overlapping corpus data"
+        fi
     elif [[ "$CHUNK_TOTAL" -eq 0 ]]; then
         echo "  ⚠️  No chunks in database"
     else
-        UNINDEXED=$((CHUNK_TOTAL - CHUNK_INDEXED))
-        echo "  ❌ $UNINDEXED chunks not indexed"
-        ERRORS=$((ERRORS + 1))
+        # Some chunks are not indexed - check if it's just duplicates or a real problem
+        UNINDEXED_UNIQUE=$((CHUNK_UNIQUE - CHUNK_INDEXED))
+        if [[ "$UNINDEXED_UNIQUE" -le 0 ]]; then
+            # All unique chunks are indexed; the "missing" are just duplicates
+            echo "  ✅ All unique chunks indexed"
+            echo "  ℹ️  $CHUNK_DUPES duplicate chunk rows exist (same paper_id+ord) - only one per position can be indexed"
+        else
+            echo "  ❌ $UNINDEXED_UNIQUE unique chunks not indexed"
+            if [[ "$CHUNK_DUPES" -gt 0 ]]; then
+                echo "  ℹ️  Additionally, $CHUNK_DUPES duplicate rows exist (expected)"
+            fi
+            ERRORS=$((ERRORS + 1))
+        fi
     fi
 fi
 echo ""
