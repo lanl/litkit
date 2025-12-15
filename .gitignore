@@ -42,4 +42,4 @@ litkit_multi_*.err
 *.err
 
 # Generated documentation
-*.pdf
+#*.pdf
