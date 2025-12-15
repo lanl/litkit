@@ -314,10 +314,13 @@ def _list_shard_dbs() -> list[Path]:
 
 
 def merge_shard_databases(main_conn, delete_after_merge: bool = True) -> dict[str, int]:
-    """Merge all per-shard SQLite databases into the main database.
+    """Merge all per-shard SQLite databases into the main database using bulk SQL operations.
     
-    Uses INSERT OR IGNORE on doc_id for idempotent paper merging, ensuring
-    that duplicate papers (same doc_id) from different shards are not duplicated.
+    Uses ATTACH DATABASE + INSERT...SELECT for efficient bulk merging instead of
+    row-by-row Python loops. This is ~100x faster for large databases.
+    
+    The merge is idempotent: duplicate papers (same doc_id) and chunks (same paper_id+ord)
+    are skipped using INSERT OR IGNORE and conflict detection.
     
     Args:
         main_conn: Connection to the main litkit.sqlite3 database
@@ -330,126 +333,103 @@ def merge_shard_databases(main_conn, delete_after_merge: bool = True) -> dict[st
     if not shard_dbs:
         return {"papers": 0, "chunks": 0, "files": 0, "shards": 0}
     
-    _eprint(f"[merge] Found {len(shard_dbs)} shard database(s) to merge")
+    _eprint(f"[merge] Found {len(shard_dbs)} shard database(s) to merge (using bulk SQL)")
     
     stats = {"papers": 0, "chunks": 0, "files": 0, "shards": 0}
     main_cur = main_conn.cursor()
     
-    for shard_db in shard_dbs:
+    for shard_idx, shard_db in enumerate(shard_dbs):
         _eprint(f"[merge] Processing {shard_db.name}...")
+        t0 = time.time()
+        
+        # Use unique alias per shard to avoid "database already in use" errors
+        shard_alias = f"shard_db_{shard_idx}"
+        # Use unique temp table name per shard for safety
+        temp_map_table = f"_shard_paper_map_{shard_idx}"
         
         try:
-            shard_conn = sqlite3.connect(shard_db, isolation_level="DEFERRED")
-            shard_cur = shard_conn.cursor()
+            # ATTACH the shard database for bulk operations
+            main_cur.execute(f"ATTACH DATABASE ? AS {shard_alias}", (str(shard_db),))
             
-            # 1) Merge papers using doc_id for deduplication
-            # First, get all papers from shard
-            shard_papers = shard_cur.execute("""
-                SELECT doc_id, pmid, pmcid, title, abstract, in_index
-                FROM papers WHERE doc_id IS NOT NULL AND doc_id != ''
-            """).fetchall()
-            
-            papers_merged = 0
-            for row in shard_papers:
-                doc_id, pmid, pmcid, title, abstract, in_index = row
+            try:
+                # Count rows before merge for statistics
+                papers_before = main_cur.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+                chunks_before = main_cur.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+                files_before = main_cur.execute("SELECT COUNT(*) FROM files").fetchone()[0]
                 
-                # Check if this doc_id already exists in main DB
-                existing = main_cur.execute(
-                    "SELECT id FROM papers WHERE doc_id = ?", (doc_id,)
-                ).fetchone()
+                # 1) BULK MERGE PAPERS
+                # Insert papers that don't already exist (by doc_id), ignoring duplicates
+                # Use a subquery to exclude papers whose doc_id already exists in main
+                main_cur.execute(f"""
+                    INSERT OR IGNORE INTO papers(doc_id, pmid, pmcid, title, abstract, in_index)
+                    SELECT s.doc_id, s.pmid, s.pmcid, s.title, s.abstract, 0
+                    FROM {shard_alias}.papers s
+                    WHERE s.doc_id IS NOT NULL 
+                      AND s.doc_id != ''
+                      AND NOT EXISTS (
+                          SELECT 1 FROM papers m WHERE m.doc_id = s.doc_id
+                      )
+                """)
                 
-                if existing is None:
-                    # Insert new paper (handle duplicate pmid/pmcid gracefully)
-                    try:
-                        main_cur.execute("""
-                            INSERT INTO papers(doc_id, pmid, pmcid, title, abstract, in_index)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                        """, (doc_id, pmid, pmcid, title, abstract, 0))  # in_index=0, will be backfilled
-                        papers_merged += 1
-                    except sqlite3.IntegrityError as e:
-                        # Duplicate pmid/pmcid from another shard - skip silently
-                        # This can happen when tar files contain overlapping papers
-                        _eprint(f"[merge] Skipping duplicate paper: pmid={pmid} pmcid={pmcid} ({e})")
-                        continue
-            
-            stats["papers"] += papers_merged
-            
-            # 2) Build doc_id -> main paper_id mapping for chunk/file remapping
-            # This handles both newly inserted and existing papers
-            doc_id_to_main_pid = {}
-            for row in shard_papers:
-                doc_id = row[0]
-                main_row = main_cur.execute(
-                    "SELECT id FROM papers WHERE doc_id = ?", (doc_id,)
-                ).fetchone()
-                if main_row:
-                    doc_id_to_main_pid[doc_id] = main_row[0]
-            
-            # 3) Merge chunks - need to remap paper_id and handle (paper_id, ord) uniqueness
-            # Get shard paper_id -> doc_id mapping
-            shard_pid_to_docid = {
-                row[0]: row[1] for row in shard_cur.execute(
-                    "SELECT id, doc_id FROM papers WHERE doc_id IS NOT NULL AND doc_id != ''"
-                ).fetchall()
-            }
-            
-            shard_chunks = shard_cur.execute("""
-                SELECT paper_id, ord, text, in_index FROM chunks
-            """).fetchall()
-            
-            chunks_merged = 0
-            for shard_pid, ord_val, text, in_index in shard_chunks:
-                doc_id = shard_pid_to_docid.get(shard_pid)
-                if doc_id is None:
-                    continue  # Orphan chunk, skip
+                # 2) BULK MERGE CHUNKS
+                # Create a temp table to map shard paper_id -> main paper_id via doc_id
+                # Drop first to ensure clean state (no IF NOT EXISTS to avoid stale data)
+                main_cur.execute(f"DROP TABLE IF EXISTS {temp_map_table}")
+                main_cur.execute(f"""
+                    CREATE TEMP TABLE {temp_map_table} AS
+                    SELECT s.id AS shard_pid, m.id AS main_pid
+                    FROM {shard_alias}.papers s
+                    JOIN papers m ON m.doc_id = s.doc_id
+                    WHERE s.doc_id IS NOT NULL AND s.doc_id != ''
+                """)
                 
-                main_pid = doc_id_to_main_pid.get(doc_id)
-                if main_pid is None:
-                    continue  # Paper not in main DB, skip
+                # Insert chunks with remapped paper_id, skipping duplicates (same paper_id+ord)
+                main_cur.execute(f"""
+                    INSERT OR IGNORE INTO chunks(paper_id, ord, text, in_index)
+                    SELECT pm.main_pid, sc.ord, sc.text, 0
+                    FROM {shard_alias}.chunks sc
+                    JOIN {temp_map_table} pm ON pm.shard_pid = sc.paper_id
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM chunks mc 
+                        WHERE mc.paper_id = pm.main_pid AND mc.ord = sc.ord
+                    )
+                """)
                 
-                # Check if this (paper_id, ord) combination already exists
-                existing_chunk = main_cur.execute(
-                    "SELECT id FROM chunks WHERE paper_id = ? AND ord = ?",
-                    (main_pid, ord_val)
-                ).fetchone()
-                
-                if existing_chunk is None:
-                    main_cur.execute("""
-                        INSERT INTO chunks(paper_id, ord, text, in_index)
-                        VALUES (?, ?, ?, ?)
-                    """, (main_pid, ord_val, text, 0))  # in_index=0, will be backfilled
-                    chunks_merged += 1
-            
-            stats["chunks"] += chunks_merged
-            
-            # 4) Merge files table - remap paper_id
-            shard_files = shard_cur.execute("""
-                SELECT path, size, mtime, paper_id FROM files
-            """).fetchall()
-            
-            files_merged = 0
-            for path, size, mtime, shard_pid in shard_files:
-                doc_id = shard_pid_to_docid.get(shard_pid)
-                if doc_id is None:
-                    continue
-                
-                main_pid = doc_id_to_main_pid.get(doc_id)
-                if main_pid is None:
-                    continue
-                
-                # Use INSERT OR REPLACE to handle path conflicts
-                main_cur.execute("""
+                # 3) BULK MERGE FILES
+                # Insert/replace files with remapped paper_id
+                main_cur.execute(f"""
                     INSERT OR REPLACE INTO files(path, size, mtime, paper_id)
-                    VALUES (?, ?, ?, ?)
-                """, (path, size, mtime, main_pid))
-                files_merged += 1
-            
-            stats["files"] += files_merged
-            stats["shards"] += 1
-            
-            shard_conn.close()
-            
-            _eprint(f"[merge] {shard_db.name}: {papers_merged} papers, {chunks_merged} chunks, {files_merged} files")
+                    SELECT sf.path, sf.size, sf.mtime, pm.main_pid
+                    FROM {shard_alias}.files sf
+                    JOIN {temp_map_table} pm ON pm.shard_pid = sf.paper_id
+                """)
+                
+                # Drop temp table immediately after use
+                main_cur.execute(f"DROP TABLE IF EXISTS {temp_map_table}")
+                
+                # Count rows after merge for statistics
+                papers_after = main_cur.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+                chunks_after = main_cur.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+                files_after = main_cur.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+                
+                papers_merged = papers_after - papers_before
+                chunks_merged = chunks_after - chunks_before
+                files_merged = files_after - files_before
+                
+                stats["papers"] += papers_merged
+                stats["chunks"] += chunks_merged
+                stats["files"] += files_merged
+                stats["shards"] += 1
+                
+                elapsed = time.time() - t0
+                _eprint(f"[merge] {shard_db.name}: +{papers_merged} papers, +{chunks_merged} chunks, +{files_merged} files ({elapsed:.1f}s)")
+                
+            finally:
+                # Always detach the shard database
+                try:
+                    main_cur.execute(f"DETACH DATABASE {shard_alias}")
+                except Exception:
+                    pass
             
             # Delete shard DB after successful merge
             if delete_after_merge:
@@ -461,6 +441,8 @@ def merge_shard_databases(main_conn, delete_after_merge: bool = True) -> dict[st
             
         except Exception as e:
             _eprint(f"[merge] ERROR processing {shard_db.name}: {e.__class__.__name__}: {e}")
+            import traceback
+            traceback.print_exc()
             # Continue with next shard
     
     # Commit all changes
@@ -1827,11 +1809,45 @@ def _segment_write(
     return final
 
 
-def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int = 2):
+def preload_paper_id_map(conn) -> dict[str, int]:
+    """Preload doc_id → paper_id mapping for O(1) lookups during segment ingestion.
+    
+    Returns:
+        Dict mapping doc_id strings to paper_id integers.
+    """
+    cur = conn.cursor()
+    rows = cur.execute(
+        "SELECT doc_id, id FROM papers WHERE doc_id IS NOT NULL AND doc_id != ''"
+    ).fetchall()
+    return {str(doc_id): int(paper_id) for doc_id, paper_id in rows}
+
+
+def preload_chunk_id_map(conn) -> dict[tuple[int, int], int]:
+    """Preload (paper_id, ord) → chunk_id mapping for O(1) lookups during segment ingestion.
+    
+    Returns:
+        Dict mapping (paper_id, ord) tuples to chunk_id integers.
+    """
+    cur = conn.cursor()
+    rows = cur.execute("SELECT paper_id, ord, id FROM chunks").fetchall()
+    return {(int(paper_id), int(ord_val)): int(chunk_id) for paper_id, ord_val, chunk_id in rows}
+
+
+def _ingest_paper_segments(
+    conn, paper_index, outdir: Path, *, save_every: int = 2, paper_id_map: dict[str, int] | None = None
+):
     """Ingest paper embedding segments from producer nodes.
     
     Segments contain doc_ids (globally unique file paths) and embeddings.
     At ingestion time, we resolve doc_id → paper_id using the merged main DB.
+    
+    Args:
+        conn: SQLite connection to main database
+        paper_index: FAISS index for papers
+        outdir: Directory containing segment files
+        save_every: Save index every N segment files
+        paper_id_map: Optional preloaded doc_id → paper_id mapping for O(1) lookups.
+                      If None, will be loaded once at start.
     """
     outdir = Path(outdir)
     if not outdir.exists():
@@ -1844,6 +1860,12 @@ def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int =
     )
     if not cand:
         return 0
+    
+    # Preload paper_id_map once if not provided (O(1) lookups vs O(N) queries)
+    if paper_id_map is None:
+        paper_id_map = preload_paper_id_map(conn)
+        _eprint(f"[segments] preloaded {len(paper_id_map)} paper ID mappings")
+    
     cur = conn.cursor()
     added_total = 0
     batch_counter = 0
@@ -1867,16 +1889,14 @@ def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int =
                     doc_ids = z["doc_ids"]  # object array of strings
                     X = np.ascontiguousarray(z["vecs"].astype(np.float32))
                     
-                    # Resolve doc_id → paper_id from main DB
+                    # Resolve doc_id → paper_id using preloaded map (O(1) lookups)
                     resolved_ids = []
                     valid_mask = []
                     for i, doc_id in enumerate(doc_ids):
                         doc_id_str = str(doc_id)
-                        row = cur.execute(
-                            "SELECT id FROM papers WHERE doc_id = ?", (doc_id_str,)
-                        ).fetchone()
-                        if row:
-                            resolved_ids.append(row[0])
+                        paper_id = paper_id_map.get(doc_id_str)
+                        if paper_id is not None:
+                            resolved_ids.append(paper_id)
                             valid_mask.append(True)
                         else:
                             # Paper not in merged DB yet - skip this embedding
@@ -1954,7 +1974,11 @@ def _ingest_paper_segments(conn, paper_index, outdir: Path, *, save_every: int =
     return added_total
 
 
-def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int = 2):
+def _ingest_chunk_segments(
+    conn, chunk_index, outdir: Path, *, save_every: int = 2,
+    paper_id_map: dict[str, int] | None = None,
+    chunk_id_map: dict[tuple[int, int], int] | None = None
+):
     """Ingest chunk embedding segments from producer nodes.
     
     Segments contain (paper_doc_id, ord) pairs and embeddings.
@@ -1965,6 +1989,16 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
       - if already ".npz.ingesting", read in place
       - on success, delete the .ingesting file
       - on failure, rename back so it can be retried next run
+
+    Args:
+        conn: SQLite connection to main database
+        chunk_index: FAISS index for chunks
+        outdir: Directory containing segment files
+        save_every: Save index every N segment files
+        paper_id_map: Optional preloaded doc_id → paper_id mapping for O(1) lookups.
+                      If None, will be loaded once at start.
+        chunk_id_map: Optional preloaded (paper_id, ord) → chunk_id mapping for O(1) lookups.
+                      If None, will be loaded once at start.
 
     Returns the number of vectors added.
     """
@@ -1986,6 +2020,14 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
     )
     if not cand:
         return 0
+
+    # Preload ID maps once if not provided (O(1) lookups vs O(N) queries)
+    if paper_id_map is None:
+        paper_id_map = preload_paper_id_map(conn)
+        _eprint(f"[segments] preloaded {len(paper_id_map)} paper ID mappings")
+    if chunk_id_map is None:
+        chunk_id_map = preload_chunk_id_map(conn)
+        _eprint(f"[segments] preloaded {len(chunk_id_map)} chunk ID mappings")
 
     cur = conn.cursor()
     added_total = 0
@@ -2018,28 +2060,22 @@ def _ingest_chunk_segments(conn, chunk_index, outdir: Path, *, save_every: int =
                     ords = z["ords"]  # int32 array
                     X = np.ascontiguousarray(z["vecs"].astype(np.float32))
                     
-                    # Resolve (paper_doc_id, ord) → chunk_id from main DB
+                    # Resolve (paper_doc_id, ord) → chunk_id using preloaded maps (O(1) lookups)
                     resolved_ids = []
                     valid_mask = []
                     for i, (doc_id, ord_val) in enumerate(zip(paper_doc_ids, ords)):
                         doc_id_str = str(doc_id)
                         ord_int = int(ord_val)
                         
-                        # First, get the paper_id from doc_id
-                        paper_row = cur.execute(
-                            "SELECT id FROM papers WHERE doc_id = ?", (doc_id_str,)
-                        ).fetchone()
+                        # Get paper_id from preloaded map
+                        paper_id = paper_id_map.get(doc_id_str)
                         
-                        if paper_row:
-                            paper_id = paper_row[0]
-                            # Now get the chunk_id from (paper_id, ord)
-                            chunk_row = cur.execute(
-                                "SELECT id FROM chunks WHERE paper_id = ? AND ord = ?",
-                                (paper_id, ord_int)
-                            ).fetchone()
+                        if paper_id is not None:
+                            # Get chunk_id from preloaded map
+                            chunk_id = chunk_id_map.get((paper_id, ord_int))
                             
-                            if chunk_row:
-                                resolved_ids.append(chunk_row[0])
+                            if chunk_id is not None:
+                                resolved_ids.append(chunk_id)
                                 valid_mask.append(True)
                             else:
                                 # Chunk not in merged DB yet - skip this embedding
@@ -5260,12 +5296,13 @@ def main():
     DEFAULT_BUSY_TIMEOUT_MS = int(args.sqlite_busy_timeout_ms)
 
     # Do we need tar shards?
+    # Note: --consume-only doesn't need corpus (it only ingests pre-computed segments)
     needs_corpus = (
         args.rebuild
         or args.update
         or args.build_only
         or args.embed_producer
-        or args.faiss_writer
+        or (args.faiss_writer and not args.consume_only)  # consume-only skips tar scanning
         or (not _vector_store_exists())
     ) and not args.init_indices_only  # Bootstrap doesn't need corpus
 
