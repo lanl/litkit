@@ -39,6 +39,24 @@ except ModuleNotFoundError:
     FLOCK_AVAILABLE = False
 
 
+def has_real_file_locks() -> bool:
+    """Return True if real inter-process file locking is available.
+    
+    This is False on Windows (no fcntl) and on filesystems where
+    advisory locking is unsupported (NFS without proper configuration).
+    
+    Use this to:
+    - Decide whether to allow concurrent writers
+    - Emit warnings when running in degraded mode
+    - Adjust behavior in higher-level code paths
+    """
+    return FLOCK_AVAILABLE and not _ADVISORY_LOCK_DISABLED
+
+
+# Track whether we've already warned about degraded mode
+_DEGRADED_MODE_WARNED = False
+
+
 # ---------------------------------------------------------------------------
 # Lock depth tracking (thread-local for proper nesting detection)
 # ---------------------------------------------------------------------------
@@ -74,7 +92,10 @@ def in_db_lock() -> bool:
 
 
 # Track advisory lock status
-_ADVISORY_LOCK_DISABLED = False
+# Set to True when:
+# - fcntl is unavailable (Windows)
+# - flock raises ENOTSUP/EOPNOTSUPP (NFS without advisory locking)
+_ADVISORY_LOCK_DISABLED = not FLOCK_AVAILABLE
 
 
 def _eprint(msg: str = "", *, end: str = "\n") -> None:
@@ -125,9 +146,11 @@ class FileLock:
         self._faiss_lock_path = faiss_lock_path
 
     def __enter__(self):
-        global _ADVISORY_LOCK_DISABLED
+        global _ADVISORY_LOCK_DISABLED, _DEGRADED_MODE_WARNED
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = open(self.path, "w")
+        # Use "a" mode to avoid truncating the lock file on each acquisition
+        # This is safer for cross-platform compatibility and external inspection
+        self._fd = open(self.path, "a")
 
         if FLOCK_AVAILABLE and fcntl is not None:
             try:
@@ -139,11 +162,22 @@ class FileLock:
                 eopnotsupp = getattr(errno, "EOPNOTSUPP", 95)
                 if e.errno not in (enotsup, eopnotsupp):
                     raise
-                _eprint(
-                    f"[lock] WARNING: flock unsupported on {self.path}; "
-                    "proceeding best-effort."
-                )
+                if not _DEGRADED_MODE_WARNED:
+                    _eprint(
+                        f"[lock] WARNING: flock unsupported on {self.path}; "
+                        "proceeding best-effort (no inter-process locking)."
+                    )
+                    _DEGRADED_MODE_WARNED = True
                 _ADVISORY_LOCK_DISABLED = True
+        else:
+            # No flock available (Windows) - log once
+            if not _DEGRADED_MODE_WARNED:
+                _eprint(
+                    "[lock] WARNING: Advisory file locking unavailable on "
+                    "this platform; proceeding best-effort (no inter-process "
+                    "locking). Writer modes may not be safe for concurrent use."
+                )
+                _DEGRADED_MODE_WARNED = True
 
         # Track depth for known lock paths
         if self._db_lock_path and self.path == self._db_lock_path:
