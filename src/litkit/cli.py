@@ -24,6 +24,13 @@
 # See docs/REFACTOR_ROADMAP.md for the full extraction plan.
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# --- Job 2 modules (available for incremental migration) ---
+# These modules now contain the canonical implementations of path discovery
+# and progress utilities. cli.py still has local copies for safety during
+# the migration. See docs/REFACTOR_ROADMAP.md for the extraction plan.
+# from litkit.config.paths import WorkspacePaths, get_default_paths
+# from litkit.progress import eprint, Progress, Pulse, phase, set_quiet
+
 import os
 import sys
 
