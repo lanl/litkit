@@ -45,6 +45,13 @@ from litkit.index.search import (
 from litkit.index.dedup import (
     add_with_ids_dedup,
 )
+from litkit.index.training import (
+    TrainingConfig,
+    TrainingResult,
+    compute_safe_ivfpq_params,
+    gather_training_samples,
+    train_ivfpq_index,
+)
 
 __all__ = [
     # Constants
@@ -76,4 +83,10 @@ __all__ = [
     "faiss_search",
     # Dedup
     "add_with_ids_dedup",
+    # Training
+    "TrainingConfig",
+    "TrainingResult",
+    "compute_safe_ivfpq_params",
+    "gather_training_samples",
+    "train_ivfpq_index",
 ]
