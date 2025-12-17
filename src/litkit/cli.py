@@ -103,7 +103,7 @@ from litkit.formatting.answers import (
 )
 from litkit.frontload.cap import cap_chunks_per_paper
 from litkit.ingest.ingest import (
-    ArticleMeta,
+ArticleMeta,
     TarMemberMeta,
     count_tar_xml_members,
     iter_tar_paths,
@@ -112,6 +112,9 @@ from litkit.ingest.ingest import (
     parallel_iter_tar_articles,
     parse_xml_fileobj,
 )
+from litkit.ingest import is_uncompressed_tar, shard_filter
+from litkit.index import safe_pq_m
+from litkit.pipeline import dedupe_ids_and_texts
 
 
 _FAISS_LOCK_DEPTH = threading.local()
@@ -2622,7 +2625,7 @@ def iter_tar_articles(
         - member_meta has .name, .size, .mtime attributes
         - article_meta is the parsed ArticleMeta dict
     """
-    use_parallel = parse_workers > 1 and _is_uncompressed_tar(tar_path)
+    use_parallel = parse_workers > 1 and is_uncompressed_tar(tar_path)
     
     if use_parallel:
         # Parallel path for uncompressed tars
@@ -3019,7 +3022,7 @@ def build_or_update_indices(args):
         if args.chunks_index == "flat":
             chunk_index = _flat_ip_index(chunk_dim)
         else:  # ivfpq
-            m_safe = _safe_pq_m(chunk_dim, args.pq_m)
+            m_safe = safe_pq_m(chunk_dim, args.pq_m)
             chunk_index = _ivfpq_index(chunk_dim, nlist=args.ivf_nlist, m=m_safe)
         
         chunk_index = faiss.IndexIDMap2(chunk_index)
@@ -3368,7 +3371,7 @@ def build_or_update_indices(args):
             k = (1 << pq_bits)
             min_for_micro = 256
             min_for_pq = 39 * k  # FAISS guidance ~39*k
-            m_candidate = _safe_pq_m(chunk_dim, args.pq_m)
+            m_candidate = safe_pq_m(chunk_dim, args.pq_m)
 
             # Early floor: require enough data for codebooks and subquantizers
             if n_train < max(min_for_micro, min_for_pq, 100 * m_candidate):
