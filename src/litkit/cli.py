@@ -885,18 +885,6 @@ def pack_paragraphs(
     return chunks
 
 
-def _dedupe_ids_and_texts(ids: list[int], texts: list[str]) -> tuple[list[int], list[str]]:
-    """Keep the first occurrence of each id; return aligned id/text lists."""
-    out_ids, out_texts, seen = [], [], set()
-    for i, t in zip(ids, texts, strict=False):
-        if i in seen:
-            continue
-        seen.add(i)
-        out_ids.append(i)
-        out_texts.append(t)
-    return out_ids, out_texts
-
-
 def _dedupe_papers_with_doc_ids(
     ids: list[int], texts: list[str], doc_ids: list[str]
 ) -> tuple[list[int], list[str], list[str]]:
@@ -1776,20 +1764,6 @@ def _ivfpq_index(dim: int, nlist: int = 16384, m: int = 64, bits: int = PQ_BITS)
     return idx
 
 
-def _safe_pq_m(dim: int, requested_m: int) -> int:
-    """Return the largest divisor of `dim` that is <= requested_m (and >=1).
-    Guarantees a valid FAISS IVFPQ `m` (subvector count).
-    """
-    if requested_m is None or requested_m <= 0:
-        requested_m = min(64, dim)
-    requested_m = min(requested_m, dim)
-    # scan downwards until we hit a divisor
-    for m in range(requested_m, 0, -1):
-        if dim % m == 0:
-            return m
-    return 1
-
-
 def _ensure_parent(path: Path):
     """Ensure parent directory of `path` exists."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2603,14 +2577,6 @@ def already_processed(cur, fpath: str, st) -> bool:
     return size == st.st_size and abs(mtime - st.st_mtime) < 1e-6
 
 
-def _is_uncompressed_tar(tar_path: Path) -> bool:
-    """Detect if a tar file is uncompressed (no .gz/.bz2/.xz suffix)."""
-    name = tar_path.name.lower()
-    return name.endswith(".tar") and not any(
-        name.endswith(ext) for ext in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".txz")
-    )
-
-
 def iter_tar_articles(
     tar_path: Path,
     parse_workers: int = 8,
@@ -2833,7 +2799,7 @@ def _flush_paper_batch(ctx: _IngestContext) -> None:
     if not ctx.paper_ids_buf:
         return
     
-    u_ids, u_texts = _dedupe_ids_and_texts(ctx.paper_ids_buf, ctx.paper_texts_buf)
+    u_ids, u_texts = dedupe_ids_and_texts(ctx.paper_ids_buf, ctx.paper_texts_buf)
 
     if paper_seg_writer is not None:
         Xp = ctx.paper_embedder.encode(
@@ -2889,7 +2855,7 @@ def _flush_chunk_batch(ctx: _IngestContext) -> None:
     if not ctx.chunk_ids_buf:
         return
     
-    u_ids, u_texts = _dedupe_ids_and_texts(ctx.chunk_ids_buf, ctx.chunk_texts_buf)
+    u_ids, u_texts = dedupe_ids_and_texts(ctx.chunk_ids_buf, ctx.chunk_texts_buf)
 
     if chunk_seg_writer is not None:
         Xc = ctx.chunk_embedder.encode(
@@ -3204,7 +3170,7 @@ def build_or_update_indices(args):
                     "CHUNK index does not exist. Start a writer with --faiss-writer or precreate the index."
                 )
         else:
-            m_safe = _safe_pq_m(chunk_dim, args.pq_m)
+            m_safe = safe_pq_m(chunk_dim, args.pq_m)
             if m_safe != args.pq_m:
                 _eprint(
                     f"[train] note: adjusted pq_m {args.pq_m} -> {m_safe} to divide dim={chunk_dim}"
@@ -3403,7 +3369,7 @@ def build_or_update_indices(args):
                     _clear_chunk_trained_flag()
                 else:
                     # 3) Train IVF-PQ with safe parameters
-                    m = m_candidate  # already a safe divisor from _safe_pq_m
+                    m = m_candidate  # already a safe divisor from safe_pq_m
                     if m != args.pq_m:
                         _eprint(f"[train] note: adjusted pq_m {args.pq_m} -> {m} to divide dim={chunk_dim}")
                     _eprint(f"[train] training IVF-PQ: nlist={eff_nlist} m={m} (dim={chunk_dim})")
@@ -3464,80 +3430,13 @@ def build_or_update_indices(args):
                                 _faiss_save(chunk_index, CHUNK_INDEX_PATH)
                         _clear_chunk_trained_flag()
 
-    def _shard_filter(paths, shard_id, num_shards):
-        """Deterministically assign tar files to shards using size-aware bin-packing
-        to balance load across producers.
-        
-        Algorithm:
-        1. Stat each tar file from the manifest to get sizes
-        2. Sort by size (largest first) for better packing
-        3. Greedy bin-packing: assign each tar to the shard with smallest current load
-        4. Yield only the tars assigned to this shard
-        
-        Falls back to hash-based sharding if stat fails (errors out loudly per user request).
-        """
-        # Materialize the path list for sorting
-        paths_list = list(paths)
-        
-        if not paths_list:
-            return
-        
-        # Collect sizes for load balancing
-        paths_with_sizes = []
-        for p in paths_list:
-            try:
-                size = p.stat().st_size
-                paths_with_sizes.append((p, size))
-            except Exception as e:
-                # User requested: fail loudly if a manifest file is unreadable
-                raise RuntimeError(f"Cannot stat tar file {p}: {e}") from e
-        
-        if not paths_with_sizes:
-            return  # all files failed stat (already raised above)
-        
-        # Sort by size (largest first) for better bin-packing
-        paths_with_sizes.sort(key=lambda x: x[1], reverse=True)
-        
-        # Greedy bin-packing: assign each tar to the shard with smallest current load
-        shard_loads = [0] * num_shards
-        shard_assignments = [[] for _ in range(num_shards)]
-        
-        for tar_path, size in paths_with_sizes:
-            # Find shard with minimum load
-            min_shard = min(range(num_shards), key=lambda i: shard_loads[i])
-            shard_assignments[min_shard].append((tar_path, size))
-            shard_loads[min_shard] += size
-        
-        # Log shard assignments (shows load balance across all shards)
-        if not QUIET:
-            _eprint(f"\n[shard] Load-balanced tar distribution across {num_shards} shard(s):")
-            for i in range(num_shards):
-                count = len(shard_assignments[i])
-                load_gb = shard_loads[i] / (1024**3)
-                marker = " <-- THIS SHARD" if i == shard_id else ""
-                _eprint(f"[shard]   Shard {i}/{num_shards}: {count} tar files, {load_gb:.2f} GB{marker}")
-                
-                # Show first few files for this shard if it's the current one
-                if i == shard_id and shard_assignments[i]:
-                    _eprint(f"[shard]   Files assigned to shard {shard_id}:")
-                    for j, (tar_p, tar_sz) in enumerate(shard_assignments[i][:5]):
-                        sz_gb = tar_sz / (1024**3)
-                        _eprint(f"[shard]     - {tar_p.name} ({sz_gb:.2f} GB)")
-                    if len(shard_assignments[i]) > 5:
-                        remaining = len(shard_assignments[i]) - 5
-                        _eprint(f"[shard]     ... and {remaining} more file(s)")
-        
-        # Yield only the tars assigned to this shard
-        for tar_path, _ in shard_assignments[shard_id]:
-            yield tar_path
-
     use_tar = (getattr(args, "tar_dir", None) is not None) or (
         getattr(args, "tar_manifest", None) is not None
     )
 
     # ----- TAR SHARD PATH (NO EXTRACTION) -----
     tar_paths = list(
-        _shard_filter(
+        shard_filter(
             iter_tar_paths(args.tar_dir, args.tar_manifest), args.shard_id, args.num_shards
         )
     )
@@ -3918,7 +3817,7 @@ def build_or_update_indices(args):
     if args.faiss_writer:
 
         if paper_ids_buf:
-            u_ids, u_texts = _dedupe_ids_and_texts(paper_ids_buf, paper_texts_buf)
+            u_ids, u_texts = dedupe_ids_and_texts(paper_ids_buf, paper_texts_buf)
             Xp = paper_embedder.encode(
                 u_texts,
                 progress_label=f"Embedding papers (batch of {len(u_texts)})",
@@ -3953,7 +3852,7 @@ def build_or_update_indices(args):
         paper_texts_buf.clear()
 
         if chunk_ids_buf:
-            u_ids, u_texts = _dedupe_ids_and_texts(chunk_ids_buf, chunk_texts_buf)
+            u_ids, u_texts = dedupe_ids_and_texts(chunk_ids_buf, chunk_texts_buf)
             Xc = chunk_embedder.encode(
                 u_texts,
                 progress_label=f"Embedding chunks (batch of {len(u_texts)})",
