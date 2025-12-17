@@ -1,6 +1,6 @@
 # LitKit Refactor Progress
 
-**Last Updated:** 2025-12-17  
+**Last Updated:** 2025-12-17 (Phase 1 Complete)  
 **Branch:** `feature/refactor-scope`
 
 ## Executive Summary
@@ -22,7 +22,8 @@ This document tracks the progress of extracting reusable modules from the monoli
 | 7 | `litkit.ingest` | 4 | ~464 | `b816d88` | ✅ Complete |
 | 8 | `litkit.pipeline` | 5 | ~561 | `561ed5d` | ✅ Complete |
 
-**Total extracted:** ~4,370 lines across 8 modules
+**Total extracted:** ~4,370 lines across 8 modules  
+**Dead code removed (Phase 1):** ~93 lines
 
 ### Module Structure
 
@@ -78,18 +79,30 @@ src/litkit/
     └── article.py      # process_article, flush_paper_buffer, flush_chunk_buffer
 ```
 
-## In-Progress Work (Job 9)
+## Completed Work (Job 9)
 
-### Phase 1: Simple Function Migration (In Progress)
+### Phase 1: Simple Function Migration ✅ Complete
 
 | Function | Status | Notes |
 |----------|--------|-------|
-| `_safe_pq_m` → `safe_pq_m` | 🟡 Partial | 2 of 4 calls replaced |
+| `_safe_pq_m` → `safe_pq_m` | ✅ Complete | All 4 calls replaced |
 | `_is_uncompressed_tar` → `is_uncompressed_tar` | ✅ Complete | All calls replaced |
-| `_shard_filter` → `shard_filter` | ❌ Not started | Complex nested function |
-| `_dedupe_ids_and_texts` → `dedupe_ids_and_texts` | 🟡 Imported | Ready to use |
+| `_shard_filter` → `shard_filter` | ✅ Complete | ~65-line nested function deleted |
+| `_dedupe_ids_and_texts` → `dedupe_ids_and_texts` | ✅ Complete | All 4 calls replaced |
 
-**Commit:** `fb9e635` (partial migration)
+**Commits:**
+- `fb9e635` - Start migration: add imports
+- `7cd61b8` - Complete Phase 1: replace all calls, delete dead code (~93 lines removed)
+
+### Dead Code Removed
+
+| Function | Lines | Location |
+|----------|-------|----------|
+| `_dedupe_ids_and_texts` | ~10 | line 888 |
+| `_safe_pq_m` | ~12 | line 1779 |
+| `_is_uncompressed_tar` | ~6 | line 2606 |
+| `_shard_filter` | ~65 | line 3467 (nested) |
+| **Total** | **~93** | |
 
 ## Future Work
 
