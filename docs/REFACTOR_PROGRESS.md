@@ -369,14 +369,54 @@ sed replacement.
 - ✅ Mac local build completes successfully (`./test_build.sh --clean --verbose`)
 - Note: `[faiss] remove_ids not supported` warning is expected and harmless (HNSW indices don't support ID removal)
 
+## Work Completed 2024-12-18 (Session 2)
+
+### Enhanced Segment Ingestion Module
+
+**Commit `d22daa4`:** `refactor(segments): enhance ingest module with cli.py features`
+
+Enhanced `litkit/segments/ingest.py` with robust features from cli.py's implementations:
+- Atomic file claiming (`.ingesting` rename pattern)
+- Content-addressed doc_id resolution with preloaded maps (O(1) lookups)
+- Warning logging for resolution failures
+- Support for both new format (`doc_ids/vecs`) and legacy format (`ids/vecs`)
+
+Wired `seg_ingest_paper_segments` and `seg_ingest_chunk_segments` into cli.py.
+
+### Fixed HNSW remove_ids Warning
+
+**Commit `3a48a2e`:** `fix(index): skip remove_ids silently for HNSW indices`
+
+Modified `safe_remove_ids()` in `litkit/index/ids.py` to check index type upfront
+and return silently for HNSW (which doesn't support ID removal). Eliminates the
+noisy `[faiss] remove_ids not supported` warning during paper embedding batches.
+
+### Investigation: `_add_ids_union_compat` Fallback
+
+Investigated whether cli.py's `_add_ids_union_compat` fallback is still needed:
+
+1. **pyproject.toml requires `faiss-cpu>=1.8,<1.9`** - FAISS 1.8+ fully supports
+   `add_with_ids` on IndexIDMap2.
+
+2. **`add_with_ids_dedup` already has internal fallback** - The module function
+   in `litkit/index/dedup.py` catches `RuntimeError` and falls back to skipping
+   present IDs.
+
+3. **Conclusion:** The cli.py `_add_ids_union_compat` is effectively dead code.
+   Safe to remove along with the local `_ingest_*` functions.
+
 ## Next Steps (Phase 5)
 
-1. **Final Cleanup:**
+1. **Immediate:**
+   - Remove `_ingest_paper_segments`, `_ingest_chunk_segments`, `_add_ids_union_compat` from cli.py (~400 lines)
+   - Test with `./test_build.sh --clean`
+
+2. **Final Cleanup:**
    - Remove the SCOPE CONTRACT comment block once cli.py is stable
    - Final lint and test pass
    - Update module docstrings
 
-2. **Optional Further Extraction:**
-   - Move segment ingestion functions to `litkit.segments.ingest` (after enhancing module)
+3. **Future Extraction Candidates:**
    - Move citation normalization to `litkit.formatting.answers`
    - Move lexical search helpers to `litkit.db.queries`
+   - Extract `build_or_update_indices` to `litkit.build` module

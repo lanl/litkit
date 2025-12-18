@@ -746,25 +746,6 @@ def _idmap_bloom(index, bits_per_key=8):
 # ------------------------------------------------------------------
 
 
-def _add_ids_union_compat(index, ids_list, X, *, table, cur, save_path: Path):
-    ids_arr = np.asarray(ids_list, dtype=np.int64)
-
-    present = faiss_present_ids(index) or set()
-    mask = np.array([int(i) not in present for i in ids_arr], dtype=bool)
-
-    if not mask.any():
-        db_mark_in_index(cur, table, [int(i) for i in ids_arr])
-        return 0
-
-    ids_new = ids_arr[mask]
-    X_new = np.ascontiguousarray(X[mask].astype("float32"))
-    faiss.normalize_L2(X_new)  # unit norm for IP == cosine (same as _add_with_ids_dedup)
-    index.add_with_ids(X_new, ids_new)
-    faiss_save(index, save_path)
-    db_mark_in_index(cur, table, [int(i) for i in ids_new])
-    return int(ids_new.size)
-
-
 # Throttle index saves to reduce I/O on shared filesystems.
 _SAVE_MIN_SEC = int(os.environ.get("LITKIT_SAVE_EVERY_SEC", "120"))
 _last_save_ts = {"papers": 0.0, "chunks": 0.0}
@@ -810,350 +791,6 @@ def _ensure_parent(path: Path):
 
 
 # -------------------- Embedding segment I/O (producer↔writer) --------------------
-def _ingest_paper_segments(
-    conn, paper_index, outdir: Path, *, save_every: int = 2, paper_id_map: dict[str, int] | None = None
-) -> tuple:
-    """Ingest paper embedding segments from producer nodes.
-    
-    Segments contain doc_ids (globally unique file paths) and embeddings.
-    At ingestion time, we resolve doc_id → paper_id using the merged main DB.
-    
-    Args:
-        conn: SQLite connection to main database
-        paper_index: FAISS index for papers (may be wrapped in IndexIDMap2 if needed)
-        outdir: Directory containing segment files
-        save_every: Save index every N segment files
-        paper_id_map: Optional preloaded doc_id → paper_id mapping for O(1) lookups.
-                      If None, will be loaded once at start.
-    
-    Returns:
-        (paper_index, added_count): The (possibly wrapped) index and number of vectors added.
-        Caller should rebind their index reference to the returned value.
-    """
-    outdir = Path(outdir)
-    if not outdir.exists():
-        return paper_index, 0
-    cand = sorted(
-        list(outdir.glob("papers_*.npz"))  # new style
-        + list(outdir.glob("papers.seg.*.npz"))  # old style
-        + list(outdir.glob("papers_*.npz.ingesting"))
-        + list(outdir.glob("papers.seg.*.npz.ingesting"))
-    )
-    if not cand:
-        return paper_index, 0
-    
-    # Preload paper_id_map once if not provided (O(1) lookups vs O(N) queries)
-    if paper_id_map is None:
-        paper_id_map = db_preload_paper_id_map(conn)
-        _eprint(f"[segments] preloaded {len(paper_id_map)} paper ID mappings")
-    
-    cur = conn.cursor()
-    added_total = 0
-    batch_counter = 0
-    for p in cand:
-        is_ingesting = p.name.endswith(".npz.ingesting")
-        tmp = p if is_ingesting else p.with_suffix(p.suffix + ".ingesting")
-        if not is_ingesting:
-            try:
-                os.replace(p, tmp)
-            except FileNotFoundError:
-                continue
-            except Exception:
-                continue
-        try:
-            with np.load(tmp, mmap_mode="r", allow_pickle=True) as z:
-                if "kind" in z.files and str(z["kind"].item()).strip() != "papers":
-                    raise ValueError("wrong segment kind for paper ingester")
-                
-                # New format: doc_ids + vecs (content-addressed)
-                if "doc_ids" in z.files and "vecs" in z.files:
-                    doc_ids = z["doc_ids"]  # object array of strings
-                    X = np.ascontiguousarray(z["vecs"].astype(np.float32))
-                    
-                    # Resolve doc_id → paper_id using preloaded map (O(1) lookups)
-                    resolved_ids = []
-                    valid_mask = []
-                    for i, doc_id in enumerate(doc_ids):
-                        doc_id_str = str(doc_id)
-                        paper_id = paper_id_map.get(doc_id_str)
-                        if paper_id is not None:
-                            resolved_ids.append(paper_id)
-                            valid_mask.append(True)
-                        else:
-                            # Paper not in merged DB yet - skip this embedding
-                            valid_mask.append(False)
-                    
-                    # Log resolution failures for debugging canonicalization issues
-                    missing = np.count_nonzero(~np.array(valid_mask, dtype=bool))
-                    if missing:
-                        _eprint(f"[segments] WARNING: skipped {missing}/{len(doc_ids)} paper embeddings in {p.name} "
-                                "(doc_id not found in main DB - check doc_id canonicalization)")
-                    
-                    if not resolved_ids:
-                        os.remove(tmp)
-                        continue
-                    
-                    # Filter to only valid entries
-                    valid_mask = np.array(valid_mask, dtype=bool)
-                    ids = np.array(resolved_ids, dtype=np.int64)
-                    X = X[valid_mask]
-                
-                # Legacy format: ids + vecs (shard-local IDs, deprecated)
-                elif "ids" in z.files and ("vecs" in z.files or "emb" in z.files):
-                    ids = np.ascontiguousarray(z["ids"].astype(np.int64))
-                    X = np.ascontiguousarray(
-                        (z["vecs"] if "vecs" in z.files else z["emb"]).astype(np.float32)
-                    )
-                else:
-                    raise ValueError(f"Segment missing doc_ids/vecs or ids/vecs in {p.name}")
-            
-            if ids.size == 0:
-                os.remove(tmp)
-                continue
-
-            if not isinstance(paper_index, faiss.IndexIDMap2):
-                paper_index = faiss.IndexIDMap2(paper_index)
-
-            prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
-            added, ids_added, saved = 0, [], False
-            try:
-                with FileLock(FAISS_LOCK):
-                    added, ids_added = add_with_ids_dedup(paper_index, ids, X)
-                    if added:
-                        saved = faiss_save_force(paper_index, PAPER_INDEX_PATH) if prior_ntotal == 0 \
-                                else faiss_save(paper_index, PAPER_INDEX_PATH)
-            except RuntimeError:
-                # Compat path: hold DB_LOCK then FAISS_LOCK (lock-order invariant), and commit under DB_LOCK.
-                with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                    added = _add_ids_union_compat(
-                        paper_index, ids, X, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
-                    )
-                    conn.commit()
-                saved = bool(added)
-            if added:
-                if saved:
-                    with FileLock(DB_LOCK):
-                        if len(ids_added) > 0:
-                            db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
-                        conn.commit()
-                else:
-                    if len(ids_added) > 0:
-                        _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
-
-            added_total += int(added or 0)
-            batch_counter += 1
-            os.remove(tmp)
-
-            if (batch_counter % max(1, int(save_every))) == 0:
-                with FileLock(FAISS_LOCK):
-                    saved_now = faiss_save(paper_index, PAPER_INDEX_PATH)
-                if saved_now:
-                    with FileLock(DB_LOCK):
-                        db_flush_pending_marks(cur)
-                        conn.commit()
-        except Exception as e:
-            if not is_ingesting:
-                try:
-                    os.replace(tmp, p)
-                except Exception:
-                    pass
-            _eprint(f"[segments] ERROR ingesting {p.name}: {e.__class__.__name__}: {e}")
-    return paper_index, added_total
-
-
-def _ingest_chunk_segments(
-    conn, chunk_index, outdir: Path, *, save_every: int = 2,
-    paper_id_map: dict[str, int] | None = None,
-    chunk_id_map: dict[tuple[int, int], int] | None = None
-) -> tuple:
-    """Ingest chunk embedding segments from producer nodes.
-    
-    Segments contain (paper_doc_id, ord) pairs and embeddings.
-    At ingestion time, we resolve (paper_doc_id, ord) → chunk_id using the merged main DB.
-    
-    Safe file-handling:
-      - rename "<file>.npz" -> "<file>.npz.ingesting" before reading (atomic)
-      - if already ".npz.ingesting", read in place
-      - on success, delete the .ingesting file
-      - on failure, rename back so it can be retried next run
-
-    Args:
-        conn: SQLite connection to main database
-        chunk_index: FAISS index for chunks (may be wrapped in IndexIDMap2 if needed)
-        outdir: Directory containing segment files
-        save_every: Save index every N segment files
-        paper_id_map: Optional preloaded doc_id → paper_id mapping for O(1) lookups.
-                      If None, will be loaded once at start.
-        chunk_id_map: Optional preloaded (paper_id, ord) → chunk_id mapping for O(1) lookups.
-                      If None, will be loaded once at start.
-
-    Returns:
-        (chunk_index, added_count): The (possibly wrapped) index and number of vectors added.
-        Caller should rebind their index reference to the returned value.
-    """
-    outdir = Path(outdir)
-    if not outdir.exists():
-        return chunk_index, 0
-
-    # Ensure external ID mapping is present for robust remove and add
-    if not isinstance(chunk_index, faiss.IndexIDMap2):
-        chunk_index = faiss.IndexIDMap2(chunk_index)
-
-    # Accept both our writer's names and generic .npz containing {'ids','vecs'}.
-    # Also consider files already in the ".ingesting" state.
-    cand = sorted(
-        list(outdir.glob("chunks_*.npz"))  # new style
-        + list(outdir.glob("chunks.seg.*.npz"))  # old style
-        + list(outdir.glob("chunks_*.npz.ingesting"))
-        + list(outdir.glob("chunks.seg.*.npz.ingesting"))
-    )
-    if not cand:
-        return chunk_index, 0
-
-    # Preload ID maps once if not provided (O(1) lookups vs O(N) queries)
-    if paper_id_map is None:
-        paper_id_map = db_preload_paper_id_map(conn)
-        _eprint(f"[segments] preloaded {len(paper_id_map)} paper ID mappings")
-    if chunk_id_map is None:
-        chunk_id_map = db_preload_chunk_id_map(conn)
-        _eprint(f"[segments] preloaded {len(chunk_id_map)} chunk ID mappings")
-
-    cur = conn.cursor()
-    added_total = 0
-    batch_counter = 0
-
-    for p in cand:
-        # Normalize to a working path "tmp" that we always read from:
-        is_ingesting = p.name.endswith(".npz.ingesting")
-        tmp = p if is_ingesting else p.with_suffix(p.suffix + ".ingesting")
-
-        if not is_ingesting:
-            try:
-                # Claim atomically; another writer may race us.
-                os.replace(p, tmp)
-            except FileNotFoundError:
-                continue
-            except Exception:
-                # Could not claim; skip
-                continue
-
-        try:
-            with np.load(tmp, mmap_mode="r", allow_pickle=True) as z:
-                # Reject wrong-kind files (old .seg has 'kind')
-                if "kind" in z.files and str(z["kind"].item()).strip() != "chunks":
-                    raise ValueError("wrong segment kind for chunk ingester")
-                
-                # New format: paper_doc_ids + ords + vecs (content-addressed)
-                if "paper_doc_ids" in z.files and "ords" in z.files and "vecs" in z.files:
-                    paper_doc_ids = z["paper_doc_ids"]  # object array of strings
-                    ords = z["ords"]  # int32 array
-                    X = np.ascontiguousarray(z["vecs"].astype(np.float32))
-                    
-                    # Resolve (paper_doc_id, ord) → chunk_id using preloaded maps (O(1) lookups)
-                    resolved_ids = []
-                    valid_mask = []
-                    for i, (doc_id, ord_val) in enumerate(zip(paper_doc_ids, ords)):
-                        doc_id_str = str(doc_id)
-                        ord_int = int(ord_val)
-                        
-                        # Get paper_id from preloaded map
-                        paper_id = paper_id_map.get(doc_id_str)
-                        
-                        if paper_id is not None:
-                            # Get chunk_id from preloaded map
-                            chunk_id = chunk_id_map.get((paper_id, ord_int))
-                            
-                            if chunk_id is not None:
-                                resolved_ids.append(chunk_id)
-                                valid_mask.append(True)
-                            else:
-                                # Chunk not in merged DB yet - skip this embedding
-                                valid_mask.append(False)
-                        else:
-                            # Paper not in merged DB yet - skip this embedding
-                            valid_mask.append(False)
-                    
-                    # Log resolution failures for debugging canonicalization issues
-                    missing = np.count_nonzero(~np.array(valid_mask, dtype=bool))
-                    if missing:
-                        _eprint(f"[segments] WARNING: skipped {missing}/{len(paper_doc_ids)} chunk embeddings in {p.name} "
-                                "(doc_id/ord not found in main DB - check doc_id canonicalization)")
-                    
-                    if not resolved_ids:
-                        os.remove(tmp)
-                        continue
-                    
-                    # Filter to only valid entries
-                    valid_mask = np.array(valid_mask, dtype=bool)
-                    ids = np.array(resolved_ids, dtype=np.int64)
-                    X = X[valid_mask]
-                
-                # Legacy format: ids + vecs (shard-local IDs, deprecated)
-                elif "ids" in z.files and "vecs" in z.files:
-                    ids = np.ascontiguousarray(z["ids"].astype(np.int64))
-                    X = np.ascontiguousarray(z["vecs"].astype(np.float32))
-                elif "ids" in z.files and "emb" in z.files:
-                    ids = np.ascontiguousarray(z["ids"].astype(np.int64))
-                    X = np.ascontiguousarray(z["emb"].astype(np.float32))
-                else:
-                    raise ValueError(f"Segment missing required keys: {z.files}")
-
-            if ids.size == 0:
-                os.remove(tmp)
-                continue
-
-            prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
-            added, ids_added, saved = 0, [], False
-            try:
-                with FileLock(FAISS_LOCK):
-                    sel = make_id_selector(ids)
-                    safe_remove_ids(chunk_index, sel)
-                    added, ids_added = add_with_ids_dedup(chunk_index, ids, X)
-                    if added:
-                        saved = faiss_save_force(chunk_index, CHUNK_INDEX_PATH) if prior_ntotal == 0 \
-                                else faiss_save(chunk_index, CHUNK_INDEX_PATH)
-            except RuntimeError:
-                with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                    added = _add_ids_union_compat(
-                        chunk_index, ids, X, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
-                    )
-                    conn.commit()
-                saved = bool(added)
-            if added:
-                if saved:
-                    with FileLock(DB_LOCK):
-                        if len(ids_added) > 0:
-                            db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
-                        conn.commit()
-                else:
-                    if len(ids_added) > 0:
-                        _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
-
-            added_total += int(added)
-            batch_counter += 1
-            os.remove(tmp)
-
-            if (batch_counter % max(1, int(save_every))) == 0:
-                with FileLock(FAISS_LOCK):
-                    saved_now = faiss_save(chunk_index, CHUNK_INDEX_PATH)
-                if saved_now:
-                    with FileLock(DB_LOCK):
-                        db_flush_pending_marks(cur)
-                        conn.commit()
-
-        except Exception as e:
-            # If we claimed it, put it back so another run can retry.
-            if not is_ingesting:
-                try:
-                    os.replace(tmp, p)
-                except Exception:
-                    pass
-            _eprint(f"[segments] ERROR ingesting {p.name}: {e.__class__.__name__}: {e}")
-
-    return chunk_index, added_total
-
-
-
 
 def backfill_unindexed_vectors(
     conn,
@@ -1188,25 +825,15 @@ def backfill_unindexed_vectors(
         if not isinstance(paper_index, faiss.IndexIDMap2):
             paper_index = faiss.IndexIDMap2(paper_index)
 
-        try:
-            prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
-            with FileLock(FAISS_LOCK):
-                sel = make_id_selector(ids)
-                safe_remove_ids(paper_index, sel)
-                added, ids_added = add_with_ids_dedup(paper_index, ids, Xp)
-                saved = False
-                if added:
-                    saved = faiss_save_force(paper_index, PAPER_INDEX_PATH) if prior_ntotal == 0 \
-                            else faiss_save(paper_index, PAPER_INDEX_PATH)
-        except RuntimeError:
-            # Fallback: _add_ids_union_compat handles db_mark_in_index internally
-            with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                added = _add_ids_union_compat(
-                    paper_index, ids, Xp, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
-                )
-                conn.commit()
-            # No external marking needed - already done inside _add_ids_union_compat
-            continue
+        prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
+        with FileLock(FAISS_LOCK):
+            sel = make_id_selector(ids)
+            safe_remove_ids(paper_index, sel)
+            added, ids_added = add_with_ids_dedup(paper_index, ids, Xp)
+            saved = False
+            if added:
+                saved = faiss_save_force(paper_index, PAPER_INDEX_PATH) if prior_ntotal == 0 \
+                        else faiss_save(paper_index, PAPER_INDEX_PATH)
         if added and saved:
             with FileLock(DB_LOCK):
                 db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
@@ -1234,25 +861,15 @@ def backfill_unindexed_vectors(
         if not isinstance(chunk_index, faiss.IndexIDMap2):
             chunk_index = faiss.IndexIDMap2(chunk_index)
 
-        try:
-            prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
-            with FileLock(FAISS_LOCK):
-                sel = make_id_selector(ids)
-                safe_remove_ids(chunk_index, sel)
-                added, ids_added = add_with_ids_dedup(chunk_index, ids, Xc)
-                saved = False
-                if added:
-                    saved = faiss_save_force(chunk_index, CHUNK_INDEX_PATH) if prior_ntotal == 0 \
-                            else faiss_save(chunk_index, CHUNK_INDEX_PATH)
-        except RuntimeError:
-            # Fallback: _add_ids_union_compat handles db_mark_in_index internally
-            with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                added = _add_ids_union_compat(
-                    chunk_index, ids, Xc, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
-                )
-                conn.commit()
-            # No external marking needed - already done inside _add_ids_union_compat
-            continue
+        prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
+        with FileLock(FAISS_LOCK):
+            sel = make_id_selector(ids)
+            safe_remove_ids(chunk_index, sel)
+            added, ids_added = add_with_ids_dedup(chunk_index, ids, Xc)
+            saved = False
+            if added:
+                saved = faiss_save_force(chunk_index, CHUNK_INDEX_PATH) if prior_ntotal == 0 \
+                        else faiss_save(chunk_index, CHUNK_INDEX_PATH)
         if added and saved:
             with FileLock(DB_LOCK):
                 db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
@@ -2426,23 +2043,18 @@ def build_or_update_indices(args):
                 paper_index = faiss.IndexIDMap2(paper_index)
 
             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                try:
-                    prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
-                    added, ids_added = add_with_ids_dedup(paper_index, u_ids, Xp)
-                    if added:
-                        if prior_ntotal == 0:
-                            faiss_save_force(paper_index, PAPER_INDEX_PATH)
+                prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
+                added, ids_added = add_with_ids_dedup(paper_index, u_ids, Xp)
+                if added:
+                    if prior_ntotal == 0:
+                        faiss_save_force(paper_index, PAPER_INDEX_PATH)
+                        db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
+                    else:
+                        if faiss_save(paper_index, PAPER_INDEX_PATH):
                             db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
+                            db_flush_pending_marks(cur)
                         else:
-                            if faiss_save(paper_index, PAPER_INDEX_PATH):
-                                db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
-                                db_flush_pending_marks(cur)
-                            else:
-                                _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
-                except RuntimeError:
-                    added = _add_ids_union_compat(
-                        paper_index, u_ids, Xp, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
-                    )
+                            _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
                 conn.commit()
             papers_added_total += int(added)
 
@@ -2461,23 +2073,18 @@ def build_or_update_indices(args):
                 chunk_index = faiss.IndexIDMap2(chunk_index)
 
             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                try:
-                    prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
-                    added, ids_added = add_with_ids_dedup(chunk_index, u_ids, Xc)
-                    if added:
-                        if prior_ntotal == 0:
-                            faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+                prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
+                added, ids_added = add_with_ids_dedup(chunk_index, u_ids, Xc)
+                if added:
+                    if prior_ntotal == 0:
+                        faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+                        db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
+                    else:
+                        if faiss_save(chunk_index, CHUNK_INDEX_PATH):
                             db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
+                            db_flush_pending_marks(cur)
                         else:
-                            if faiss_save(chunk_index, CHUNK_INDEX_PATH):
-                                db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
-                                db_flush_pending_marks(cur)
-                            else:
-                                _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
-                except RuntimeError:
-                    added = _add_ids_union_compat(
-                        chunk_index, u_ids, Xc, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
-                    )
+                            _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
                 conn.commit()
             chunks_added_total += int(added)
 
