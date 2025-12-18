@@ -2338,27 +2338,8 @@ def _normalize_for_search_py(s: str) -> str:
     return s.translate(trans)
 
 
-def load_checkpoint() -> dict:
-    """Load JSON checkpoint (if exists) for resumable workflows; else {}."""
-    get_runtime()  # ensure CKPT_PATH is bound
-    if CKPT_PATH.exists():
-        try:
-            return json.loads(CKPT_PATH.read_text())
-        except Exception:
-            return {}
-    return {}
-
-
-def save_checkpoint(obj: dict):
-    get_runtime()  # ensure CKPT_PATH and CKPT_LOCK are bound
-    with FileLock(CKPT_LOCK):
-        tmp = CKPT_PATH.with_suffix(".tmp")
-        with open(tmp, "w") as fh:
-            fh.write(json.dumps(obj, indent=2))
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, CKPT_PATH)
-        _maybe_fsync_dir(CKPT_PATH)
+# NOTE: load_checkpoint and save_checkpoint moved to litkit.segments.checkpoint
+# Use seg_load_checkpoint() and seg_save_checkpoint() from imports above.
 
 
 def iter_tar_articles(
@@ -3319,7 +3300,7 @@ def build_or_update_indices(args):
         conn.commit()
         ckpt_stream[str(tpath)] = processed_count
         ckpt["build_stream"] = ckpt_stream
-        save_checkpoint(ckpt)
+        seg_save_checkpoint(ckpt, CKPT_PATH, CKPT_LOCK, shard_id=ckpt_shard_id)
 
     if args.faiss_writer:
 
