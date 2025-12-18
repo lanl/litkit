@@ -9,6 +9,8 @@ from typing import Any
 import faiss
 import numpy as np
 
+from litkit.index.constants import INDEX_KIND_HNSW
+
 
 def _eprint(msg: str = "", *, end: str = "\n") -> None:
     """Print to stderr with flush."""
@@ -49,8 +51,8 @@ def make_id_selector(ids_like: list[int] | np.ndarray) -> Any:
 def safe_remove_ids(index: faiss.Index, sel: Any) -> int:
     """Best-effort removal of IDs from a FAISS index.
     
-    Works with IDMap2/HNSW/FLAT/IVF indices. Some index types don't
-    support removal, in which case this is a no-op.
+    Works with IDMap2/FLAT/IVF indices. HNSW indices don't support
+    removal, so this is a silent no-op for them.
     
     Args:
         index: FAISS index
@@ -59,6 +61,14 @@ def safe_remove_ids(index: faiss.Index, sel: Any) -> int:
     Returns:
         Number of IDs removed (0 if removal not supported)
     """
+    # Import here to avoid circular dependency
+    from litkit.index.introspection import kind_and_core
+    
+    # Check index type - HNSW doesn't support removal, skip silently
+    kind, _ = kind_and_core(index)
+    if kind == INDEX_KIND_HNSW:
+        return 0  # No-op, no warning - HNSW doesn't support ID removal
+    
     # Handle raw array fallback (when no IDSelector available)
     if isinstance(sel, np.ndarray):
         # Try remove_ids with array directly (some FAISS versions support it)
@@ -71,6 +81,6 @@ def safe_remove_ids(index: faiss.Index, sel: Any) -> int:
     try:
         return index.remove_ids(sel)
     except (TypeError, AttributeError, RuntimeError) as e:
-        # Some index types don't support removal
+        # Some index types don't support removal (unexpected)
         _eprint(f"[faiss] remove_ids not supported: {e}")
         return 0
