@@ -1,10 +1,19 @@
 # litkit/segments/ingest.py
-"""Segment ingestion into FAISS indices for litkit."""
+"""Segment ingestion into FAISS indices for litkit.
+
+This module handles the consumer side of the producer-consumer workflow:
+- Loads embedding segments written by producer nodes
+- Resolves doc_ids to database IDs using preloaded maps
+- Adds vectors to FAISS indices with deduplication
+- Supports atomic file claiming to prevent race conditions
+"""
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -12,19 +21,20 @@ from typing import TYPE_CHECKING
 import faiss
 import numpy as np
 
-from litkit.segments.constants import (
-    PAPER_SEGMENT_PREFIX,
-    CHUNK_SEGMENT_PREFIX,
-    SEGMENT_EXTENSION,
-)
 from litkit.db.queries import preload_paper_id_map, preload_chunk_id_map
-from litkit.db.indexing import add_pending_marks, flush_pending_marks
 from litkit.index.dedup import add_with_ids_dedup
-from litkit.index.io import faiss_save
-from litkit.concurrent.locking import FileLock
+from litkit.index.io import faiss_save, faiss_save_force
+from litkit.index.ids import make_id_selector, safe_remove_ids
 
 if TYPE_CHECKING:
     from litkit.config.paths import WorkspacePaths
+
+
+# ---------------------------------------------------------------------------
+# Module-level pending marks buffer (used by segment ingestion)
+# ---------------------------------------------------------------------------
+
+_PENDING_MARKS: dict[str, list[int]] = defaultdict(list)
 
 
 def _eprint(msg: str = "", *, end: str = "\n") -> None:
@@ -44,17 +54,36 @@ class SegmentIngestConfig:
     save_every: int = 2  # Save FAISS index every N segments
 
 
-def _load_segment(path: Path) -> dict:
-    """Load a segment file and return its contents.
+def _glob_segment_files(outdir: Path, kind: str) -> list[Path]:
+    """Find segment files matching both new and old naming patterns.
     
     Args:
-        path: Path to .npz segment file
+        outdir: Directory to search
+        kind: Either "papers" or "chunks"
     
     Returns:
-        Dictionary with arrays from the segment
+        Sorted list of segment file paths (including .ingesting files)
     """
-    with np.load(path, allow_pickle=True) as data:
-        return {k: data[k] for k in data.files}
+    cand = []
+    
+    if kind == "papers":
+        # New style: papers_*.npz
+        cand.extend(outdir.glob("papers_*.npz"))
+        # Old style: papers.seg.*.npz
+        cand.extend(outdir.glob("papers.seg.*.npz"))
+        # In-progress files from previous interrupted runs
+        cand.extend(outdir.glob("papers_*.npz.ingesting"))
+        cand.extend(outdir.glob("papers.seg.*.npz.ingesting"))
+    else:  # chunks
+        # New style: chunks_*.npz
+        cand.extend(outdir.glob("chunks_*.npz"))
+        # Old style: chunks.seg.*.npz
+        cand.extend(outdir.glob("chunks.seg.*.npz"))
+        # In-progress files from previous interrupted runs
+        cand.extend(outdir.glob("chunks_*.npz.ingesting"))
+        cand.extend(outdir.glob("chunks.seg.*.npz.ingesting"))
+    
+    return sorted(cand)
 
 
 def ingest_paper_segments(
@@ -63,100 +92,180 @@ def ingest_paper_segments(
     outdir: Path,
     faiss_lock_path: Path,
     paper_index_path: Path,
+    db_lock_path: Path | None = None,
     *,
     save_every: int = 2,
     paper_id_map: dict[str, int] | None = None,
-) -> int:
-    """Ingest paper embedding segments into FAISS index.
+    FileLock: type | None = None,
+) -> tuple[faiss.Index, int]:
+    """Ingest paper embedding segments from producer nodes.
     
-    Loads segment files, resolves doc_ids to paper IDs using the database,
-    adds embeddings to the FAISS index, and marks papers as indexed.
+    Segments contain doc_ids (globally unique file paths) and embeddings.
+    At ingestion time, we resolve doc_id → paper_id using the merged main DB.
+    
+    Uses atomic file claiming (.ingesting rename) to prevent race conditions
+    between multiple consumers.
     
     Args:
-        conn: Database connection
-        paper_index: FAISS index for papers
+        conn: SQLite connection to main database
+        paper_index: FAISS index for papers (may be wrapped in IndexIDMap2 if needed)
         outdir: Directory containing segment files
         faiss_lock_path: Path to FAISS lock file
         paper_index_path: Path to save the paper index
-        save_every: Save index after every N segments
-        paper_id_map: Optional pre-loaded doc_id -> paper_id mapping
+        db_lock_path: Path to DB lock file (optional, for commit locking)
+        save_every: Save index every N segment files
+        paper_id_map: Optional preloaded doc_id → paper_id mapping for O(1) lookups.
+                      If None, will be loaded once at start.
+        FileLock: File lock class to use (pass from caller to avoid circular import)
     
     Returns:
-        Total number of paper vectors added
+        (paper_index, added_count): The (possibly wrapped) index and number of vectors added.
+        Caller should rebind their index reference to the returned value.
     """
+    # Lazy import if not provided
+    if FileLock is None:
+        from litkit.concurrent.locking import FileLock as _FileLock
+        FileLock = _FileLock
+    
     outdir = Path(outdir)
     if not outdir.exists():
-        return 0
+        return paper_index, 0
     
-    # Find paper segment files
-    pattern = f"{PAPER_SEGMENT_PREFIX}_*{SEGMENT_EXTENSION}"
-    seg_files = sorted(outdir.glob(pattern))
+    cand = _glob_segment_files(outdir, "papers")
+    if not cand:
+        return paper_index, 0
     
-    if not seg_files:
-        return 0
-    
-    # Load paper ID map if not provided
+    # Preload paper_id_map once if not provided (O(1) lookups vs O(N) queries)
     if paper_id_map is None:
         paper_id_map = preload_paper_id_map(conn)
+        _eprint(f"[segments] preloaded {len(paper_id_map)} paper ID mappings")
     
-    total_added = 0
     cur = conn.cursor()
+    added_total = 0
+    batch_counter = 0
     
-    for i, seg_path in enumerate(seg_files):
+    for p in cand:
+        is_ingesting = p.name.endswith(".npz.ingesting")
+        tmp = p if is_ingesting else p.with_suffix(p.suffix + ".ingesting")
+        
+        # Atomic claim: rename to .ingesting before reading
+        if not is_ingesting:
+            try:
+                os.replace(p, tmp)
+            except FileNotFoundError:
+                continue  # Another process claimed it
+            except Exception:
+                continue
+        
         try:
-            data = _load_segment(seg_path)
-            doc_ids = data["doc_ids"]
-            embeddings = data["embeddings"].astype("float32")
-            
-            # Resolve doc_ids to paper IDs
-            ids = []
-            valid_rows = []
-            for j, doc_id in enumerate(doc_ids):
-                pid = paper_id_map.get(str(doc_id))
-                if pid is not None:
-                    ids.append(pid)
-                    valid_rows.append(j)
-                else:
-                    _eprint(
-                        f"[ingest] WARNING: unknown doc_id {doc_id}, skipping"
+            with np.load(tmp, mmap_mode="r", allow_pickle=True) as z:
+                # Reject wrong-kind files
+                if "kind" in z.files and str(z["kind"].item()).strip() != "papers":
+                    raise ValueError("wrong segment kind for paper ingester")
+                
+                # New format: doc_ids + vecs (content-addressed)
+                if "doc_ids" in z.files and "vecs" in z.files:
+                    doc_ids = z["doc_ids"]  # object array of strings
+                    X = np.ascontiguousarray(z["vecs"].astype(np.float32))
+                    
+                    # Resolve doc_id → paper_id using preloaded map (O(1) lookups)
+                    resolved_ids = []
+                    valid_mask = []
+                    for i, doc_id in enumerate(doc_ids):
+                        doc_id_str = str(doc_id)
+                        paper_id = paper_id_map.get(doc_id_str)
+                        if paper_id is not None:
+                            resolved_ids.append(paper_id)
+                            valid_mask.append(True)
+                        else:
+                            valid_mask.append(False)
+                    
+                    # Log resolution failures for debugging canonicalization issues
+                    missing = np.count_nonzero(~np.array(valid_mask, dtype=bool))
+                    if missing:
+                        _eprint(f"[segments] WARNING: skipped {missing}/{len(doc_ids)} paper embeddings in {p.name} "
+                                "(doc_id not found in main DB - check doc_id canonicalization)")
+                    
+                    if not resolved_ids:
+                        os.remove(tmp)
+                        continue
+                    
+                    # Filter to only valid entries
+                    valid_mask = np.array(valid_mask, dtype=bool)
+                    ids = np.array(resolved_ids, dtype=np.int64)
+                    X = X[valid_mask]
+                
+                # Legacy format: ids + vecs (shard-local IDs, deprecated)
+                elif "ids" in z.files and ("vecs" in z.files or "emb" in z.files):
+                    ids = np.ascontiguousarray(z["ids"].astype(np.int64))
+                    X = np.ascontiguousarray(
+                        (z["vecs"] if "vecs" in z.files else z["emb"]).astype(np.float32)
                     )
+                else:
+                    raise ValueError(f"Segment missing doc_ids/vecs or ids/vecs in {p.name}")
             
-            if not ids:
-                seg_path.unlink()
+            if ids.size == 0:
+                os.remove(tmp)
                 continue
             
-            # Filter to valid rows
-            X = embeddings[valid_rows]
+            # Ensure IDMap2 wrapper for external ID tracking
+            if not isinstance(paper_index, faiss.IndexIDMap2):
+                paper_index = faiss.IndexIDMap2(paper_index)
             
-            # Add to FAISS with dedup
+            prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
+            added, ids_added, saved = 0, [], False
+            
             with FileLock(faiss_lock_path):
                 added, ids_added = add_with_ids_dedup(paper_index, ids, X)
-                if added > 0:
-                    add_pending_marks("papers", [int(i) for i in ids_added])
-                    total_added += added
-                
-                # Periodic save
-                if (i + 1) % save_every == 0:
-                    faiss_save(paper_index, paper_index_path)
-                    flush_pending_marks(cur)
-                    conn.commit()
+                if added:
+                    # Force save on first vectors, throttled save otherwise
+                    saved = faiss_save_force(paper_index, paper_index_path) if prior_ntotal == 0 \
+                            else faiss_save(paper_index, paper_index_path)
             
-            # Remove consumed segment
-            seg_path.unlink()
-            _eprint(f"[ingest] Ingested {added} papers from {seg_path.name}")
+            if added:
+                if saved:
+                    from litkit.db.indexing import mark_in_index, flush_pending_marks
+                    if db_lock_path:
+                        with FileLock(db_lock_path):
+                            if len(ids_added) > 0:
+                                mark_in_index(cur, "papers", [int(i) for i in ids_added])
+                            conn.commit()
+                    else:
+                        if len(ids_added) > 0:
+                            mark_in_index(cur, "papers", [int(i) for i in ids_added])
+                        conn.commit()
+                else:
+                    if len(ids_added) > 0:
+                        _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
             
+            added_total += int(added or 0)
+            batch_counter += 1
+            os.remove(tmp)
+            
+            # Periodic save
+            if (batch_counter % max(1, int(save_every))) == 0:
+                with FileLock(faiss_lock_path):
+                    saved_now = faiss_save(paper_index, paper_index_path)
+                if saved_now:
+                    from litkit.db.indexing import flush_pending_marks
+                    if db_lock_path:
+                        with FileLock(db_lock_path):
+                            flush_pending_marks(cur)
+                            conn.commit()
+                    else:
+                        flush_pending_marks(cur)
+                        conn.commit()
+        
         except Exception as e:
-            _eprint(f"[ingest] ERROR processing {seg_path}: {e}")
-            continue
+            # On error, rename file back so it can be retried next run
+            if not is_ingesting:
+                try:
+                    os.replace(tmp, p)
+                except Exception:
+                    pass
+            _eprint(f"[segments] ERROR ingesting {p.name}: {e.__class__.__name__}: {e}")
     
-    # Final flush
-    with FileLock(faiss_lock_path):
-        faiss_save(paper_index, paper_index_path)
-    flush_pending_marks(cur)
-    conn.commit()
-    
-    _eprint(f"[ingest] Total: {total_added} paper vectors ingested")
-    return total_added
+    return paper_index, added_total
 
 
 def ingest_chunk_segments(
@@ -165,101 +274,219 @@ def ingest_chunk_segments(
     outdir: Path,
     faiss_lock_path: Path,
     chunk_index_path: Path,
+    db_lock_path: Path | None = None,
     *,
     save_every: int = 2,
     paper_id_map: dict[str, int] | None = None,
     chunk_id_map: dict[tuple[int, int], int] | None = None,
-) -> int:
-    """Ingest chunk embedding segments into FAISS index.
+    FileLock: type | None = None,
+) -> tuple[faiss.Index, int]:
+    """Ingest chunk embedding segments from producer nodes.
     
-    Loads segment files, resolves (doc_id, ord) to chunk IDs using the
-    database, adds embeddings to the FAISS index, and marks chunks as indexed.
+    Segments contain (paper_doc_id, ord) pairs and embeddings.
+    At ingestion time, we resolve (paper_doc_id, ord) → chunk_id using the merged main DB.
     
+    Uses atomic file claiming (.ingesting rename) to prevent race conditions.
+    
+    Safe file-handling:
+      - rename "<file>.npz" -> "<file>.npz.ingesting" before reading (atomic)
+      - if already ".npz.ingesting", read in place
+      - on success, delete the .ingesting file
+      - on failure, rename back so it can be retried next run
+
     Args:
-        conn: Database connection
-        chunk_index: FAISS index for chunks
+        conn: SQLite connection to main database
+        chunk_index: FAISS index for chunks (may be wrapped in IndexIDMap2 if needed)
         outdir: Directory containing segment files
         faiss_lock_path: Path to FAISS lock file
         chunk_index_path: Path to save the chunk index
-        save_every: Save index after every N segments
-        paper_id_map: Optional pre-loaded doc_id -> paper_id mapping
-        chunk_id_map: Optional pre-loaded (paper_id, ord) -> chunk_id mapping
-    
+        db_lock_path: Path to DB lock file (optional, for commit locking)
+        save_every: Save index every N segment files
+        paper_id_map: Optional preloaded doc_id → paper_id mapping for O(1) lookups.
+                      If None, will be loaded once at start.
+        chunk_id_map: Optional preloaded (paper_id, ord) → chunk_id mapping for O(1) lookups.
+                      If None, will be loaded once at start.
+        FileLock: File lock class to use (pass from caller to avoid circular import)
+
     Returns:
-        Total number of chunk vectors added
+        (chunk_index, added_count): The (possibly wrapped) index and number of vectors added.
+        Caller should rebind their index reference to the returned value.
     """
+    # Lazy import if not provided
+    if FileLock is None:
+        from litkit.concurrent.locking import FileLock as _FileLock
+        FileLock = _FileLock
+    
     outdir = Path(outdir)
     if not outdir.exists():
-        return 0
+        return chunk_index, 0
     
-    # Find chunk segment files
-    pattern = f"{CHUNK_SEGMENT_PREFIX}_*{SEGMENT_EXTENSION}"
-    seg_files = sorted(outdir.glob(pattern))
+    # Ensure external ID mapping is present for robust remove and add
+    if not isinstance(chunk_index, faiss.IndexIDMap2):
+        chunk_index = faiss.IndexIDMap2(chunk_index)
     
-    if not seg_files:
-        return 0
+    cand = _glob_segment_files(outdir, "chunks")
+    if not cand:
+        return chunk_index, 0
     
-    # Load mappings if not provided
+    # Preload ID maps once if not provided (O(1) lookups vs O(N) queries)
     if paper_id_map is None:
         paper_id_map = preload_paper_id_map(conn)
+        _eprint(f"[segments] preloaded {len(paper_id_map)} paper ID mappings")
     if chunk_id_map is None:
         chunk_id_map = preload_chunk_id_map(conn)
+        _eprint(f"[segments] preloaded {len(chunk_id_map)} chunk ID mappings")
     
-    total_added = 0
     cur = conn.cursor()
+    added_total = 0
+    batch_counter = 0
     
-    for i, seg_path in enumerate(seg_files):
+    for p in cand:
+        # Normalize to a working path "tmp" that we always read from:
+        is_ingesting = p.name.endswith(".npz.ingesting")
+        tmp = p if is_ingesting else p.with_suffix(p.suffix + ".ingesting")
+        
+        if not is_ingesting:
+            try:
+                # Claim atomically; another writer may race us.
+                os.replace(p, tmp)
+            except FileNotFoundError:
+                continue
+            except Exception:
+                # Could not claim; skip
+                continue
+        
         try:
-            data = _load_segment(seg_path)
-            doc_ids = data["doc_ids"]
-            ords = data["ords"]
-            embeddings = data["embeddings"].astype("float32")
+            with np.load(tmp, mmap_mode="r", allow_pickle=True) as z:
+                # Reject wrong-kind files (old .seg has 'kind')
+                if "kind" in z.files and str(z["kind"].item()).strip() != "chunks":
+                    raise ValueError("wrong segment kind for chunk ingester")
+                
+                # New format: paper_doc_ids + ords + vecs (content-addressed)
+                if "paper_doc_ids" in z.files and "ords" in z.files and "vecs" in z.files:
+                    paper_doc_ids = z["paper_doc_ids"]  # object array of strings
+                    ords = z["ords"]  # int32 array
+                    X = np.ascontiguousarray(z["vecs"].astype(np.float32))
+                    
+                    # Resolve (paper_doc_id, ord) → chunk_id using preloaded maps (O(1) lookups)
+                    resolved_ids = []
+                    valid_mask = []
+                    for i, (doc_id, ord_val) in enumerate(zip(paper_doc_ids, ords)):
+                        doc_id_str = str(doc_id)
+                        ord_int = int(ord_val)
+                        
+                        # Get paper_id from preloaded map
+                        paper_id = paper_id_map.get(doc_id_str)
+                        
+                        if paper_id is not None:
+                            # Get chunk_id from preloaded map
+                            chunk_id = chunk_id_map.get((paper_id, ord_int))
+                            
+                            if chunk_id is not None:
+                                resolved_ids.append(chunk_id)
+                                valid_mask.append(True)
+                            else:
+                                valid_mask.append(False)
+                        else:
+                            valid_mask.append(False)
+                    
+                    # Log resolution failures for debugging canonicalization issues
+                    missing = np.count_nonzero(~np.array(valid_mask, dtype=bool))
+                    if missing:
+                        _eprint(f"[segments] WARNING: skipped {missing}/{len(paper_doc_ids)} chunk embeddings in {p.name} "
+                                "(doc_id/ord not found in main DB - check doc_id canonicalization)")
+                    
+                    if not resolved_ids:
+                        os.remove(tmp)
+                        continue
+                    
+                    # Filter to only valid entries
+                    valid_mask = np.array(valid_mask, dtype=bool)
+                    ids = np.array(resolved_ids, dtype=np.int64)
+                    X = X[valid_mask]
+                
+                # Legacy format: ids + vecs (shard-local IDs, deprecated)
+                elif "ids" in z.files and "vecs" in z.files:
+                    ids = np.ascontiguousarray(z["ids"].astype(np.int64))
+                    X = np.ascontiguousarray(z["vecs"].astype(np.float32))
+                elif "ids" in z.files and "emb" in z.files:
+                    ids = np.ascontiguousarray(z["ids"].astype(np.int64))
+                    X = np.ascontiguousarray(z["emb"].astype(np.float32))
+                else:
+                    raise ValueError(f"Segment missing required keys: {z.files}")
             
-            # Resolve (doc_id, ord) to chunk IDs
-            ids = []
-            valid_rows = []
-            for j, (doc_id, ord_) in enumerate(zip(doc_ids, ords)):
-                pid = paper_id_map.get(str(doc_id))
-                if pid is None:
-                    continue
-                cid = chunk_id_map.get((pid, int(ord_)))
-                if cid is not None:
-                    ids.append(cid)
-                    valid_rows.append(j)
-            
-            if not ids:
-                seg_path.unlink()
+            if ids.size == 0:
+                os.remove(tmp)
                 continue
             
-            # Filter to valid rows
-            X = embeddings[valid_rows]
+            prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
+            added, ids_added, saved = 0, [], False
             
-            # Add to FAISS with dedup
             with FileLock(faiss_lock_path):
-                added, ids_added = add_with_ids_dedup(chunk_index, ids, X)
-                if added > 0:
-                    add_pending_marks("chunks", [int(i) for i in ids_added])
-                    total_added += added
+                # Remove existing IDs to allow re-embedding
+                sel = make_id_selector(ids)
+                safe_remove_ids(chunk_index, sel)
                 
-                # Periodic save
-                if (i + 1) % save_every == 0:
-                    faiss_save(chunk_index, chunk_index_path)
-                    flush_pending_marks(cur)
-                    conn.commit()
+                added, ids_added = add_with_ids_dedup(chunk_index, ids, X)
+                if added:
+                    saved = faiss_save_force(chunk_index, chunk_index_path) if prior_ntotal == 0 \
+                            else faiss_save(chunk_index, chunk_index_path)
             
-            # Remove consumed segment
-            seg_path.unlink()
-            _eprint(f"[ingest] Ingested {added} chunks from {seg_path.name}")
+            if added:
+                if saved:
+                    from litkit.db.indexing import mark_in_index, flush_pending_marks
+                    if db_lock_path:
+                        with FileLock(db_lock_path):
+                            if len(ids_added) > 0:
+                                mark_in_index(cur, "chunks", [int(i) for i in ids_added])
+                            conn.commit()
+                    else:
+                        if len(ids_added) > 0:
+                            mark_in_index(cur, "chunks", [int(i) for i in ids_added])
+                        conn.commit()
+                else:
+                    if len(ids_added) > 0:
+                        _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
             
+            added_total += int(added)
+            batch_counter += 1
+            os.remove(tmp)
+            
+            # Periodic save
+            if (batch_counter % max(1, int(save_every))) == 0:
+                with FileLock(faiss_lock_path):
+                    saved_now = faiss_save(chunk_index, chunk_index_path)
+                if saved_now:
+                    from litkit.db.indexing import flush_pending_marks
+                    if db_lock_path:
+                        with FileLock(db_lock_path):
+                            flush_pending_marks(cur)
+                            conn.commit()
+                    else:
+                        flush_pending_marks(cur)
+                        conn.commit()
+        
         except Exception as e:
-            _eprint(f"[ingest] ERROR processing {seg_path}: {e}")
-            continue
+            # If we claimed it, put it back so another run can retry.
+            if not is_ingesting:
+                try:
+                    os.replace(tmp, p)
+                except Exception:
+                    pass
+            _eprint(f"[segments] ERROR ingesting {p.name}: {e.__class__.__name__}: {e}")
     
-    # Final flush
-    with FileLock(faiss_lock_path):
-        faiss_save(chunk_index, chunk_index_path)
-    flush_pending_marks(cur)
-    conn.commit()
+    return chunk_index, added_total
+
+
+def get_pending_marks() -> dict[str, list[int]]:
+    """Get the pending marks buffer for segment ingestion.
     
-    _eprint(f"[ingest] Total: {total_added} chunk vectors ingested")
-    return total_added
+    Returns:
+        Dictionary mapping table names to lists of pending IDs
+    """
+    return _PENDING_MARKS
+
+
+def clear_pending_marks() -> None:
+    """Clear all pending marks."""
+    _PENDING_MARKS.clear()

@@ -180,6 +180,8 @@ from litkit.segments import (
     SegmentWriterConfig,
     ProducerCoordinator as SegProducerCoordinator,
     ConsumerCoordinator as SegConsumerCoordinator,
+    ingest_paper_segments as seg_ingest_paper_segments,
+    ingest_chunk_segments as seg_ingest_chunk_segments,
 )
 
 
@@ -1618,8 +1620,14 @@ def build_or_update_indices(args):
         
         # NOW ingest segments - the main DB has all the data for doc_id resolution
         _eprint("[consumer] Ingesting embedding segments...")
-        paper_index, p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
-        chunk_index, c_added = _ingest_chunk_segments(conn, chunk_index, seg_dir)
+        paper_index, p_added = seg_ingest_paper_segments(
+            conn, paper_index, seg_dir, FAISS_LOCK, PAPER_INDEX_PATH, DB_LOCK,
+            FileLock=FileLock
+        )
+        chunk_index, c_added = seg_ingest_chunk_segments(
+            conn, chunk_index, seg_dir, FAISS_LOCK, CHUNK_INDEX_PATH, DB_LOCK,
+            FileLock=FileLock
+        )
         _eprint(f"[consumer] Ingested {p_added} paper vectors and {c_added} chunk vectors")
         
         # Force save indices after ingestion
@@ -2541,8 +2549,14 @@ def build_or_update_indices(args):
 
         if args.consume_segments and seg_dir and Path(seg_dir).exists():
             # Ingest segments - functions handle IDMap2 wrapping and return the (possibly wrapped) index
-            paper_index, p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
-            chunk_index, c_added = _ingest_chunk_segments(conn, chunk_index, seg_dir)
+            paper_index, p_added = seg_ingest_paper_segments(
+                conn, paper_index, seg_dir, FAISS_LOCK, PAPER_INDEX_PATH, DB_LOCK,
+                FileLock=FileLock
+            )
+            chunk_index, c_added = seg_ingest_chunk_segments(
+                conn, chunk_index, seg_dir, FAISS_LOCK, CHUNK_INDEX_PATH, DB_LOCK,
+                FileLock=FileLock
+            )
             if c_added or p_added:
                 _eprint(
                     f"[segments] ingested {p_added} paper vectors and {c_added} chunk vectors from segments"
