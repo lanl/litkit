@@ -4321,6 +4321,13 @@ def main():
         except Exception:
             return False
 
+    # Early guard for --consume-only with missing indices
+    if args.consume_only and not _vector_store_exists():
+        raise SystemExit(
+            "[consumer] FAISS indices/DB not found. Run an initial build "
+            "or --init-indices-only first before using --consume-only."
+        )
+
     # Make all later db_connect_db() calls honor the user's timeout setting
     # by setting the env var that litkit.db.connection reads:
     os.environ["LITKIT_SQLITE_BUSY_TIMEOUT_MS"] = str(args.sqlite_busy_timeout_ms)
@@ -4329,11 +4336,14 @@ def main():
     # Note: --consume-only doesn't need corpus (it only ingests pre-computed segments)
     # Note: --faiss-writer is a role flag (may mutate indices), not "must scan tars"
     needs_corpus = (
-        args.rebuild
-        or args.update
-        or args.build_only
-        or args.embed_producer
-        or (not _vector_store_exists())
+        not args.consume_only
+        and (
+            args.rebuild
+            or args.update
+            or args.build_only
+            or args.embed_producer
+            or (not _vector_store_exists())
+        )
     ) and not args.init_indices_only  # Bootstrap doesn't need corpus
 
     # --- helper: determine if a directory contains .tar.gz files ---
