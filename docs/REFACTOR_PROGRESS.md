@@ -1,274 +1,128 @@
-# LitKit Refactor Progress
+# Litkit Refactor Progress
 
-**Last Updated:** 2025-12-17 (Phase 2 Complete)  
-**Branch:** `feature/refactor-scope`
+## Overview
 
-## Executive Summary
+This document tracks the progress of the litkit refactoring effort, which extracts functionality from the monolithic `cli.py` into well-organized modules.
 
-This document tracks the progress of extracting reusable modules from the monolithic `cli.py` (~5,000 lines) into focused, testable modules. The goal is to transform `cli.py` into a thin CLI layer that dispatches to well-structured library code.
+## Completed Work
 
-## Completed Work (Jobs 1-8)
+### Phase 1: Module Extraction (COMPLETE)
 
-### Module Extraction Summary
+The following modules have been extracted from `cli.py`:
 
-| Job | Module | Files | Lines | Commit | Status |
-|-----|--------|-------|-------|--------|--------|
-| 1 | Lock Scope | - | ~50 | `2692d2c` | ✅ Complete |
-| 2 | `litkit.config.paths` | 1 | ~200 | `80e4d97` | ✅ Complete |
-| 5 | `litkit.concurrent` | 2 | ~400 | `dd0705b`, `586647a` | ✅ Complete |
-| 3 | `litkit.db` | 7 | ~815 | `56fdb5c` | ✅ Complete |
-| 4 | `litkit.index` | 9 | ~933 | `cb65f99` | ✅ Complete |
-| 6 | `litkit.segments` | 6 | ~949 | `396d30e` | ✅ Complete |
-| 7 | `litkit.ingest` | 4 | ~464 | `b816d88` | ✅ Complete |
-| 8 | `litkit.pipeline` | 5 | ~561 | `561ed5d` | ✅ Complete |
+#### 1. `litkit.concurrent` - Locking utilities
+- `locking.py` - FileLock class, lock depth tracking
+- Re-exported via `__init__.py`
 
-**Total extracted:** ~4,370 lines across 8 modules  
-**Dead code removed (Phase 1):** ~93 lines
+#### 2. `litkit.db` - Database operations  
+- `connection.py` - Connection factory, busy timeout handling
+- `schema.py` - SCHEMA constant, DDL for papers/chunks/files tables
+- `sharding.py` - Shard-specific DB initialization
+- `queries.py` - Common SQL helpers (mark_in_index, already_processed, etc.)
+- `indexing.py` - ensure_in_index_columns migration
+- `temp_tables.py` - Temporary table helpers for candidate papers
+- Re-exported via `__init__.py`
 
-### Module Structure
+#### 3. `litkit.index` - FAISS index operations
+- `constants.py` - PQ_BITS, USE_DOWNCAST_FALLBACK constants
+- `factory.py` - Index creation (hnsw_index, flat_ip_index, ivfpq_index)
+- `io.py` - Index save/load with throttling and fsync
+- `introspection.py` - unwrap_core_and_kind, kind_and_core, report_faiss_index
+- `ids.py` - ID selector creation, safe_remove_ids
+- `search.py` - FAISS search with temporary param adjustment
+- `dedup.py` - add_with_ids_dedup, faiss_present_ids
+- `training.py` - effective_nlist, auto_set_nprobe, pick_nprobe
+- Re-exported via `__init__.py`
+
+#### 4. `litkit.segments` - Embedding segment I/O
+- `constants.py` - DEFAULT_EMBED_SEGMENT_SIZE, DEFAULT_EMBED_SEGMENT_DTYPE
+- `writer.py` - _SegmentWriter, _ChunkSegmentWriter classes
+- `metadata.py` - Build metadata for shard consistency
+- `coordination.py` - ProducerCoordinator, ConsumerCoordinator classes
+- `ingest.py` - Segment ingestion functions
+- Re-exported via `__init__.py`
+
+#### 5. `litkit.ingest` - Tar/XML ingestion
+- `detection.py` - is_uncompressed_tar helper
+- `sharding.py` - shard_filter for load-balanced tar distribution
+- Extended `__init__.py` to re-export new helpers
+
+#### 6. `litkit.pipeline` - Build pipeline helpers
+- `helpers.py` - dedupe_ids_and_texts function
+- `buffers.py` - Batch buffer management (planned)
+- `context.py` - _IngestContext class
+- `article.py` - Article ingestion functions
+- Re-exported via `__init__.py`
+
+### Phase 2: Import-Time Purity (COMPLETE)
+
+All import-time side effects have been eliminated from `cli.py`:
+
+1. **Lazy Runtime Initialization**
+   - Created `_Runtime` dataclass for path constants
+   - Implemented `get_runtime()` with thread-safe lazy init
+   - Module-level `__getattr__` for backward-compatible path access
+   - All mkdir/env var setting deferred until first use
+
+2. **Import-Time Side Effects Removed**
+   - Python version check moved to `main()`
+   - `faiss.cvar.seed` moved to `_init_runtime()`
+   - `import litkit.cli` now has zero I/O or side effects
+
+### Phase 3: CLI Wire-up (IN PROGRESS)
+
+The extracted modules are imported and used by `cli.py`:
+- ✅ `from litkit.index import safe_pq_m`
+- ✅ `from litkit.pipeline import dedupe_ids_and_texts`
+- ✅ `from litkit.ingest import is_uncompressed_tar, shard_filter`
+
+Note: cli.py still contains local implementations of many functions that have
+been extracted. These duplicates exist for safety during the migration and will
+be removed in a future cleanup phase once the new modules are validated.
+
+## Remaining Work
+
+### Phase 4: Full Migration (NOT STARTED)
+
+Replace remaining local implementations in `cli.py` with imports from extracted modules:
+- Database operations → `litkit.db`
+- Index operations → `litkit.index`
+- Segment operations → `litkit.segments`
+- Locking → `litkit.concurrent`
+
+### Phase 5: Dead Code Removal (NOT STARTED)
+
+After full migration validation:
+- Remove duplicated functions from `cli.py`
+- Remove the SCOPE CONTRACT comment block
+- Final lint and test pass
+
+## Architecture Goals
+
+The final architecture will have:
 
 ```
-src/litkit/
+litkit/
+├── cli.py              # Thin CLI: argparse, orchestration, exit codes
 ├── concurrent/         # Locking primitives
-│   ├── __init__.py
-│   └── locking.py      # FileLock, flock_guard
-│
-├── config/             # Configuration and paths
-│   ├── __init__.py
-│   └── paths.py        # WorkspacePaths, get_default_paths
-│
-├── db/                 # SQLite operations
-│   ├── __init__.py
-│   ├── connection.py   # connect_db, init_db
-│   ├── schema.py       # SCHEMA constant
-│   ├── queries.py      # register_file, already_processed
-│   ├── sharding.py     # init_shard_db, merge_shard_databases
-│   ├── indexing.py     # mark_in_index, reconcile_sqlite_flags
-│   └── temp_tables.py  # Temporary table utilities
-│
-├── index/              # FAISS index operations
-│   ├── __init__.py
-│   ├── constants.py    # PQ_BITS, paths
-│   ├── factory.py      # ivfpq_index, hnsw_index, flat_ip_index
-│   ├── io.py           # faiss_save, faiss_load, faiss_save_force
-│   ├── introspection.py # unwrap_core_and_kind, kind_and_core
-│   ├── ids.py          # make_id_selector, safe_remove_ids
-│   ├── search.py       # faiss_search, auto_set_nprobe
-│   ├── training.py     # effective_nlist, safe_pq_m
-│   └── dedup.py        # add_with_ids_dedup
-│
+├── db/                 # All SQLite operations
+├── index/              # All FAISS operations
 ├── segments/           # Embedding segment I/O
-│   ├── __init__.py
-│   ├── constants.py    # Segment size defaults
-│   ├── writer.py       # SegmentWriter, ChunkSegmentWriter
-│   ├── metadata.py     # write_build_meta, read_build_meta
-│   ├── coordination.py # ProducerCoordinator, ConsumerCoordinator
-│   └── ingest.py       # ingest_paper_segments, ingest_chunk_segments
-│
-├── ingest/             # Document ingestion
-│   ├── __init__.py
-│   ├── detection.py    # is_uncompressed_tar
-│   ├── sharding.py     # shard_filter (load-balanced)
-│   └── ingest.py       # (existing XML parsing, unchanged)
-│
-└── pipeline/           # Document processing pipeline
-    ├── __init__.py
-    ├── helpers.py      # dedupe_ids_and_texts, check_file_processed
-    ├── buffers.py      # EmbeddingBuffer, PaperBuffer, ChunkBuffer
-    ├── context.py      # ProcessingContext dataclass
-    └── article.py      # process_article, flush_paper_buffer, flush_chunk_buffer
+├── ingest/             # Tar/XML parsing
+├── pipeline/           # Build pipeline logic
+├── embeddings/         # (existing) Embedding models
+├── formatting/         # (existing) Answer formatting
+└── frontload/          # (existing) Chunk capping
 ```
 
-## Completed Work (Job 9)
+## Validation Checklist
 
-### Phase 1: Simple Function Migration ✅ Complete
+After each phase:
+- [ ] `python -c "import litkit.cli"` succeeds without I/O
+- [ ] `python -m litkit --version` works
+- [ ] Build workflow with sample data passes
+- [ ] Query workflow with existing indices works
 
-| Function | Status | Notes |
-|----------|--------|-------|
-| `_safe_pq_m` → `safe_pq_m` | ✅ Complete | All 4 calls replaced |
-| `_is_uncompressed_tar` → `is_uncompressed_tar` | ✅ Complete | All calls replaced |
-| `_shard_filter` → `shard_filter` | ✅ Complete | ~65-line nested function deleted |
-| `_dedupe_ids_and_texts` → `dedupe_ids_and_texts` | ✅ Complete | All 4 calls replaced |
+## Commit History
 
-**Commits:**
-- `fb9e635` - Start migration: add imports
-- `7cd61b8` - Complete Phase 1: replace all calls, delete dead code (~93 lines removed)
-
-### Dead Code Removed
-
-| Function | Lines | Location |
-|----------|-------|----------|
-| `_dedupe_ids_and_texts` | ~10 | line 888 |
-| `_safe_pq_m` | ~12 | line 1779 |
-| `_is_uncompressed_tar` | ~6 | line 2606 |
-| `_shard_filter` | ~65 | line 3467 (nested) |
-| **Total** | **~93** | |
-
-## Completed Work (Job 9, Phase 2)
-
-### Phase 2: Import-Time Side Effect Isolation ✅ Complete
-
-**Goal:** Make `import litkit.cli` pure (no I/O, no side effects).
-
-**Solution:** Lazy singleton pattern with module-level `__getattr__`.
-
-**Implementation:**
-1. Created `_Runtime` dataclass holding all path constants
-2. Created `get_runtime()` - thread-safe lazy initialization
-3. Added module-level `__getattr__` for backward compatibility
-4. Moved all side effects into `_init_runtime()`:
-   - Directory creation (`mkdir`)
-   - Environment variable setup (`HF_HOME`, `HF_HUB_OFFLINE`, etc.)
-5. Called `get_runtime()` at start of `main()` to trigger initialization
-6. All 205+ internal uses of path constants work via `globals()` population
-
-**Code pattern:**
-```python
-@dataclass(frozen=True)
-class _Runtime:
-    """Immutable container for lazily-initialized runtime paths."""
-    root: Path
-    workspace: Path
-    sqlite_dir: Path
-    # ... 15 total path fields
-
-_runtime: _Runtime | None = None
-_runtime_lock = threading.Lock()
-
-def get_runtime() -> _Runtime:
-    """Thread-safe lazy initialization."""
-    global _runtime
-    if _runtime is not None:
-        return _runtime
-    with _runtime_lock:
-        if _runtime is not None:
-            return _runtime
-        _runtime = _init_runtime()
-        # Populate module-level globals for internal code
-        for attr_name, field_name in _LAZY_PATH_ATTRS.items():
-            globals()[attr_name] = getattr(_runtime, field_name)
-        return _runtime
-
-def __getattr__(name: str):
-    """Module-level __getattr__ for external lazy access."""
-    if name in _LAZY_PATH_ATTRS:
-        rt = get_runtime()
-        return globals()[name]
-    raise AttributeError(...)
-```
-
-**Benefits:**
-- ✅ `import litkit.cli` is now pure (no I/O)
-- ✅ All existing code works unchanged (backward compatible)
-- ✅ Thread-safe initialization
-- ✅ Testable with mock paths
-
-## Future Work
-
-### Phase 3: Remaining Domain Extraction
-
-| Domain | Target Module | Size Estimate |
-|--------|---------------|---------------|
-| LLM/Prompts | `litkit.llm` | ~200 lines |
-| Retrieval | `litkit.retrieval` | ~300 lines |
-| Progress | `litkit.progress` | ~150 lines |
-
-### Phase 4: Orchestration Refactor
-
-**Goal:** Split `build_or_update_indices()` (~800 lines) into focused functions.
-
-**Proposed structure:**
-```python
-# litkit/build/orchestration.py
-def run_single_node(config: BuildConfig, services: Services) -> BuildResult
-def run_producer(config: BuildConfig, services: Services) -> BuildResult
-def run_consumer(config: BuildConfig, services: Services) -> BuildResult
-def run_init_indices(config: BuildConfig, services: Services) -> BuildResult
-
-# litkit/build/config.py
-@dataclass
-class BuildConfig:
-    mode: Literal["single", "producer", "consumer", "init"]
-    shard_id: int
-    num_shards: int
-    # ... other config fields
-```
-
-## Critique Scorecard
-
-Based on the detailed critique of the monolithic `cli.py`:
-
-| # | Issue | Status | Notes |
-|---|-------|--------|-------|
-| 1 | Scope creep | 🟡 Partial | Modules created, not integrated |
-| 2 | Massive file size | 🟡 Partial | ~4,400 lines extracted |
-| 3 | Import-time side effects | ✅ Addressed | Lazy singleton pattern |
-| 4 | Global state | 🟡 Partial | `ProcessingContext` created |
-| 5 | Monolithic build function | ❌ Not addressed | Phase 4 |
-| 6 | Locking complexity | ✅ Addressed | `FileLock` centralized |
-| 7 | Duplication | 🟡 Partial | New modules coexist with old |
-| 8 | Error handling | ❌ Not addressed | Future work |
-| 9 | LLM leakage | ❌ Not addressed | Phase 3 |
-| 10 | Config sprawl | 🟡 Partial | `WorkspacePaths` created |
-| 11 | Testing | 🟡 Partial | Modules testable |
-| 12 | Style nits | ❌ Not addressed | Future work |
-
-## Testing
-
-### Build Validation
-
-After each change, run:
-```bash
-./test_build.sh --clean
-```
-
-Expected output:
-```
-✅ BUILD VALIDATION PASSED
-```
-
-### Import Test
-
-Quick smoke test:
-```bash
-python -c "from litkit.cli import main; print('OK')"
-```
-
-### Module Import Test
-
-```bash
-python -c "
-from litkit.db import init_db
-from litkit.index import safe_pq_m, faiss_save
-from litkit.segments import SegmentWriter
-from litkit.ingest import is_uncompressed_tar, shard_filter
-from litkit.pipeline import ProcessingContext
-print('All modules import successfully')
-"
-```
-
-## Decisions Log
-
-### 2025-12-17: Option B Selected for Job 8
-
-**Decision:** Extract article processing as a new `litkit.pipeline` module rather than integrating into existing modules.
-
-**Rationale:**
-- Cleaner separation of concerns
-- Allows cli.py to continue using its own implementations during transition
-- Lower risk of regressions
-
-### 2025-12-17: Gradual Migration Strategy
-
-**Decision:** Replace simple functions first, defer context/flush migration.
-
-**Rationale:**
-- `ProcessingContext` has different API than `_IngestContext`
-- Buffer management patterns differ
-- Need adapter layer for full migration
-
-## Related Files
-
-- `docs/REFACTOR_ROADMAP.md` - Original planning document
-- `CODE_REVIEW_SUMMARY.md` - Pre-refactor code review
-- `.git/` - Full commit history on `feature/refactor-scope`
+See git log for `feature/refactor-scope` branch for detailed commit history.
