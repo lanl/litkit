@@ -277,37 +277,76 @@ See git log for detailed commit history. Key commits:
 
 ## Current Status
 
-**cli.py is still ~4600 lines.** The modules have been created and imports wired up, but
-most function DEFINITIONS still live in cli.py. The next phase is to remove those local
-definitions and use the imported versions.
+**cli.py is now ~4066 lines** (down from ~4723 at start of 2024-12-18 session).
+The major module imports are wired up and local definitions have been removed.
 
-## Suggested Next Task
+## Work Completed 2024-12-18
 
-**Remove FAISS function definitions from cli.py**
+### Session: Wire Up Extracted Modules + Remove Local Defs (-657 lines)
 
-cli.py still contains ~500+ lines of FAISS-related functions that already have
-equivalents in `litkit.index`:
+#### 1. FAISS Index Functions (-319 lines)
+**Commit:** `refactor(cli): replace local FAISS functions with litkit.index imports`
 
-| cli.py function | Use from litkit.index |
-|-----------------|----------------------|
-| `_unwrap_core_and_kind()` | `index.introspection.unwrap_core_and_kind` |
-| `_kind_and_core()` | `index.introspection.kind_and_core` |
-| `_report_faiss_index()` | `index.introspection.report_faiss_index` |
-| `_flat_ip_index()` | `index.factory.flat_ip_index` |
-| `_hnsw_index()` | `index.factory.hnsw_index` |
-| `_ivfpq_index()` | `index.factory.ivfpq_index` |
-| `_effective_nlist()` | `index.training.effective_nlist` |
-| `_pick_nprobe()` | `index.training.pick_nprobe` |
-| `_auto_set_nprobe()` | `index.training.auto_set_nprobe` |
-| `_faiss_save()`, `_faiss_save_force()` | `index.io` |
-| `_faiss_load()`, `_faiss_load_cached()` | `index.io` |
-| `_add_with_ids_dedup()` | `index.dedup.add_with_ids_dedup` |
-| `_faiss_present_ids()` | `index.dedup.faiss_present_ids` |
-| `_make_id_selector()`, `_safe_remove_ids()` | `index.ids` |
-| `_faiss_search()` | `index.search.faiss_search` |
-| `_temporary_search_params()` | `index.search` |
-| `_extract_ivf()` | `index.introspection.extract_ivf` |
+Replaced 17 local FAISS function definitions with imports from `litkit.index`:
+- Factory: `flat_ip_index`, `hnsw_index`, `ivfpq_index`, `safe_pq_m`
+- I/O: `faiss_save`, `faiss_save_force`, `faiss_load`, `faiss_load_cached`
+- Introspection: `unwrap_core_and_kind`, `kind_and_core`, `extract_ivf`, `report_faiss_index`
+- IDs: `make_id_selector`, `safe_remove_ids`, `faiss_present_ids`
+- Search: `pick_nprobe`, `auto_set_nprobe`, `faiss_search`
+- Dedup: `add_with_ids_dedup`
 
-**Estimated reduction:** ~500-600 lines from cli.py
+#### 2. Progress Classes (-111 lines)
+**Commit:** `refactor(cli): replace local progress classes with litkit.progress imports`
 
-This advances **Job 4 (FAISS/Index)** from REFACTOR_ROADMAP.md.
+Replaced local `eprint`, `Progress`, `Pulse`, `phase` with imports from `litkit.progress`.
+
+#### 3. FileLock Class (-71 lines)
+**Commit:** `refactor(cli): replace local FileLock with litkit.concurrent import`
+
+- Imported `FileLock`, `FLOCK_AVAILABLE`, `in_faiss_lock`, `in_db_lock` from `litkit.concurrent`
+- Created thin wrapper that binds `DB_LOCK`/`FAISS_LOCK` paths at runtime
+- Deleted local lock depth tracking, fcntl imports, FileLock class
+
+#### 4. Runtime Paths (-92 lines)
+**Commit:** `refactor(cli): replace _Runtime with litkit.config.paths.WorkspacePaths`
+
+- Imported `WorkspacePaths` from `litkit.config.paths`
+- Deleted `_find_root()`, `_resolve_workspace()`, `_Runtime` dataclass
+- Simplified `_init_runtime()` to use `WorkspacePaths.from_env_or_default()`
+- Fixed regression risk: updated `WorkspacePaths.setup_environment()` busy timeout 30000→120000ms
+- Kept `faiss.cvar.seed` init in cli.py (FAISS-specific)
+
+### Remaining Local Functions (~35 still in cli.py)
+
+**CLI-specific (should stay):**
+- `_version_banner()`, `_report_paths()`, `_confirm_rebuild()`, `_resolve_question()`
+- Writer guard functions (`_create_writer_guard_or_exit()`, `_maybe_cleanup_own_stale_guard()`)
+- LLM config helpers (`_default_base_url_for()`, `_default_api_key_for()`, `_is_openai_cloud()`)
+- `_post_build_sanity_check()`, `_init_runtime()`, `__getattr__()`
+
+**Extraction candidates (diminishing returns):**
+- `_ingest_paper_segments()`, `_ingest_chunk_segments()` (~190 lines) - module version is simpler, needs enhancement to match cli.py's robust implementation
+- `_normalize_and_strip_citations()` (~40 lines) - preprocessing step before existing module
+- `_faiss_search()`, `_temporary_search_params()` (~40 lines) - thin wrappers
+
+### Summary
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| cli.py lines | 4723 | 4066 | -657 |
+| FAISS local defs | 17 | 0 | -17 |
+| Progress local defs | 4 | 0 | -4 |
+| FileLock local | 1 | 0 (wrapper) | -1 |
+| Runtime/paths local | 3 | 0 | -3 |
+
+## Next Steps (Phase 5)
+
+1. **Final Cleanup:**
+   - Remove the SCOPE CONTRACT comment block once cli.py is stable
+   - Final lint and test pass
+   - Update module docstrings
+
+2. **Optional Further Extraction:**
+   - Move segment ingestion functions to `litkit.segments.ingest` (after enhancing module)
+   - Move citation normalization to `litkit.formatting.answers`
+   - Move lexical search helpers to `litkit.db.queries`
