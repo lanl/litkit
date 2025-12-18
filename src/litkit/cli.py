@@ -2937,7 +2937,10 @@ def build_or_update_indices(args):
     # NOTE: The global --rebuild handling already reset DB/indices/checkpoint
     # near the start of build_or_update_indices(). No extra resets here.
 
-    ckpt = load_checkpoint()
+    # Use per-shard checkpoint for producers (multi-process safe)
+    # Single-node and consumer use shared checkpoint (backward compatible)
+    ckpt_shard_id = args.shard_id if args.embed_producer else None
+    ckpt = seg_load_checkpoint(CKPT_PATH, shard_id=ckpt_shard_id)
     ckpt_stream = ckpt.get("build_stream", {})
 
     paper_ids_buf, paper_texts_buf = [], []
@@ -3298,7 +3301,7 @@ def build_or_update_indices(args):
                     conn.commit()
                     ckpt_stream[str(tpath)] = processed_count
                     ckpt["build_stream"] = ckpt_stream
-                    save_checkpoint(ckpt)
+                    seg_save_checkpoint(ckpt, CKPT_PATH, CKPT_LOCK, shard_id=ckpt_shard_id)
                     persisted_count = processed_count
                     _render(force=True)
 
