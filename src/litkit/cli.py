@@ -1422,12 +1422,6 @@ from collections import defaultdict
 _PENDING_MARKS = defaultdict(list)
 
 
-def _flush_pending_marks(cur):
-    for tbl, ids in list(_PENDING_MARKS.items()):
-        if not ids:
-            continue
-        db_mark_in_index(cur, tbl, ids)
-        _PENDING_MARKS[tbl].clear()
 
 
 class _ChunkSegmentWriter:
@@ -2250,8 +2244,6 @@ def _query_terms(s: str) -> list[str]:
     return uniq
 
 
-def _mark_in_index(cur, table: str, ids: list[int]):
-    cur.executemany(f"UPDATE {table} SET in_index=1 WHERE id=?", [(i,) for i in ids])
 
 
 def _auto_top_papers() -> int:
