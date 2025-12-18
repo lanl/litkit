@@ -34,10 +34,6 @@
 import os
 import sys
 
-if sys.version_info < (3,10):
-    sys.stderr.write("[env] Python >= 3.10 required.\n")
-    sys.exit(2)
-
 from . import __version__ as LITKIT_VERSION
 
 # -------- simple early quieting (env), used before argparse exists ----------
@@ -365,6 +361,13 @@ def _init_runtime() -> _Runtime:
         sys.exit(2)
     
     db_filename = os.environ.get("LITKIT_DB_FILE", "litkit.sqlite3")
+    
+    # Set deterministic FAISS seed (deferred from import-time for import purity)
+    try:
+        import faiss
+        faiss.cvar.seed = int(os.environ.get("LITKIT_FAISS_SEED", "123456"))
+    except Exception:
+        pass
     
     return _Runtime(
         root=root,
@@ -1030,11 +1033,7 @@ def _dedupe_chunks_with_doc_ids(
 import faiss
 import numpy as np
 
-# Deterministic FAISS training (IVF/PQ k-means init)
-try:
-    faiss.cvar.seed = int(os.environ.get("LITKIT_FAISS_SEED", "123456"))
-except Exception:
-    pass
+# Note: faiss.cvar.seed is set inside _init_runtime() to avoid import-time side effects
 
 
 # --- shared progress line state (prevents line collisions) ---
@@ -5002,6 +5001,11 @@ def _strip_citation_linelocs(text: str) -> str:
 # -------------------- Main --------------------
 def main():
     """CLI entry point."""
+    # Check Python version at runtime (moved from import-time for import purity)
+    if sys.version_info < (3, 10):
+        sys.stderr.write("[env] Python >= 3.10 required.\n")
+        sys.exit(2)
+    
     # Trigger lazy runtime initialization (creates dirs, sets env vars, populates globals)
     get_runtime()
     
