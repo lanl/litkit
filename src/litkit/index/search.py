@@ -17,8 +17,8 @@ from litkit.index.constants import INDEX_KIND_HNSW, INDEX_KIND_IVF
 def pick_nprobe(nlist: int, user: int | None) -> int:
     """Compute nprobe for IVF index.
     
-    If user provides a value, use it. Otherwise, use sqrt(nlist) clamped
-    to [8, 512].
+    If user provides a value, use it. Otherwise, use sqrt(nlist) with
+    dynamic floor/cap based on index size.
     
     Args:
         nlist: Number of Voronoi cells in the IVF index
@@ -28,11 +28,13 @@ def pick_nprobe(nlist: int, user: int | None) -> int:
         nprobe value to use
     """
     if user is not None:
-        return user
-    
-    # Auto: sqrt(nlist) clamped to reasonable range
-    auto = int(math.sqrt(nlist))
-    return max(8, min(512, auto))
+        target = int(user)
+    else:
+        target = int(math.sqrt(max(1, nlist)))
+    # Dynamic floor/cap based on index size for better recall on large indices
+    min_floor = 32 if nlist >= 16384 else 8
+    max_cap = 1024 if nlist >= 65536 else 512
+    return min(nlist, max(min_floor, min(max_cap, target)))
 
 
 def auto_set_nprobe(

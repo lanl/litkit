@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import threading
 from pathlib import Path
 
@@ -15,12 +16,30 @@ from litkit.concurrent.locking import in_faiss_lock
 # Thread-local cache for loaded indices
 _TL_FAISS_CACHE = threading.local()
 
+# Throttle index saves to reduce I/O on shared filesystems (HPC/NFS)
+_SAVE_MIN_SEC = int(os.environ.get("LITKIT_SAVE_EVERY_SEC", "120"))
+_last_save_ts: dict[str, float] = {"papers": 0.0, "chunks": 0.0}
+
 
 def _eprint(msg: str = "", *, end: str = "\n") -> None:
     """Print to stderr with flush."""
     sys.stderr.write(msg + end)
     try:
         sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _maybe_fsync_dir(p: Path) -> None:
+    """Optional: fsync the containing directory for extra safety on NFS."""
+    if os.environ.get("LITKIT_SEGMENT_FSYNC_DIR", "1") != "1":
+        return
+    try:
+        dfd = os.open(str(p.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
     except Exception:
         pass
 
@@ -35,67 +54,81 @@ def _assert_faiss_locked() -> None:
 
 
 def faiss_save(index: faiss.Index, path: Path) -> bool:
-    """Save FAISS index atomically (temp file + rename).
+    """Save FAISS index atomically with throttling and fsync.
     
-    Requires FAISS lock to be held. Uses atomic write pattern to prevent
-    corruption on crash.
+    Requires FAISS lock to be held. Uses atomic write pattern (temp file +
+    rename) to prevent corruption. Throttles saves to reduce I/O on shared
+    filesystems (configurable via LITKIT_SAVE_EVERY_SEC, default 120s).
     
     Args:
         index: FAISS index to save
         path: Destination path
     
     Returns:
-        True if save succeeded, False otherwise
+        True if save was performed, False if throttled/skipped
     """
     _assert_faiss_locked()
     
     label = "papers" if Path(path).name.startswith("papers") else "chunks"
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    now = time.time()
     
-    try:
-        faiss.write_index(index, str(tmp))
-        try:
-            os.replace(tmp, path)
-            _eprint(f"[faiss] {label}: saved {path.name}")
-            return True
-        except OSError as e:
-            _eprint(f"[faiss] {label}: rename failed: {e}")
-            return False
-    except Exception as e:
-        _eprint(f"[faiss] {label}: write failed: {e}")
+    # Throttle: skip if saved recently
+    if (now - _last_save_ts.get(label, 0.0)) < _SAVE_MIN_SEC:
         return False
+    
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    faiss.write_index(index, str(tmp))
+    
+    # fsync the temp file before rename for durability
+    try:
+        fd = os.open(str(tmp), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+    
+    os.replace(tmp, path)
+    _maybe_fsync_dir(path)
+    _last_save_ts[label] = now
+    return True
 
 
 def faiss_save_force(index: faiss.Index, path: Path) -> bool:
-    """Save FAISS index atomically, always logging success.
+    """Save FAISS index atomically, bypassing throttle.
     
-    Similar to faiss_save but used when save must happen (e.g., after
-    training or explicit flush).
+    Used when save must happen immediately (e.g., after training,
+    explicit flush, or before exit).
     
     Args:
         index: FAISS index to save
         path: Destination path
     
     Returns:
-        True if save succeeded, False otherwise
+        True (always saves)
     """
     _assert_faiss_locked()
     
     tmp = path.with_suffix(path.suffix + ".tmp")
-    label = "papers" if Path(path).name.startswith("papers") else "chunks"
+    faiss.write_index(index, str(tmp))
     
+    # fsync the temp file before rename for durability
     try:
-        faiss.write_index(index, str(tmp))
+        fd = os.open(str(tmp), os.O_RDONLY)
         try:
-            os.replace(tmp, path)
-            _eprint(f"[faiss] {label}: force-saved {path.name}")
-            return True
-        except OSError as e:
-            _eprint(f"[faiss] {label}: rename failed: {e}")
-            return False
-    except Exception as e:
-        _eprint(f"[faiss] {label}: write failed: {e}")
-        return False
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+    
+    os.replace(tmp, path)
+    _maybe_fsync_dir(path)
+    
+    label = "papers" if Path(path).name.startswith("papers") else "chunks"
+    _last_save_ts[label] = time.time()
+    return True
 
 
 def faiss_load(path: Path) -> faiss.Index:
