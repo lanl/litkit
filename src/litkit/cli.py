@@ -99,12 +99,11 @@ from litkit.formatting.answers import (
 )
 from litkit.frontload.cap import cap_chunks_per_paper
 from litkit.ingest.ingest import (
-ArticleMeta,
+    ArticleMeta,
     TarMemberMeta,
     count_tar_xml_members,
     iter_tar_paths,
     iter_tar_xml_streams,
-    pack_paragraphs as ingest_pack_paragraphs,
     parallel_iter_tar_articles,
     parse_xml_fileobj,
 )
@@ -183,6 +182,7 @@ def _effective_nlist(n_train: int, requested_nlist: int, min_nlist: int = 16, *,
 
 
 def _maybe_cleanup_own_stale_guard():
+    get_runtime()  # ensure WRITER_GUARD is bound
     try:
         if WRITER_GUARD.exists():
             pid, host, ts = (WRITER_GUARD.read_text().split() + ["", "", "0"])[:3]
@@ -193,6 +193,7 @@ def _maybe_cleanup_own_stale_guard():
 
 
 def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
+    get_runtime()  # ensure WRITER_GUARD is bound
     _maybe_cleanup_own_stale_guard()
     if not getattr(args, "faiss_writer", False):
         return
@@ -471,179 +472,6 @@ DEFAULT_EMBED_SEGMENT_DTYPE = os.environ.get("LITKIT_EMBED_SEGMENT_DTYPE", "fp16
 DEFAULT_BUSY_TIMEOUT_MS = int(os.environ.get("LITKIT_SQLITE_BUSY_TIMEOUT_MS", "120000"))
 
 
-def _shard_db_path(shard_id: int) -> Path:
-    """Return path to shard-specific SQLite database for producer mode."""
-    return SQLITE_DIR / f"litkit_shard_{shard_id:02d}.sqlite3"
-
-
-def _list_shard_dbs() -> list[Path]:
-    """List all shard SQLite databases in the sqlite directory."""
-    return sorted(SQLITE_DIR.glob("litkit_shard_*.sqlite3"))
-
-
-def merge_shard_databases(main_conn, delete_after_merge: bool = True) -> dict[str, int]:
-    """Merge all per-shard SQLite databases into the main database using bulk SQL operations.
-    
-    Uses ATTACH DATABASE + INSERT...SELECT for efficient bulk merging instead of
-    row-by-row Python loops. This is ~100x faster for large databases.
-    
-    The merge is idempotent: duplicate papers (same doc_id) and chunks (same paper_id+ord)
-    are skipped using INSERT OR IGNORE and conflict detection.
-    
-    Args:
-        main_conn: Connection to the main litkit.sqlite3 database
-        delete_after_merge: If True, delete shard DBs after successful merge
-    
-    Returns:
-        Dict with merge statistics: {"papers": N, "chunks": M, "files": F, "shards": S}
-    """
-    shard_dbs = _list_shard_dbs()
-    if not shard_dbs:
-        return {"papers": 0, "chunks": 0, "files": 0, "shards": 0}
-    
-    _eprint(f"[merge] Found {len(shard_dbs)} shard database(s) to merge (using bulk SQL)")
-    
-    stats = {"papers": 0, "chunks": 0, "files": 0, "shards": 0}
-    main_cur = main_conn.cursor()
-    
-    for shard_idx, shard_db in enumerate(shard_dbs):
-        _eprint(f"[merge] Processing {shard_db.name}...")
-        t0 = time.time()
-        
-        # Use unique alias per shard to avoid "database already in use" errors
-        shard_alias = f"shard_db_{shard_idx}"
-        # Use unique temp table name per shard for safety
-        temp_map_table = f"_shard_paper_map_{shard_idx}"
-        
-        try:
-            # ATTACH the shard database for bulk operations
-            main_cur.execute(f"ATTACH DATABASE ? AS {shard_alias}", (str(shard_db),))
-            
-            try:
-                # Count rows before merge for statistics
-                papers_before = main_cur.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
-                chunks_before = main_cur.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-                files_before = main_cur.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-                
-                # 1) BULK MERGE PAPERS
-                # Insert papers that don't already exist (by doc_id), ignoring duplicates
-                # Use a subquery to exclude papers whose doc_id already exists in main
-                main_cur.execute(f"""
-                    INSERT OR IGNORE INTO papers(doc_id, pmid, pmcid, title, abstract, in_index)
-                    SELECT s.doc_id, s.pmid, s.pmcid, s.title, s.abstract, 0
-                    FROM {shard_alias}.papers s
-                    WHERE s.doc_id IS NOT NULL 
-                      AND s.doc_id != ''
-                      AND NOT EXISTS (
-                          SELECT 1 FROM papers m WHERE m.doc_id = s.doc_id
-                      )
-                """)
-                
-                # 2) BULK MERGE CHUNKS
-                # Create a temp table to map shard paper_id -> main paper_id via doc_id
-                # Drop first to ensure clean state (no IF NOT EXISTS to avoid stale data)
-                main_cur.execute(f"DROP TABLE IF EXISTS {temp_map_table}")
-                main_cur.execute(f"""
-                    CREATE TEMP TABLE {temp_map_table} AS
-                    SELECT s.id AS shard_pid, m.id AS main_pid
-                    FROM {shard_alias}.papers s
-                    JOIN papers m ON m.doc_id = s.doc_id
-                    WHERE s.doc_id IS NOT NULL AND s.doc_id != ''
-                """)
-                
-                # Insert chunks with remapped paper_id, skipping duplicates (same paper_id+ord)
-                main_cur.execute(f"""
-                    INSERT OR IGNORE INTO chunks(paper_id, ord, text, in_index)
-                    SELECT pm.main_pid, sc.ord, sc.text, 0
-                    FROM {shard_alias}.chunks sc
-                    JOIN {temp_map_table} pm ON pm.shard_pid = sc.paper_id
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM chunks mc 
-                        WHERE mc.paper_id = pm.main_pid AND mc.ord = sc.ord
-                    )
-                """)
-                
-                # 3) BULK MERGE FILES
-                # Insert/replace files with remapped paper_id
-                main_cur.execute(f"""
-                    INSERT OR REPLACE INTO files(path, size, mtime, paper_id)
-                    SELECT sf.path, sf.size, sf.mtime, pm.main_pid
-                    FROM {shard_alias}.files sf
-                    JOIN {temp_map_table} pm ON pm.shard_pid = sf.paper_id
-                """)
-                
-                # Drop temp table immediately after use
-                main_cur.execute(f"DROP TABLE IF EXISTS {temp_map_table}")
-                
-                # Count rows after merge for statistics
-                papers_after = main_cur.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
-                chunks_after = main_cur.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-                files_after = main_cur.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-                
-                papers_merged = papers_after - papers_before
-                chunks_merged = chunks_after - chunks_before
-                files_merged = files_after - files_before
-                
-                stats["papers"] += papers_merged
-                stats["chunks"] += chunks_merged
-                stats["files"] += files_merged
-                stats["shards"] += 1
-                
-                elapsed = time.time() - t0
-                _eprint(f"[merge] {shard_db.name}: +{papers_merged} papers, +{chunks_merged} chunks, +{files_merged} files ({elapsed:.1f}s)")
-                
-            finally:
-                # Always detach the shard database
-                try:
-                    main_cur.execute(f"DETACH DATABASE {shard_alias}")
-                except Exception:
-                    pass
-            
-            # Delete shard DB after successful merge
-            if delete_after_merge:
-                try:
-                    shard_db.unlink()
-                    _eprint(f"[merge] Deleted {shard_db.name}")
-                except Exception as e:
-                    _eprint(f"[merge] WARNING: could not delete {shard_db.name}: {e}")
-            
-        except Exception as e:
-            _eprint(f"[merge] ERROR processing {shard_db.name}: {e.__class__.__name__}: {e}")
-            import traceback
-            traceback.print_exc()
-            # Continue with next shard
-    
-    # Commit all changes
-    main_conn.commit()
-    
-    _eprint(f"[merge] Complete: {stats['papers']} papers, {stats['chunks']} chunks, {stats['files']} files from {stats['shards']} shard(s)")
-    return stats
-
-
-def init_shard_db(shard_id: int, journal_mode: str, busy_timeout_ms: int):
-    """Initialize a shard-specific SQLite database for producer mode.
-    
-    Each producer writes to its own shard DB to avoid lock contention.
-    The consumer later merges all shard DBs into the main database.
-    """
-    shard_path = _shard_db_path(shard_id)
-    _eprint(f"[db] Producer shard {shard_id}: using {shard_path}")
-    
-    conn = sqlite3.connect(shard_path, isolation_level="DEFERRED", timeout=busy_timeout_ms / 1000.0)
-    
-    mode = (journal_mode or "TRUNCATE").upper()
-    conn.execute(f"PRAGMA journal_mode={mode};")
-    conn.execute("PRAGMA synchronous=FULL;")
-    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)};")
-    conn.execute("PRAGMA temp_store=MEMORY;")
-    
-    conn.executescript(SCHEMA)
-    _ensure_in_index_columns(conn)
-    conn.commit()
-    
-    return conn
-
-
 PROMPT_HEADROOM_TOKENS = int(os.environ.get("LITKIT_PROMPT_HEADROOM_TOKENS", "200"))
 
 
@@ -781,39 +609,6 @@ BATCH_TRAIN_FLUSH = int(
 BUDGET_TOKENS_O3 = 32000
 BUDGET_TOKENS_OSS20B = 3000
 
-# -------------------- DB schema --------------------
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS papers (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  doc_id TEXT,                      -- stable document identifier (pmcid or pmid or hash)
-  pmid TEXT,
-  pmcid TEXT,
-  title TEXT,
-  abstract TEXT,
-  in_index INTEGER DEFAULT 0        -- 0=not yet in FAISS, 1=added
-);
-CREATE TABLE IF NOT EXISTS chunks (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  paper_id INTEGER NOT NULL,
-  ord INTEGER NOT NULL,
-  text TEXT NOT NULL,
-  in_index INTEGER DEFAULT 0,       -- 0=not yet in FAISS, 1=added
-  FOREIGN KEY(paper_id) REFERENCES papers(id)
-);
-CREATE INDEX IF NOT EXISTS chunks_paper_id ON chunks(paper_id);
-CREATE INDEX IF NOT EXISTS chunks_paper_ord ON chunks(paper_id, ord);
-CREATE TABLE IF NOT EXISTS files (
-  path TEXT PRIMARY KEY,
-  size INTEGER,
-  mtime REAL,
-  paper_id INTEGER
-);
-CREATE UNIQUE INDEX IF NOT EXISTS papers_pmcid_uq ON papers(pmcid) WHERE pmcid <> '';
-CREATE UNIQUE INDEX IF NOT EXISTS papers_pmid_uq  ON papers(pmid)  WHERE pmid  <> '';
-CREATE UNIQUE INDEX IF NOT EXISTS papers_doc_id_uq ON papers(doc_id) WHERE doc_id <> '';
-"""
-
-
 # -------------------- Destructive action confirmation --------------------
 def _fmt_bytes(n: int) -> str:
     """Human-ish size."""
@@ -840,6 +635,7 @@ def _confirm_rebuild(conn) -> None:
     """Ask the user to confirm --rebuild when in an interactive TTY.
     In non-interactive mode, require --yes or LITKIT_ASSUME_YES=1.
     """
+    get_runtime()  # ensure path globals are bound
     # Allow fully non-interactive approvals
     assume_yes = os.environ.get("LITKIT_ASSUME_YES", "0") == "1"
     if assume_yes:
@@ -924,64 +720,6 @@ def _maybe_fsync_dir(p: Path):
 
 
 # -------------------- Utils --------------------
-def init_db(journal_mode: str, busy_timeout_ms: int):
-    """Initialize (or open) the SQLite database and ensure schema exists.
-
-    Supported journal modes: TRUNCATE (default) | WAL
-    - TRUNCATE: safe on shared HPC filesystems (reduced metadata churn vs DELETE).
-    - WAL     : excellent locally; avoid on shared FS (NFS/Lustre).
-    """
-    conn = sqlite3.connect(DB_PATH, isolation_level="DEFERRED", timeout=busy_timeout_ms / 1000.0)
-
-    mode = (journal_mode or "TRUNCATE").upper()
-    supported = {"TRUNCATE", "WAL"}
-    if mode not in supported:
-        _eprint(f"[db] WARNING: unsupported journal_mode={mode!r} -> forcing TRUNCATE")
-        mode = "TRUNCATE"
-
-    # Apply requested journal mode (TRUNCATE (default) | WAL)
-    conn.execute(f"PRAGMA journal_mode={mode};")
-
-    if mode == "WAL":
-        # WAL can misbehave on shared HPC filesystems; warn the operator.
-        _eprint(
-            "[db] WARNING: WAL selected. Ensure the DB is on node-local storage. "
-            "On shared FS (NFS/Lustre), prefer --sqlite-journal-mode TRUNCATE."
-        )
-        conn.execute("PRAGMA wal_autocheckpoint=1000;")
-
-    eff_mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
-    _eprint(f"[db] journal_mode set to {eff_mode}")
-
-    # Crash-safe on shared filesystems (NFS/Lustre) requires FULL.
-    conn.execute("PRAGMA synchronous=FULL;")
-    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)};")
-    conn.execute("PRAGMA temp_store=MEMORY;")  # force in-memory temp storage
-
-    conn.executescript(SCHEMA)
-    _ensure_in_index_columns(conn)
-    conn.commit()
-    return conn
-
-
-def _ensure_in_index_columns(conn):
-    """Idempotent migration: ensure `in_index` and `doc_id` columns exist."""
-    cur = conn.cursor()
-    for table in ("papers", "chunks"):
-        cols = {row[1] for row in cur.execute(f"PRAGMA table_info({table})")}
-        if "in_index" not in cols:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN in_index INTEGER DEFAULT 0")
-    
-    # Ensure doc_id column exists on papers table (for multi-producer deduplication)
-    papers_cols = {row[1] for row in cur.execute("PRAGMA table_info(papers)")}
-    if "doc_id" not in papers_cols:
-        cur.execute("ALTER TABLE papers ADD COLUMN doc_id TEXT")
-        # Create unique index for doc_id if it doesn't exist
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS papers_doc_id_uq ON papers(doc_id) WHERE doc_id <> ''")
-    
-    conn.commit()
-
-
 def pack_paragraphs(
     paras, max_chars=CHUNK_TARGET_CHARS, min_chars=BODY_MIN_CHARS, overlap_chars=CHUNK_OVERLAP_CHARS
 ):
@@ -1214,6 +952,7 @@ def _validate_shard_consistency(seg_dir: Path, current_num_shards: int, *, curre
     
     Raises SystemExit if there's a mismatch to prevent data corruption.
     """
+    get_runtime()  # ensure SQLITE_DIR and INDICES_DIR are bound for error messages
     seg_dir = Path(seg_dir)
     meta = _read_build_meta(seg_dir)
     has_segments = _has_segment_files(seg_dir)
@@ -1896,80 +1635,9 @@ def _ensure_parent(path: Path):
 
 
 # -------------------- Embedding segment I/O (producer↔writer) --------------------
-def _segment_fname(kind: str, producer: str, seq: int) -> str:
-    # kind: "chunks" or "papers"
-    # producer: short id (e.g., hostname-pid)
-    return f"{kind}.seg.{producer}.{seq:08d}.npz"
-
-
-def _segment_write(
-    outdir: Path,
-    kind: str,
-    producer: str,
-    seq: int,
-    ids: np.ndarray,
-    X: np.ndarray,
-    on_disk_dtype: str = "fp16",
-) -> Path:
-    outdir.mkdir(parents=True, exist_ok=True)
-    fname = _segment_fname(kind, producer, seq)
-    tmp = outdir / (fname + ".tmp")
-    final = outdir / fname
-
-    X_store = (
-        X.astype(np.float16, copy=False)
-        if on_disk_dtype == "fp16"
-        else X.astype(np.float32, copy=False)
-    )
-    np.savez(
-        tmp,
-        kind=kind,
-        dtype="fp16" if on_disk_dtype == "fp16" else "fp32",
-        dim=X.shape[1],
-        n=X.shape[0],
-        ids=ids.astype(np.int64, copy=False),
-        emb=X_store,
-    )
-    try:
-        fh = os.open(str(tmp), os.O_RDONLY)
-        try:
-            os.fsync(fh)
-        finally:
-            os.close(fh)
-    except Exception:
-        pass
-    os.replace(tmp, final)
-    _maybe_fsync_dir(final)
-    return final
-
-
-def preload_paper_id_map(conn) -> dict[str, int]:
-    """Preload doc_id → paper_id mapping for O(1) lookups during segment ingestion.
-    
-    Returns:
-        Dict mapping doc_id strings to paper_id integers.
-    """
-    cur = conn.cursor()
-    rows = cur.execute(
-        "SELECT doc_id, id FROM papers WHERE doc_id IS NOT NULL AND doc_id != ''"
-    ).fetchall()
-    return {str(doc_id): int(paper_id) for doc_id, paper_id in rows}
-
-
-def preload_chunk_id_map(conn) -> dict[tuple[int, int], int]:
-    """Preload (paper_id, ord) → chunk_id mapping for O(1) lookups during segment ingestion.
-    
-    Returns:
-        Dict mapping (paper_id, ord) tuples to chunk_id integers.
-    """
-    cur = conn.cursor()
-    rows = cur.execute("SELECT paper_id, ord, id FROM chunks").fetchall()
-    return {(int(paper_id), int(ord_val)): int(chunk_id) for paper_id, ord_val, chunk_id in rows}
-
-
 def _ingest_paper_segments(
     conn, paper_index, outdir: Path, *, save_every: int = 2, paper_id_map: dict[str, int] | None = None
-):
+) -> tuple:
     """Ingest paper embedding segments from producer nodes.
     
     Segments contain doc_ids (globally unique file paths) and embeddings.
@@ -1977,15 +1645,19 @@ def _ingest_paper_segments(
     
     Args:
         conn: SQLite connection to main database
-        paper_index: FAISS index for papers
+        paper_index: FAISS index for papers (may be wrapped in IndexIDMap2 if needed)
         outdir: Directory containing segment files
         save_every: Save index every N segment files
         paper_id_map: Optional preloaded doc_id → paper_id mapping for O(1) lookups.
                       If None, will be loaded once at start.
+    
+    Returns:
+        (paper_index, added_count): The (possibly wrapped) index and number of vectors added.
+        Caller should rebind their index reference to the returned value.
     """
     outdir = Path(outdir)
     if not outdir.exists():
-        return 0
+        return paper_index, 0
     cand = sorted(
         list(outdir.glob("papers_*.npz"))  # new style
         + list(outdir.glob("papers.seg.*.npz"))  # old style
@@ -1993,11 +1665,11 @@ def _ingest_paper_segments(
         + list(outdir.glob("papers.seg.*.npz.ingesting"))
     )
     if not cand:
-        return 0
+        return paper_index, 0
     
     # Preload paper_id_map once if not provided (O(1) lookups vs O(N) queries)
     if paper_id_map is None:
-        paper_id_map = preload_paper_id_map(conn)
+        paper_id_map = db_preload_paper_id_map(conn)
         _eprint(f"[segments] preloaded {len(paper_id_map)} paper ID mappings")
     
     cur = conn.cursor()
@@ -2105,14 +1777,14 @@ def _ingest_paper_segments(
                 except Exception:
                     pass
             _eprint(f"[segments] ERROR ingesting {p.name}: {e.__class__.__name__}: {e}")
-    return added_total
+    return paper_index, added_total
 
 
 def _ingest_chunk_segments(
     conn, chunk_index, outdir: Path, *, save_every: int = 2,
     paper_id_map: dict[str, int] | None = None,
     chunk_id_map: dict[tuple[int, int], int] | None = None
-):
+) -> tuple:
     """Ingest chunk embedding segments from producer nodes.
     
     Segments contain (paper_doc_id, ord) pairs and embeddings.
@@ -2126,7 +1798,7 @@ def _ingest_chunk_segments(
 
     Args:
         conn: SQLite connection to main database
-        chunk_index: FAISS index for chunks
+        chunk_index: FAISS index for chunks (may be wrapped in IndexIDMap2 if needed)
         outdir: Directory containing segment files
         save_every: Save index every N segment files
         paper_id_map: Optional preloaded doc_id → paper_id mapping for O(1) lookups.
@@ -2134,11 +1806,13 @@ def _ingest_chunk_segments(
         chunk_id_map: Optional preloaded (paper_id, ord) → chunk_id mapping for O(1) lookups.
                       If None, will be loaded once at start.
 
-    Returns the number of vectors added.
+    Returns:
+        (chunk_index, added_count): The (possibly wrapped) index and number of vectors added.
+        Caller should rebind their index reference to the returned value.
     """
     outdir = Path(outdir)
     if not outdir.exists():
-        return 0
+        return chunk_index, 0
 
     # Ensure external ID mapping is present for robust remove and add
     if not isinstance(chunk_index, faiss.IndexIDMap2):
@@ -2153,14 +1827,14 @@ def _ingest_chunk_segments(
         + list(outdir.glob("chunks.seg.*.npz.ingesting"))
     )
     if not cand:
-        return 0
+        return chunk_index, 0
 
     # Preload ID maps once if not provided (O(1) lookups vs O(N) queries)
     if paper_id_map is None:
-        paper_id_map = preload_paper_id_map(conn)
+        paper_id_map = db_preload_paper_id_map(conn)
         _eprint(f"[segments] preloaded {len(paper_id_map)} paper ID mappings")
     if chunk_id_map is None:
-        chunk_id_map = preload_chunk_id_map(conn)
+        chunk_id_map = db_preload_chunk_id_map(conn)
         _eprint(f"[segments] preloaded {len(chunk_id_map)} chunk ID mappings")
 
     cur = conn.cursor()
@@ -2289,7 +1963,7 @@ def _ingest_chunk_segments(
                     pass
             _eprint(f"[segments] ERROR ingesting {p.name}: {e.__class__.__name__}: {e}")
 
-    return added_total
+    return chunk_index, added_total
 
 
 def _extract_ivf(index):
@@ -2364,21 +2038,22 @@ def backfill_unindexed_vectors(
                     saved = _faiss_save_force(paper_index, PAPER_INDEX_PATH) if prior_ntotal == 0 \
                             else _faiss_save(paper_index, PAPER_INDEX_PATH)
         except RuntimeError:
+            # Fallback: _add_ids_union_compat handles db_mark_in_index internally
             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
                 added = _add_ids_union_compat(
                     paper_index, ids, Xp, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
                 )
                 conn.commit()
-            saved = bool(added)
-            ids_added = ids if added == 0 else []
+            # No external marking needed - already done inside _add_ids_union_compat
+            continue
         if added and saved:
             with FileLock(DB_LOCK):
-                db_mark_in_index(cur, "papers", [int(i) for i in (ids_added or ids)])
+                db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
                 db_flush_pending_marks(cur)
                 conn.commit()
         else:
             if added:
-                _PENDING_MARKS["papers"].extend([int(i) for i in (ids_added or ids)])
+                _PENDING_MARKS["papers"].extend([int(i) for i in ids_added])
             conn.commit()
 
     # Chunks
@@ -2409,21 +2084,22 @@ def backfill_unindexed_vectors(
                     saved = _faiss_save_force(chunk_index, CHUNK_INDEX_PATH) if prior_ntotal == 0 \
                             else _faiss_save(chunk_index, CHUNK_INDEX_PATH)
         except RuntimeError:
+            # Fallback: _add_ids_union_compat handles db_mark_in_index internally
             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
                 added = _add_ids_union_compat(
                     chunk_index, ids, Xc, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
                 )
                 conn.commit()
-            saved = bool(added)
-            ids_added = ids if added == 0 else []
+            # No external marking needed - already done inside _add_ids_union_compat
+            continue
         if added and saved:
             with FileLock(DB_LOCK):
-                db_mark_in_index(cur, "chunks", [int(i) for i in (ids_added or ids)])
+                db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
                 db_flush_pending_marks(cur)
                 conn.commit()
         else:
             if added:
-                _PENDING_MARKS["chunks"].extend([int(i) for i in (ids_added or ids)])
+                _PENDING_MARKS["chunks"].extend([int(i) for i in ids_added])
             conn.commit()
 
 
@@ -2580,7 +2256,7 @@ def _mark_in_index(cur, table: str, ids: list[int]):
 
 def _auto_top_papers() -> int:
     try:
-        conn = _connect_db()
+        conn = db_connect_db(DB_PATH)
         n = conn.execute("SELECT COUNT(1) FROM papers").fetchone()[0]
         conn.close()
     except Exception:
@@ -2645,33 +2321,9 @@ def _normalize_for_search_py(s: str) -> str:
     return s.translate(trans)
 
 
-def _connect_db(busy_timeout_ms: int | None = None, *, autocommit: bool = False):
-    if busy_timeout_ms is None:
-        busy_timeout_ms = DEFAULT_BUSY_TIMEOUT_MS
-    iso = None if autocommit else "DEFERRED"
-    conn = sqlite3.connect(DB_PATH, isolation_level=iso, timeout=busy_timeout_ms / 1000.0)
-    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)};")
-    conn.execute("PRAGMA temp_store=MEMORY;")
-    return conn
-
-
-# DB helper
-def _ensure_temp_candidates_table(conn):
-    conn.execute("CREATE TEMP TABLE IF NOT EXISTS cand_papers (id INTEGER PRIMARY KEY)")
-    conn.execute("DELETE FROM cand_papers")
-
-
-# DB helper
-def _load_temp_candidates(conn, pids: list[int]) -> None:
-    _ensure_temp_candidates_table(conn)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM cand_papers")
-    cur.executemany("INSERT OR IGNORE INTO cand_papers(id) VALUES (?)", [(int(x),) for x in pids])
-    conn.commit()
-
-
 def load_checkpoint() -> dict:
     """Load JSON checkpoint (if exists) for resumable workflows; else {}."""
+    get_runtime()  # ensure CKPT_PATH is bound
     if CKPT_PATH.exists():
         try:
             return json.loads(CKPT_PATH.read_text())
@@ -2681,6 +2333,7 @@ def load_checkpoint() -> dict:
 
 
 def save_checkpoint(obj: dict):
+    get_runtime()  # ensure CKPT_PATH and CKPT_LOCK are bound
     with FileLock(CKPT_LOCK):
         tmp = CKPT_PATH.with_suffix(".tmp")
         with open(tmp, "w") as fh:
@@ -2689,18 +2342,6 @@ def save_checkpoint(obj: dict):
             os.fsync(fh.fileno())
         os.replace(tmp, CKPT_PATH)
         _maybe_fsync_dir(CKPT_PATH)
-
-
-def already_processed(cur, fpath: str, st) -> bool:
-    """Check if file at `fpath` with current stat `st` was already ingested
-    (size and mtime match a row in the files table).
-    """
-    cur.execute("SELECT size, mtime FROM files WHERE path=?", (fpath,))
-    row = cur.fetchone()
-    if not row:
-        return False
-    size, mtime = row
-    return size == st.st_size and abs(mtime - st.st_mtime) < 1e-6
 
 
 def iter_tar_articles(
@@ -2744,294 +2385,6 @@ def iter_tar_articles(
                     pass
 
 
-def register_file(cur, fpath: str, paper_id: int, st):
-    """Insert/replace the (path, size, mtime, paper_id) record in files table."""
-    cur.execute(
-        "INSERT OR REPLACE INTO files(path, size, mtime, paper_id) VALUES (?,?,?,?)",
-        (fpath, st.st_size, st.st_mtime, paper_id),
-    )
-
-
-# -------------------- Ingest helper for parallel/sequential paths --------------------
-
-class _IngestContext:
-    """Holds shared state for article ingestion across parallel and sequential paths."""
-    
-    def __init__(
-        self,
-        conn,
-        cur,
-        args,
-        paper_embedder,
-        chunk_embedder,
-        paper_index,
-        chunk_index,
-    ):
-        self.conn = conn
-        self.cur = cur
-        self.args = args
-        self.paper_embedder = paper_embedder
-        self.chunk_embedder = chunk_embedder
-        self.paper_index = paper_index
-        self.chunk_index = chunk_index
-        
-        # Buffers for batching
-        self.paper_ids_buf: list[int] = []
-        self.paper_texts_buf: list[str] = []
-        self.chunk_ids_buf: list[int] = []
-        self.chunk_texts_buf: list[str] = []
-        
-        # Counters
-        self.papers_added_total = 0
-        self.chunks_added_total = 0
-
-
-def _ingest_article(
-    ctx: _IngestContext,
-    meta: ArticleMeta,
-    file_path: str,
-    st: SimpleNamespace,
-) -> bool:
-    """Ingest a single parsed article into the database and embedding buffers.
-    
-    Args:
-        ctx: Shared ingest context with DB connection, embedders, indices, and buffers
-        meta: Parsed article metadata from parse_xml_fileobj()
-        file_path: Canonical path string (e.g., "tar://foo.tar!/member.nxml")
-        st: SimpleNamespace with .st_size and .st_mtime attributes
-    
-    Returns:
-        True if successfully ingested, False on error
-    """
-    cur = ctx.cur
-    conn = ctx.conn
-    args = ctx.args
-    
-    try:
-        pmcid = (meta["pmcid"] or "").strip()
-        pmid = (meta["pmid"] or "").strip()
-
-        pid_row = None
-        if pmcid:
-            pid_row = cur.execute(
-                "SELECT id FROM papers WHERE pmcid=?", (pmcid,)
-            ).fetchone()
-        if (pid_row is None) and pmid:
-            pid_row = cur.execute(
-                "SELECT id FROM papers WHERE pmid=?", (pmid,)
-            ).fetchone()
-        if pid_row:
-            pid = pid_row[0]
-        else:
-            cur.execute(
-                "INSERT INTO papers(pmid, pmcid, title, abstract) VALUES (?,?,?,?)",
-                (pmid, pmcid, meta["title"], meta["abstract"]),
-            )
-            pid = cur.lastrowid
-
-        seen_this_path = (
-            cur.execute("SELECT 1 FROM files WHERE path=?", (file_path,)).fetchone()
-            is not None
-        )
-        if seen_this_path:
-            if args.faiss_writer:
-                with FileLock(FAISS_LOCK):
-                    if not isinstance(ctx.paper_index, faiss.IndexIDMap2):
-                        ctx.paper_index = faiss.IndexIDMap2(ctx.paper_index)
-                    selp = _make_id_selector([pid])
-                    _safe_remove_ids(ctx.paper_index, selp)
-                    _faiss_save_force(ctx.paper_index, PAPER_INDEX_PATH)
-
-                old_ids = [
-                    row[0]
-                    for row in cur.execute(
-                        "SELECT id FROM chunks WHERE paper_id=?", (pid,)
-                    )
-                ]
-                if old_ids:
-                    with FileLock(FAISS_LOCK):
-                        if not isinstance(ctx.chunk_index, faiss.IndexIDMap2):
-                            ctx.chunk_index = faiss.IndexIDMap2(ctx.chunk_index)
-                        selc = _make_id_selector(old_ids)
-                        _safe_remove_ids(ctx.chunk_index, selc)
-                        _faiss_save_force(ctx.chunk_index, CHUNK_INDEX_PATH)
-            with FileLock(DB_LOCK):
-                cur.execute("DELETE FROM chunks WHERE paper_id=?", (pid,))
-                cur.execute("UPDATE papers SET in_index=0 WHERE id=?", (pid,))
-
-        register_file(cur, file_path, pid, st)
-
-        ta = (meta["title"] or "").strip()
-        ab = (meta["abstract"] or "").strip()
-        ta_ab = (ta + " " + ab).strip() or (
-            meta["paragraphs"][0][:800] if meta["paragraphs"] else "untitled"
-        )
-        ctx.paper_ids_buf.append(pid)
-        ctx.paper_texts_buf.append(ta_ab)
-
-        proposed_chunks = []
-        if ta_ab:
-            proposed_chunks.append((-1, ta_ab))
-
-        paras = meta["paragraphs"] or ([ab] if ab else [])
-        chunks = (
-            pack_paragraphs(
-                paras,
-                max_chars=int(
-                    getattr(args, "chunk_target_chars", CHUNK_TARGET_CHARS)
-                ),
-                min_chars=int(getattr(args, "chunk_min_chars", BODY_MIN_CHARS)),
-                overlap_chars=int(
-                    getattr(args, "chunk_overlap", CHUNK_OVERLAP_CHARS)
-                ),
-            )
-            if paras
-            else []
-        )
-        for ord_i, ch in enumerate(chunks):
-            proposed_chunks.append((ord_i, ch))
-
-        for ord_i, text_i in proposed_chunks:
-            cur.execute(
-                "INSERT INTO chunks(paper_id, ord, text) VALUES (?,?,?)",
-                (pid, ord_i, text_i),
-            )
-            cid = cur.lastrowid
-            ctx.chunk_ids_buf.append(cid)
-            ctx.chunk_texts_buf.append(text_i)
-
-        # Flush paper batch if needed
-        if len(ctx.paper_ids_buf) >= PAPER_BATCH:
-            _flush_paper_batch(ctx)
-
-        # Flush chunk batch if needed
-        if len(ctx.chunk_ids_buf) >= CHUNK_BATCH:
-            _flush_chunk_batch(ctx)
-
-        return True
-
-    except Exception as e:
-        _eprint(f"[ingest] ERROR {file_path}: {e.__class__.__name__}: {e}")
-        try:
-            with FileLock(DB_LOCK):
-                conn.rollback()
-        except Exception:
-            pass
-        return False
-
-
-def _flush_paper_batch(ctx: _IngestContext) -> None:
-    """Embed and persist the current paper buffer."""
-    if not ctx.paper_ids_buf:
-        return
-    
-    u_ids, u_texts = dedupe_ids_and_texts(ctx.paper_ids_buf, ctx.paper_texts_buf)
-
-    if paper_seg_writer is not None:
-        Xp = ctx.paper_embedder.encode(
-            u_texts,
-            progress_label=f"Embedding papers (producer, {len(u_texts)})",
-            batch_size=ctx.args.paper_embed_bs,
-            progress_done_summary=False,
-        )
-        paper_seg_writer.write(
-            ids=np.asarray(u_ids, dtype=np.int64), vecs=Xp
-        )
-        ctx.conn.commit()
-        ctx.papers_added_total += len(u_ids)
-
-    elif ctx.args.faiss_writer:
-        Xp = ctx.paper_embedder.encode(
-            u_texts,
-            progress_label=f"Embedding papers (batch of {len(u_texts)})",
-            batch_size=ctx.args.paper_embed_bs,
-            progress_done_summary=False,
-        )
-        prior_ntotal = int(getattr(ctx.paper_index, "ntotal", 0) or 0)
-        sel = _make_id_selector(u_ids)
-        with FileLock(FAISS_LOCK):
-            _safe_remove_ids(ctx.paper_index, sel)
-            added, ids_added = _add_with_ids_dedup(ctx.paper_index, u_ids, Xp)
-            saved = False
-            if added:
-                if prior_ntotal == 0:
-                    saved = _faiss_save_force(ctx.paper_index, PAPER_INDEX_PATH)
-                else:
-                    saved = _faiss_save(ctx.paper_index, PAPER_INDEX_PATH)
-        if added:
-            if saved:
-                with FileLock(DB_LOCK):
-                    db_mark_in_index(ctx.cur, "papers", [int(i) for i in ids_added])
-                    db_flush_pending_marks(ctx.cur)
-                    ctx.conn.commit()
-            else:
-                _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
-        ctx.papers_added_total += int(added)
-
-    else:
-        ctx.conn.commit()
-        ctx.papers_added_total += len(u_ids)
-
-    ctx.paper_ids_buf.clear()
-    ctx.paper_texts_buf.clear()
-
-
-def _flush_chunk_batch(ctx: _IngestContext) -> None:
-    """Embed and persist the current chunk buffer."""
-    if not ctx.chunk_ids_buf:
-        return
-    
-    u_ids, u_texts = dedupe_ids_and_texts(ctx.chunk_ids_buf, ctx.chunk_texts_buf)
-
-    if chunk_seg_writer is not None:
-        Xc = ctx.chunk_embedder.encode(
-            u_texts,
-            progress_label=f"Embedding chunks (producer, {len(u_texts)})",
-            batch_size=ctx.args.chunk_embed_bs,
-            progress_done_summary=False,
-        )
-        chunk_seg_writer.write(
-            ids=np.asarray(u_ids, dtype=np.int64), vecs=Xc
-        )
-        ctx.conn.commit()
-        ctx.chunks_added_total += len(u_ids)
-
-    elif ctx.args.faiss_writer:
-        Xc = ctx.chunk_embedder.encode(
-            u_texts,
-            progress_label=f"Embedding chunks (batch of {len(u_texts)})",
-            batch_size=ctx.args.chunk_embed_bs,
-            progress_done_summary=False,
-        )
-        prior_ntotal = int(getattr(ctx.chunk_index, "ntotal", 0) or 0)
-        sel = _make_id_selector(u_ids)
-        with FileLock(FAISS_LOCK):
-            _safe_remove_ids(ctx.chunk_index, sel)
-            added, ids_added = _add_with_ids_dedup(ctx.chunk_index, u_ids, Xc)
-            saved = False
-            if added:
-                if prior_ntotal == 0:
-                    saved = _faiss_save_force(ctx.chunk_index, CHUNK_INDEX_PATH)
-                else:
-                    saved = _faiss_save(ctx.chunk_index, CHUNK_INDEX_PATH)
-        if added:
-            if saved:
-                with FileLock(DB_LOCK):
-                    db_mark_in_index(ctx.cur, "chunks", [int(i) for i in ids_added])
-                    db_flush_pending_marks(ctx.cur)
-                    ctx.conn.commit()
-            else:
-                _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
-        ctx.chunks_added_total += int(added)
-
-    else:
-        ctx.conn.commit()
-        ctx.chunks_added_total += len(u_ids)
-
-    ctx.chunk_ids_buf.clear()
-    ctx.chunk_texts_buf.clear()
-
-
 def build_or_update_indices(args):
     """Build or update indices & DB depending on flags.
 
@@ -3048,6 +2401,7 @@ def build_or_update_indices(args):
     save indices. Other processes (possibly using --shard-id/--num-shards) only
     populate SQLite rows and commit; they do not mutate FAISS indices.
     """
+    get_runtime()  # ensure all path globals are bound (required for library use)
     need = args.rebuild or not (
         DB_PATH.exists() and PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists()
     )
@@ -3084,10 +2438,10 @@ def build_or_update_indices(args):
     # Use shard-specific DB for producers (lock-free parallel writes)
     if args.embed_producer and not args.faiss_writer:
         _eprint(f"[build] Producer mode: using shard-specific DB for shard {args.shard_id}")
-        conn = init_shard_db(args.shard_id, args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
+        conn = db_init_shard_db(db_shard_db_path(SQLITE_DIR, args.shard_id), args.shard_id, args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
     else:
         _eprint(f"[build] using DB at {DB_PATH}")
-        conn = init_db(args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
+        conn = db_init_db(DB_PATH, args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
     cur = conn.cursor()
 
     if args.init_indices_only:
@@ -3142,14 +2496,16 @@ def build_or_update_indices(args):
         # We cannot ingest segments until the DB merge is complete, because
         # segment files use doc_id (content-addressed) which must be resolved
         # against the merged main database, not the empty initial DB.
-        while not consumer_coordinator.all_producers_complete():
-            _eprint("[consumer] Waiting for producers to complete...")
-            
-            # Wait for completion or timeout
-            # Timeout set to 10 hours (36000s) to match the cluster's max job time
-            if consumer_coordinator.wait_for_completion(poll_interval=30, timeout=36000, progress_callback=progress_callback):
-                _eprint("[consumer] All producers have completed")
-                break
+        _eprint("[consumer] Waiting for producers to complete...")
+        
+        # Wait for completion or timeout (10 hours / 36000s to match the cluster's max job time)
+        completed = consumer_coordinator.wait_for_completion(
+            poll_interval=30, timeout=36000, progress_callback=progress_callback
+        )
+        if not completed:
+            _eprint("[consumer] TIMEOUT waiting for producers; aborting consume-only run.")
+            return
+        _eprint("[consumer] All producers have completed")
         
         # Merge all shard databases into the main database FIRST.
         # This populates the main DB with all papers/chunks so that
@@ -3162,8 +2518,8 @@ def build_or_update_indices(args):
         
         # NOW ingest segments - the main DB has all the data for doc_id resolution
         _eprint("[consumer] Ingesting embedding segments...")
-        p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
-        c_added = _ingest_chunk_segments(conn, chunk_index, seg_dir)
+        paper_index, p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
+        chunk_index, c_added = _ingest_chunk_segments(conn, chunk_index, seg_dir)
         _eprint(f"[consumer] Ingested {p_added} paper vectors and {c_added} chunk vectors")
         
         # Force save indices after ingestion
@@ -3582,9 +2938,6 @@ def build_or_update_indices(args):
     chunk_ords_buf: list[int] = []  # Track chunk ordinals within papers
     papers_added_total = 0
     chunks_added_total = 0
-    
-    # Track current paper's doc_id for chunk association
-    current_paper_doc_id: str | None = None
 
     for tpath in tar_paths:
         # Number of *persisted* members previously processed for this tar shard
@@ -3672,7 +3025,7 @@ def build_or_update_indices(args):
                 _render()
 
                 # Fast path: unchanged (count as handled)
-                if not args.rebuild and already_processed(cur, str(f), st):
+                if not args.rebuild and db_already_processed(cur, str(f), st):
                     handled_ok = True
 
                 else:
@@ -3751,7 +3104,7 @@ def build_or_update_indices(args):
                                 cur.execute("DELETE FROM chunks WHERE paper_id=?", (pid,))
                                 cur.execute("UPDATE papers SET in_index=0 WHERE id=?", (pid,))
 
-                        register_file(cur, str(f), pid, st)
+                        db_register_file(cur, str(f), pid, st)
 
                         ta = (meta["title"] or "").strip()
                         ab = (meta["abstract"] or "").strip()
@@ -4076,12 +3429,9 @@ def build_or_update_indices(args):
         seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
 
         if args.consume_segments and seg_dir and Path(seg_dir).exists():
-            if not isinstance(chunk_index, faiss.IndexIDMap2):
-                chunk_index = faiss.IndexIDMap2(chunk_index)
-            c_added = _ingest_chunk_segments(conn, chunk_index, seg_dir)
-            if not isinstance(paper_index, faiss.IndexIDMap2):
-                paper_index = faiss.IndexIDMap2(paper_index)
-            p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
+            # Ingest segments - functions handle IDMap2 wrapping and return the (possibly wrapped) index
+            paper_index, p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
+            chunk_index, c_added = _ingest_chunk_segments(conn, chunk_index, seg_dir)
             if c_added or p_added:
                 _eprint(
                     f"[segments] ingested {p_added} paper vectors and {c_added} chunk vectors from segments"
@@ -4330,20 +3680,6 @@ def shortlist_papers(
     return ids
 
 
-def chunk_ids_to_paper_ids(conn, chunk_ids: list[int]) -> dict[int, int]:
-    """Resolve chunk_id -> paper_id mapping for a given set of chunk IDs (batched to avoid SQLite var limits)."""
-    if not chunk_ids:
-        return {}
-    out: dict[int, int] = {}
-    B = 800
-    cur = conn.cursor()
-    for s in range(0, len(chunk_ids), B):
-        batch = chunk_ids[s : s + B]
-        marks = ",".join("?" for _ in batch)
-        cur.execute(f"SELECT id, paper_id FROM chunks WHERE id IN ({marks})", batch)
-        out.update({row[0]: row[1] for row in cur.fetchall()})
-    return out
-
 def search_chunks_constrained(
     question: str,
     candidate_papers: list[int],
@@ -4382,7 +3718,7 @@ def search_chunks_constrained(
     # Step 2: candidate-paper filter (if any)
     ranked = list(zip(ids, dists, strict=False))
 
-    db_conn = _connect_db()
+    db_conn = db_connect_db(DB_PATH)
 
     try:
         cand: set | None = None
@@ -4406,7 +3742,7 @@ def search_chunks_constrained(
             did_fallback = cand is None
 
         if cand:
-            ann_chunk_to_paper = chunk_ids_to_paper_ids(db_conn, ids)
+            ann_chunk_to_paper = db_chunk_ids_to_paper_ids(db_conn, ids)
             ranked = [(cid, dist) for cid, dist in ranked if ann_chunk_to_paper.get(cid) in cand]
 
         # Step 3: lexical front-loading  (LIKE + ESCAPE ? + normalization + guard)
@@ -4654,7 +3990,7 @@ def _avg_chunks_for_papers(pids: list[int]) -> float:
     """Average number of chunks across the requested paper ids (zeros included)."""
     if not pids:
         return 0.0
-    conn = _connect_db()
+    conn = db_connect_db(DB_PATH)
     try:
         db_load_temp_candidates(conn, pids)
         rows = conn.execute(
@@ -5359,17 +4695,17 @@ def main():
         except Exception:
             return False
 
-    # Make all later _connect_db() calls honor the user's timeout setting:
+    # Make all later db_connect_db() calls honor the user's timeout setting:
     DEFAULT_BUSY_TIMEOUT_MS = int(args.sqlite_busy_timeout_ms)
 
     # Do we need tar shards?
     # Note: --consume-only doesn't need corpus (it only ingests pre-computed segments)
+    # Note: --faiss-writer is a role flag (may mutate indices), not "must scan tars"
     needs_corpus = (
         args.rebuild
         or args.update
         or args.build_only
         or args.embed_producer
-        or (args.faiss_writer and not args.consume_only)  # consume-only skips tar scanning
         or (not _vector_store_exists())
     ) and not args.init_indices_only  # Bootstrap doesn't need corpus
 
@@ -5493,7 +4829,7 @@ def main():
         args.efsearch = max(args.efsearch, 256)
 
     if args.reconcile_only:
-        conn = _connect_db()
+        conn = db_connect_db(DB_PATH)
         try:
             try:
                 paper_index = _faiss_load(PAPER_INDEX_PATH)
@@ -5600,7 +4936,7 @@ def main():
         )
         return
 
-    conn = _connect_db()
+    conn = db_connect_db(DB_PATH)
     try:
         chunks = get_chunks(conn, chunk_ids)
     finally:

@@ -6,11 +6,9 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    pass
 
 # ---------------------------------------------------------------------------
 # Shard Path Utilities
@@ -27,7 +25,7 @@ def shard_db_path(sqlite_dir: Path, shard_id: int) -> Path:
     Returns:
         Path to the shard database file
     """
-    return sqlite_dir / f"litkit_shard_{shard_id}.sqlite3"
+    return sqlite_dir / f"litkit_shard_{shard_id:02d}.sqlite3"
 
 
 def list_shard_dbs(sqlite_dir: Path) -> list[Path]:
@@ -62,109 +60,177 @@ def _eprint(msg: str = "", *, end: str = "\n") -> None:
 
 def merge_shard_databases(
     main_conn: sqlite3.Connection,
-    sqlite_dir: Path,
-    *,
     delete_after_merge: bool = True,
 ) -> dict[str, int]:
     """Merge all per-shard SQLite databases into the main database.
     
-    Uses bulk SQL operations for efficient merging. Papers and chunks from
-    shards are inserted using INSERT OR IGNORE to handle duplicates safely.
+    Uses ATTACH DATABASE + INSERT...SELECT for efficient bulk merging.
+    The merge is idempotent: duplicate papers (same doc_id) and chunks 
+    (same paper_id+ord) are skipped using INSERT OR IGNORE.
+    
+    Note: This function discovers shard databases from SQLITE_DIR which
+    should be derived from the main database path.
     
     Args:
-        main_conn: Connection to the main database
-        sqlite_dir: Directory containing shard databases
-        delete_after_merge: If True, delete shard databases after merging
+        main_conn: Connection to the main litkit.sqlite3 database
+        delete_after_merge: If True, delete shard DBs after successful merge
     
     Returns:
-        Dictionary with merge statistics:
-        - shards: Number of shards merged
-        - papers: Number of papers merged
-        - chunks: Number of chunks merged
-        - files: Number of files merged
+        Dict with merge statistics: {"papers": N, "chunks": M, "files": F, 
+        "shards": S}
     """
+    # Derive sqlite_dir from main database path
+    # The main_conn is typically to sqlite_dir/litkit.sqlite3
+    db_path = main_conn.execute("PRAGMA database_list").fetchone()[2]
+    sqlite_dir = Path(db_path).parent if db_path else Path(".")
+    
     shard_dbs = list_shard_dbs(sqlite_dir)
     if not shard_dbs:
-        return {"shards": 0, "papers": 0, "chunks": 0, "files": 0}
-    
-    stats = {"shards": 0, "papers": 0, "chunks": 0, "files": 0}
-    cur = main_conn.cursor()
-    
-    for shard_path in shard_dbs:
-        _eprint(f"[merge] Merging shard database: {shard_path.name}")
-        
-        # Attach shard database
-        shard_alias = f"shard_{shard_path.stem}"
-        cur.execute(f"ATTACH DATABASE ? AS {shard_alias}", (str(shard_path),))
-        
-        try:
-            # Merge papers (INSERT OR IGNORE to handle duplicates)
-            cur.execute(f"""
-                INSERT OR IGNORE INTO papers 
-                    (doc_id, title, abstract, authors, year, src_file, in_index)
-                SELECT doc_id, title, abstract, authors, year, src_file, in_index
-                FROM {shard_alias}.papers
-            """)
-            papers_merged = cur.rowcount
-            stats["papers"] += papers_merged
-            
-            # Build doc_id to main paper_id mapping for chunk merging
-            cur.execute(f"""
-                INSERT OR IGNORE INTO chunks (paper_id, ord, text, in_index)
-                SELECT 
-                    main_papers.id,
-                    shard_chunks.ord,
-                    shard_chunks.text,
-                    shard_chunks.in_index
-                FROM {shard_alias}.chunks AS shard_chunks
-                JOIN {shard_alias}.papers AS shard_papers 
-                    ON shard_chunks.paper_id = shard_papers.id
-                JOIN papers AS main_papers 
-                    ON main_papers.doc_id = shard_papers.doc_id
-            """)
-            chunks_merged = cur.rowcount
-            stats["chunks"] += chunks_merged
-            
-            # Merge files table
-            cur.execute(f"""
-                INSERT OR REPLACE INTO files (path, size, mtime_ns, paper_id)
-                SELECT 
-                    shard_files.path,
-                    shard_files.size,
-                    shard_files.mtime_ns,
-                    main_papers.id
-                FROM {shard_alias}.files AS shard_files
-                LEFT JOIN {shard_alias}.papers AS shard_papers 
-                    ON shard_files.paper_id = shard_papers.id
-                LEFT JOIN papers AS main_papers 
-                    ON main_papers.doc_id = shard_papers.doc_id
-            """)
-            files_merged = cur.rowcount
-            stats["files"] += files_merged
-            
-            main_conn.commit()
-            stats["shards"] += 1
-            
-            _eprint(
-                f"[merge] Shard {shard_path.name}: "
-                f"{papers_merged} papers, {chunks_merged} chunks, "
-                f"{files_merged} files"
-            )
-            
-        finally:
-            # Detach shard database
-            cur.execute(f"DETACH DATABASE {shard_alias}")
-        
-        # Delete shard after successful merge
-        if delete_after_merge:
-            try:
-                os.remove(shard_path)
-                _eprint(f"[merge] Deleted shard: {shard_path.name}")
-            except OSError as e:
-                _eprint(f"[merge] WARNING: Could not delete {shard_path}: {e}")
+        return {"papers": 0, "chunks": 0, "files": 0, "shards": 0}
     
     _eprint(
-        f"[merge] Complete: {stats['shards']} shards, "
-        f"{stats['papers']} papers, {stats['chunks']} chunks"
+        f"[merge] Found {len(shard_dbs)} shard database(s) to merge "
+        "(using bulk SQL)"
+    )
+    
+    stats = {"papers": 0, "chunks": 0, "files": 0, "shards": 0}
+    main_cur = main_conn.cursor()
+    
+    for shard_idx, shard_db in enumerate(shard_dbs):
+        _eprint(f"[merge] Processing {shard_db.name}...")
+        t0 = time.time()
+        
+        # Use unique alias per shard to avoid "database already in use"
+        shard_alias = f"shard_db_{shard_idx}"
+        # Use unique temp table name per shard for safety
+        temp_map_table = f"_shard_paper_map_{shard_idx}"
+        
+        try:
+            # ATTACH the shard database for bulk operations
+            main_cur.execute(
+                f"ATTACH DATABASE ? AS {shard_alias}", (str(shard_db),)
+            )
+            
+            try:
+                # Count rows before merge for statistics
+                papers_before = main_cur.execute(
+                    "SELECT COUNT(*) FROM papers"
+                ).fetchone()[0]
+                chunks_before = main_cur.execute(
+                    "SELECT COUNT(*) FROM chunks"
+                ).fetchone()[0]
+                files_before = main_cur.execute(
+                    "SELECT COUNT(*) FROM files"
+                ).fetchone()[0]
+                
+                # 1) BULK MERGE PAPERS
+                # Insert papers that don't already exist (by doc_id)
+                main_cur.execute(f"""
+                    INSERT OR IGNORE INTO papers(
+                        doc_id, pmid, pmcid, title, abstract, in_index
+                    )
+                    SELECT s.doc_id, s.pmid, s.pmcid, s.title, s.abstract, 0
+                    FROM {shard_alias}.papers s
+                    WHERE s.doc_id IS NOT NULL 
+                      AND s.doc_id != ''
+                      AND NOT EXISTS (
+                          SELECT 1 FROM papers m WHERE m.doc_id = s.doc_id
+                      )
+                """)
+                
+                # 2) BULK MERGE CHUNKS
+                # Create temp table to map shard paper_id -> main paper_id
+                main_cur.execute(f"DROP TABLE IF EXISTS {temp_map_table}")
+                main_cur.execute(f"""
+                    CREATE TEMP TABLE {temp_map_table} AS
+                    SELECT s.id AS shard_pid, m.id AS main_pid
+                    FROM {shard_alias}.papers s
+                    JOIN papers m ON m.doc_id = s.doc_id
+                    WHERE s.doc_id IS NOT NULL AND s.doc_id != ''
+                """)
+                
+                # Insert chunks with remapped paper_id
+                main_cur.execute(f"""
+                    INSERT OR IGNORE INTO chunks(paper_id, ord, text, in_index)
+                    SELECT pm.main_pid, sc.ord, sc.text, 0
+                    FROM {shard_alias}.chunks sc
+                    JOIN {temp_map_table} pm ON pm.shard_pid = sc.paper_id
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM chunks mc 
+                        WHERE mc.paper_id = pm.main_pid AND mc.ord = sc.ord
+                    )
+                """)
+                
+                # 3) BULK MERGE FILES
+                # Insert/replace files with remapped paper_id
+                main_cur.execute(f"""
+                    INSERT OR REPLACE INTO files(path, size, mtime, paper_id)
+                    SELECT sf.path, sf.size, sf.mtime, pm.main_pid
+                    FROM {shard_alias}.files sf
+                    JOIN {temp_map_table} pm ON pm.shard_pid = sf.paper_id
+                """)
+                
+                # Drop temp table immediately after use
+                main_cur.execute(f"DROP TABLE IF EXISTS {temp_map_table}")
+                
+                # Count rows after merge for statistics
+                papers_after = main_cur.execute(
+                    "SELECT COUNT(*) FROM papers"
+                ).fetchone()[0]
+                chunks_after = main_cur.execute(
+                    "SELECT COUNT(*) FROM chunks"
+                ).fetchone()[0]
+                files_after = main_cur.execute(
+                    "SELECT COUNT(*) FROM files"
+                ).fetchone()[0]
+                
+                papers_merged = papers_after - papers_before
+                chunks_merged = chunks_after - chunks_before
+                files_merged = files_after - files_before
+                
+                stats["papers"] += papers_merged
+                stats["chunks"] += chunks_merged
+                stats["files"] += files_merged
+                stats["shards"] += 1
+                
+                elapsed = time.time() - t0
+                _eprint(
+                    f"[merge] {shard_db.name}: +{papers_merged} papers, "
+                    f"+{chunks_merged} chunks, +{files_merged} files "
+                    f"({elapsed:.1f}s)"
+                )
+                
+            finally:
+                # Always detach the shard database
+                try:
+                    main_cur.execute(f"DETACH DATABASE {shard_alias}")
+                except Exception:
+                    pass
+            
+            # Delete shard DB after successful merge
+            if delete_after_merge:
+                try:
+                    shard_db.unlink()
+                    _eprint(f"[merge] Deleted {shard_db.name}")
+                except Exception as e:
+                    _eprint(
+                        f"[merge] WARNING: could not delete {shard_db.name}: {e}"
+                    )
+            
+        except Exception as e:
+            _eprint(
+                f"[merge] ERROR processing {shard_db.name}: "
+                f"{e.__class__.__name__}: {e}"
+            )
+            import traceback
+            traceback.print_exc()
+            # Continue with next shard
+    
+    # Commit all changes
+    main_conn.commit()
+    
+    _eprint(
+        f"[merge] Complete: {stats['papers']} papers, {stats['chunks']} chunks, "
+        f"{stats['files']} files from {stats['shards']} shard(s)"
     )
     return stats

@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 def already_processed(
     cur: sqlite3.Cursor,
     fpath: str,
-    st: "os.stat_result",
+    st,
 ) -> bool:
     """Check if file at `fpath` with current stat `st` was already ingested.
     
@@ -27,26 +27,27 @@ def already_processed(
     Args:
         cur: Database cursor
         fpath: File path to check
-        st: os.stat() result for the file
+        st: SimpleNamespace or os.stat() result with st_size and st_mtime attributes
     
     Returns:
         True if file was already processed with same size/mtime
     """
     cur.execute(
-        "SELECT size, mtime_ns FROM files WHERE path = ?",
+        "SELECT size, mtime FROM files WHERE path = ?",
         (fpath,)
     )
     row = cur.fetchone()
     if row is None:
         return False
-    return row[0] == st.st_size and row[1] == st.st_mtime_ns
+    size, mtime = row
+    return size == st.st_size and abs(mtime - st.st_mtime) < 1e-6
 
 
 def register_file(
     cur: sqlite3.Cursor,
     fpath: str,
     paper_id: int,
-    st: "os.stat_result",
+    st,
 ) -> None:
     """Insert/replace the (path, size, mtime, paper_id) record in files table.
     
@@ -54,14 +55,12 @@ def register_file(
         cur: Database cursor
         fpath: File path
         paper_id: Associated paper ID
-        st: os.stat() result for the file
+        st: SimpleNamespace or os.stat() result with st_size and st_mtime
     """
     cur.execute(
-        """
-        INSERT OR REPLACE INTO files (path, size, mtime_ns, paper_id)
-        VALUES (?, ?, ?, ?)
-        """,
-        (fpath, st.st_size, st.st_mtime_ns, paper_id),
+        "INSERT OR REPLACE INTO files(path, size, mtime, paper_id) "
+        "VALUES (?, ?, ?, ?)",
+        (fpath, st.st_size, st.st_mtime, paper_id),
     )
 
 
