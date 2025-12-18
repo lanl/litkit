@@ -1045,6 +1045,7 @@ def _add_ids_union_compat(index, ids_list, X, *, table, cur, save_path: Path):
 
     ids_new = ids_arr[mask]
     X_new = np.ascontiguousarray(X[mask].astype("float32"))
+    faiss.normalize_L2(X_new)  # unit norm for IP == cosine (same as _add_with_ids_dedup)
     index.add_with_ids(X_new, ids_new)
     _faiss_save(index, save_path)
     db_mark_in_index(cur, table, [int(i) for i in ids_new])
