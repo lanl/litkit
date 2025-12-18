@@ -1553,7 +1553,7 @@ def build_or_update_indices(args):
         chunk_dim = 768  # SBERT dimension
         
         # Create paper index (always HNSW for papers)
-        paper_index = _hnsw_index(
+        paper_index = hnsw_index(
             paper_dim,
             M=args.hnsw_m,
             ef_construction=args.efconstruction,
@@ -1562,19 +1562,19 @@ def build_or_update_indices(args):
         paper_index = faiss.IndexIDMap2(paper_index)
         _ensure_parent(PAPER_INDEX_PATH)
         with FileLock(FAISS_LOCK):
-            _faiss_save_force(paper_index, PAPER_INDEX_PATH)
+            faiss_save_force(paper_index, PAPER_INDEX_PATH)
         
         # Create chunk index (FLAT or IVF-PQ based on args)
         if args.chunks_index == "flat":
-            chunk_index = _flat_ip_index(chunk_dim)
+            chunk_index = flat_ip_index(chunk_dim)
         else:  # ivfpq
             m_safe = safe_pq_m(chunk_dim, args.pq_m)
-            chunk_index = _ivfpq_index(chunk_dim, nlist=args.ivf_nlist, m=m_safe)
+            chunk_index = ivfpq_index(chunk_dim, nlist=args.ivf_nlist, m=m_safe)
         
         chunk_index = faiss.IndexIDMap2(chunk_index)
         _ensure_parent(CHUNK_INDEX_PATH)
         with FileLock(FAISS_LOCK):
-            _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+            faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
         
         _eprint("[bootstrap] Empty indices created. Exiting.")
         return
@@ -1584,8 +1584,8 @@ def build_or_update_indices(args):
             raise ValueError("--consume-only requires --faiss-writer")
         _eprint("[consumer] Starting consume-only mode")
         seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
-        paper_index = _faiss_load(PAPER_INDEX_PATH)
-        chunk_index = _faiss_load(CHUNK_INDEX_PATH)
+        paper_index = faiss_load(PAPER_INDEX_PATH)
+        chunk_index = faiss_load(CHUNK_INDEX_PATH)
         
         consumer_coordinator = SegConsumerCoordinator(seg_dir, args.num_shards)
         
@@ -1624,8 +1624,8 @@ def build_or_update_indices(args):
         
         # Force save indices after ingestion
         with FileLock(FAISS_LOCK):
-            _faiss_save_force(paper_index, PAPER_INDEX_PATH)
-            _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+            faiss_save_force(paper_index, PAPER_INDEX_PATH)
+            faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
         with FileLock(DB_LOCK):
             db_flush_pending_marks(conn.cursor())
             conn.commit()
@@ -1665,7 +1665,7 @@ def build_or_update_indices(args):
 
     # PAPER index
     if PAPER_INDEX_PATH.exists():
-        paper_index = _faiss_load(PAPER_INDEX_PATH)
+        paper_index = faiss_load(PAPER_INDEX_PATH)
 
         # --- Verify papers index family/metric (kind-aware; tolerate FlatIP) ---
         kind, core, _ = _unwrap_core_and_kind(paper_index)
@@ -1688,13 +1688,13 @@ def build_or_update_indices(args):
             paper_index = faiss.IndexIDMap2(paper_index)
             if args.faiss_writer:
                 with FileLock(FAISS_LOCK):
-                    _faiss_save(paper_index, PAPER_INDEX_PATH)
+                    faiss_save(paper_index, PAPER_INDEX_PATH)
     else:
         # Create base (HNSW or FLAT) and wrap in IDMap2
         if args.papers_index == "flat":
-            base = _flat_ip_index(paper_dim)
+            base = flat_ip_index(paper_dim)
         else:
-            base = _hnsw_index(
+            base = hnsw_index(
                 paper_dim,
                 M=args.hnsw_m,
                 ef_construction=args.efconstruction,
@@ -1710,7 +1710,7 @@ def build_or_update_indices(args):
         _ensure_parent(PAPER_INDEX_PATH)
         if args.faiss_writer:
             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                _faiss_save(paper_index, PAPER_INDEX_PATH)
+                faiss_save(paper_index, PAPER_INDEX_PATH)
         else:
             raise RuntimeError(
                 "PAPER index does not exist. Start a writer with --faiss-writer or precreate the index."
@@ -1718,8 +1718,8 @@ def build_or_update_indices(args):
 
     # CHUNK index
     if CHUNK_INDEX_PATH.exists():
-        chunk_index = _faiss_load(CHUNK_INDEX_PATH)
-        _, core = _kind_and_core(chunk_index)
+        chunk_index = faiss_load(CHUNK_INDEX_PATH)
+        _, core = kind_and_core(chunk_index)
         mt = getattr(core, "metric_type", faiss.METRIC_INNER_PRODUCT)
         if mt != faiss.METRIC_INNER_PRODUCT:
             raise RuntimeError(
@@ -1730,7 +1730,7 @@ def build_or_update_indices(args):
             chunk_index = faiss.IndexIDMap2(chunk_index)
             if args.faiss_writer:
                 with FileLock(FAISS_LOCK):
-                    _faiss_save(chunk_index, CHUNK_INDEX_PATH)
+                    faiss_save(chunk_index, CHUNK_INDEX_PATH)
 
         ivf = _extract_ivf(chunk_index)
         if isinstance(ivf, faiss.IndexIVFPQ) and not getattr(ivf, "is_trained", False):
@@ -1740,13 +1740,13 @@ def build_or_update_indices(args):
             _clear_chunk_trained_flag()
     else:
         if args.chunks_index == "flat":
-            base = _flat_ip_index(chunk_dim)
+            base = flat_ip_index(chunk_dim)
             chunk_index = faiss.IndexIDMap2(base)
             _clear_chunk_trained_flag()
             _ensure_parent(CHUNK_INDEX_PATH)
             if args.faiss_writer:
                 with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                    _faiss_save(chunk_index, CHUNK_INDEX_PATH)
+                    faiss_save(chunk_index, CHUNK_INDEX_PATH)
             else:
                 raise RuntimeError(
                     "CHUNK index does not exist. Start a writer with --faiss-writer or precreate the index."
@@ -1760,7 +1760,7 @@ def build_or_update_indices(args):
 
             # Placeholder IVFPQ (will be replaced after training)
             eff_nlist = 16
-            chunk_index = _ivfpq_index(chunk_dim, nlist=eff_nlist, m=m_safe)
+            chunk_index = ivfpq_index(chunk_dim, nlist=eff_nlist, m=m_safe)
 
             _ensure_parent(CHUNK_INDEX_PATH)
             if not args.faiss_writer:
@@ -1901,10 +1901,10 @@ def build_or_update_indices(args):
         samples_prog.finish()
         if not X_train_list:
             _eprint("[train] WARNING: no chunk texts found for training; falling back to FLAT index")
-            base = _flat_ip_index(chunk_dim)
+            base = flat_ip_index(chunk_dim)
             chunk_index = faiss.IndexIDMap2(base)
             _clear_chunk_trained_flag()
-            _faiss_save(chunk_index, CHUNK_INDEX_PATH)
+            faiss_save(chunk_index, CHUNK_INDEX_PATH)
         else:
             X_train = np.vstack(X_train_list)
             if X_train.shape[0] > train_samples:
@@ -1924,11 +1924,11 @@ def build_or_update_indices(args):
             # Early floor: require enough data for codebooks and subquantizers
             if n_train < max(min_for_micro, min_for_pq, 100 * m_candidate):
                 _eprint(f"[train] not enough samples for IVF-PQ (n={n_train}); using FLAT IP")
-                base = _flat_ip_index(chunk_dim)
+                base = flat_ip_index(chunk_dim)
                 chunk_index = faiss.IndexIDMap2(base)
                 if args.faiss_writer:
                     with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                        _faiss_save(chunk_index, CHUNK_INDEX_PATH)
+                        faiss_save(chunk_index, CHUNK_INDEX_PATH)
                 _clear_chunk_trained_flag()
             else:
                 # 2) Choose nlist with data-aware caps
@@ -1943,11 +1943,11 @@ def build_or_update_indices(args):
                 # Re-check adequacy now that nlist is known
                 if eff_nlist < 8 or n_train < max(min_for_pq, 50 * eff_nlist, 100 * m_candidate):
                     _eprint(f"[train] nlist/m under-sampled (n={n_train}, nlist={eff_nlist}, m={m_candidate}); using FLAT IP")
-                    base = _flat_ip_index(chunk_dim)
+                    base = flat_ip_index(chunk_dim)
                     chunk_index = faiss.IndexIDMap2(base)
                     if args.faiss_writer:
                         with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                            _faiss_save(chunk_index, CHUNK_INDEX_PATH)
+                            faiss_save(chunk_index, CHUNK_INDEX_PATH)
                     _clear_chunk_trained_flag()
                 else:
                     # 3) Train IVF-PQ with safe parameters
@@ -1958,7 +1958,7 @@ def build_or_update_indices(args):
 
                     try:
                         # after successful training
-                        new_chunk_index = _ivfpq_index(
+                        new_chunk_index = ivfpq_index(
                             chunk_dim, nlist=eff_nlist, m=m, bits=pq_bits
                         )
                         # best-effort verbosity
@@ -1992,7 +1992,7 @@ def build_or_update_indices(args):
 
                         if args.faiss_writer:
                             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                                _faiss_save(chunk_index, CHUNK_INDEX_PATH)
+                                faiss_save(chunk_index, CHUNK_INDEX_PATH)
                                 # Only now write the trained flag (we have valid nlist/m)
                                 _tf_tmp = CHUNK_TRAINED_FLAG.with_suffix(".tmp")
                                 with open(_tf_tmp, "w") as fh:
@@ -2006,10 +2006,10 @@ def build_or_update_indices(args):
                         _eprint(
                             f"[train] WARNING: IVF-PQ training failed ({e}); falling back to FLAT"
                         )
-                        chunk_index = faiss.IndexIDMap2(_flat_ip_index(chunk_dim))
+                        chunk_index = faiss.IndexIDMap2(flat_ip_index(chunk_dim))
                         if args.faiss_writer:
                             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                                _faiss_save(chunk_index, CHUNK_INDEX_PATH)
+                                faiss_save(chunk_index, CHUNK_INDEX_PATH)
                         _clear_chunk_trained_flag()
 
     use_tar = (getattr(args, "tar_dir", None) is not None) or (
@@ -2194,9 +2194,9 @@ def build_or_update_indices(args):
                                 with FileLock(FAISS_LOCK):
                                     if not isinstance(paper_index, faiss.IndexIDMap2):
                                         paper_index = faiss.IndexIDMap2(paper_index)
-                                    selp = _make_id_selector([pid])
-                                    _safe_remove_ids(paper_index, selp)
-                                    _faiss_save_force(paper_index, PAPER_INDEX_PATH)
+                                    selp = make_id_selector([pid])
+                                    safe_remove_ids(paper_index, selp)
+                                    faiss_save_force(paper_index, PAPER_INDEX_PATH)
 
                                 old_ids = [
                                     row[0]
@@ -2208,9 +2208,9 @@ def build_or_update_indices(args):
                                     with FileLock(FAISS_LOCK):
                                         if not isinstance(chunk_index, faiss.IndexIDMap2):
                                             chunk_index = faiss.IndexIDMap2(chunk_index)
-                                        selc = _make_id_selector(old_ids)
-                                        _safe_remove_ids(chunk_index, selc)
-                                        _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+                                        selc = make_id_selector(old_ids)
+                                        safe_remove_ids(chunk_index, selc)
+                                        faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
                             with FileLock(DB_LOCK):
                                 cur.execute("DELETE FROM chunks WHERE paper_id=?", (pid,))
                                 cur.execute("UPDATE papers SET in_index=0 WHERE id=?", (pid,))
@@ -2284,16 +2284,16 @@ def build_or_update_indices(args):
                                 )
                                 # mutate & save FAISS without holding DB_LOCK
                                 prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
-                                sel = _make_id_selector(u_ids)
+                                sel = make_id_selector(u_ids)
                                 with FileLock(FAISS_LOCK):
-                                    _safe_remove_ids(paper_index, sel)
-                                    added, ids_added = _add_with_ids_dedup(paper_index, u_ids, Xp)
+                                    safe_remove_ids(paper_index, sel)
+                                    added, ids_added = add_with_ids_dedup(paper_index, u_ids, Xp)
                                     saved = False
                                     if added:
                                         if prior_ntotal == 0:
-                                            saved = _faiss_save_force(paper_index, PAPER_INDEX_PATH)
+                                            saved = faiss_save_force(paper_index, PAPER_INDEX_PATH)
                                         else:
-                                            saved = _faiss_save(paper_index, PAPER_INDEX_PATH)
+                                            saved = faiss_save(paper_index, PAPER_INDEX_PATH)
                                 if added:
                                     if saved:
                                         with FileLock(DB_LOCK):
@@ -2339,16 +2339,16 @@ def build_or_update_indices(args):
                                 )
                                 # mutate & save FAISS without holding DB_LOCK
                                 prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
-                                sel = _make_id_selector(u_ids)
+                                sel = make_id_selector(u_ids)
                                 with FileLock(FAISS_LOCK):
-                                    _safe_remove_ids(chunk_index, sel)
-                                    added, ids_added = _add_with_ids_dedup(chunk_index, u_ids, Xc)
+                                    safe_remove_ids(chunk_index, sel)
+                                    added, ids_added = add_with_ids_dedup(chunk_index, u_ids, Xc)
                                     saved = False
                                     if added:
                                         if prior_ntotal == 0:
-                                            saved = _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+                                            saved = faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
                                         else:
-                                            saved = _faiss_save(chunk_index, CHUNK_INDEX_PATH)
+                                            saved = faiss_save(chunk_index, CHUNK_INDEX_PATH)
                                 if added:
                                     if saved:
                                         with FileLock(DB_LOCK):
@@ -2420,13 +2420,13 @@ def build_or_update_indices(args):
             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
                 try:
                     prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
-                    added, ids_added = _add_with_ids_dedup(paper_index, u_ids, Xp)
+                    added, ids_added = add_with_ids_dedup(paper_index, u_ids, Xp)
                     if added:
                         if prior_ntotal == 0:
-                            _faiss_save_force(paper_index, PAPER_INDEX_PATH)
+                            faiss_save_force(paper_index, PAPER_INDEX_PATH)
                             db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
                         else:
-                            if _faiss_save(paper_index, PAPER_INDEX_PATH):
+                            if faiss_save(paper_index, PAPER_INDEX_PATH):
                                 db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
                                 db_flush_pending_marks(cur)
                             else:
@@ -2455,13 +2455,13 @@ def build_or_update_indices(args):
             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
                 try:
                     prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
-                    added, ids_added = _add_with_ids_dedup(chunk_index, u_ids, Xc)
+                    added, ids_added = add_with_ids_dedup(chunk_index, u_ids, Xc)
                     if added:
                         if prior_ntotal == 0:
-                            _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+                            faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
                             db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
                         else:
-                            if _faiss_save(chunk_index, CHUNK_INDEX_PATH):
+                            if faiss_save(chunk_index, CHUNK_INDEX_PATH):
                                 db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
                                 db_flush_pending_marks(cur)
                             else:
@@ -2567,14 +2567,14 @@ def build_or_update_indices(args):
 
         # Respect lock order while forcing saves and flushing marks
         with FileLock(FAISS_LOCK):
-            _faiss_save_force(paper_index, PAPER_INDEX_PATH)
-            _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+            faiss_save_force(paper_index, PAPER_INDEX_PATH)
+            faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
         with FileLock(DB_LOCK):
             db_flush_pending_marks(conn.cursor())
             conn.commit()
 
         try:
-            k, _ = _kind_and_core(paper_index)
+            k, _ = kind_and_core(paper_index)
             if k == "hnsw":
                 _eprint(
                     f"[done] HNSW (papers): build complete — ntotal={int(getattr(paper_index, 'ntotal', 0) or 0)}"
@@ -3881,8 +3881,8 @@ def main():
         conn = db_connect_db(DB_PATH)
         try:
             try:
-                paper_index = _faiss_load(PAPER_INDEX_PATH)
-                chunk_index = _faiss_load(CHUNK_INDEX_PATH)
+                paper_index = faiss_load(PAPER_INDEX_PATH)
+                chunk_index = faiss_load(CHUNK_INDEX_PATH)
             except FileNotFoundError:
                 sys.stderr.write(
                     "[reconcile] FAISS index files not found; run a build first (e.g., --faiss-writer --build-only)\n"
@@ -3908,8 +3908,8 @@ def main():
                 chunk_bs=args.chunk_embed_bs,
             )
             with FileLock(FAISS_LOCK):
-                _faiss_save_force(paper_index, PAPER_INDEX_PATH)
-                _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+                faiss_save_force(paper_index, PAPER_INDEX_PATH)
+                faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
         finally:
             conn.close()
         return
