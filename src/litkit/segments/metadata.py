@@ -110,18 +110,28 @@ def validate_shard_consistency(
     current_num_shards: int,
     *,
     current_mode: str = "single",
-) -> None:
-    """Validate that current shard count and mode match any existing build.
+    sqlite_dir: Path | None = None,
+) -> dict:
+    """Validate shard config and handle resharding if detected.
     
-    This prevents corruption from resuming with mismatched configuration.
+    When shard count changes (resharding), we WARN and clear old checkpoints
+    rather than ERROR. The DB-based already_processed() provides fallback
+    resume capability.
     
     Args:
         seg_dir: Segment directory
         current_num_shards: Number of shards for this run
         current_mode: Build mode for this run ("single" or "multi")
+        sqlite_dir: SQLite directory for clearing shard checkpoints
+    
+    Returns:
+        dict with keys:
+          - "status": "fresh" | "resume" | "reshard"
+          - "previous_shards": int | None
+          - "checkpoints_cleared": int (only if resharding)
     
     Raises:
-        ValueError: If configuration doesn't match existing build
+        ValueError: If mode changes (single↔multi) - this is not supported
     """
     seg_dir = Path(seg_dir)
     meta = read_build_meta(seg_dir)
@@ -129,7 +139,7 @@ def validate_shard_consistency(
     
     if meta is None and not has_segs:
         # Fresh start - nothing to validate
-        return
+        return {"status": "fresh", "previous_shards": None}
     
     if meta is None and has_segs:
         # Orphan segments without metadata - warn but continue
@@ -137,19 +147,14 @@ def validate_shard_consistency(
             "[meta] WARNING: Segment files exist without build_meta.json. "
             "Cannot validate shard consistency."
         )
-        return
+        return {"status": "resume", "previous_shards": None}
     
     # Validate against existing metadata
+    assert meta is not None  # Narrowing for mypy (handled above)
     existing_shards = meta.get("num_shards", 1)
     existing_mode = meta.get("mode", "single")
     
-    if existing_shards != current_num_shards:
-        raise ValueError(
-            f"Shard count mismatch: existing build used {existing_shards} "
-            f"shards, but current run specifies {current_num_shards}. "
-            f"To start fresh, remove {seg_dir}."
-        )
-    
+    # Mode changes are NOT supported (would corrupt data)
     if existing_mode != current_mode:
         raise ValueError(
             f"Build mode mismatch: existing build used '{existing_mode}' "
@@ -157,7 +162,35 @@ def validate_shard_consistency(
             f"To start fresh, remove {seg_dir}."
         )
     
+    # Shard count changes: WARN and clear checkpoints (DB provides resume)
+    if existing_shards != current_num_shards:
+        _eprint(
+            f"[meta] WARNING: Shard count changed from {existing_shards} "
+            f"to {current_num_shards}."
+        )
+        _eprint(
+            "[meta] Checkpoints invalidated. Resume will use DB-based "
+            "already_processed() checks (slower but correct)."
+        )
+        
+        cleared = 0
+        if sqlite_dir is not None:
+            from litkit.segments.checkpoint import clear_shard_checkpoints
+            cleared = clear_shard_checkpoints(sqlite_dir, existing_shards)
+            if cleared:
+                _eprint(f"[meta] Cleared {cleared} old checkpoint file(s).")
+        
+        # Update metadata to reflect new shard count
+        write_build_meta(seg_dir, current_num_shards, mode=current_mode)
+        
+        return {
+            "status": "reshard",
+            "previous_shards": existing_shards,
+            "checkpoints_cleared": cleared,
+        }
+    
     _eprint(
         f"[meta] Validated: resuming {existing_mode} build "
         f"with {existing_shards} shards"
     )
+    return {"status": "resume", "previous_shards": existing_shards}

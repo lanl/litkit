@@ -129,6 +129,11 @@ from litkit.db import (
     ensure_temp_candidates_table as db_ensure_temp_candidates_table,
     load_temp_candidates as db_load_temp_candidates,
 )
+from litkit.segments import (
+    load_checkpoint as seg_load_checkpoint,
+    save_checkpoint as seg_save_checkpoint,
+    validate_shard_consistency as seg_validate_shard_consistency,
+)
 
 
 _FAISS_LOCK_DEPTH = threading.local()

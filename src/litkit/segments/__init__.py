@@ -23,6 +23,12 @@ from litkit.segments.metadata import (
     validate_shard_consistency,
     has_segment_files,
 )
+from litkit.segments.checkpoint import (
+    load_checkpoint,
+    save_checkpoint,
+    shard_ckpt_path,
+    clear_shard_checkpoints,
+)
 from litkit.segments.coordination import (
     ProducerCoordinator,
     ConsumerCoordinator,
@@ -46,6 +52,11 @@ __all__ = [
     "read_build_meta",
     "validate_shard_consistency",
     "has_segment_files",
+    # Checkpoints
+    "load_checkpoint",
+    "save_checkpoint",
+    "shard_ckpt_path",
+    "clear_shard_checkpoints",
     # Coordination
     "ProducerCoordinator",
     "ConsumerCoordinator",
