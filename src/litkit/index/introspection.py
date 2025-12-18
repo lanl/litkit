@@ -33,9 +33,10 @@ def unwrap_core_and_kind(
 ) -> tuple[str, faiss.Index, list[faiss.Index]]:
     """Unwrap FAISS index wrappers to find core index and determine type.
     
-    Unwraps common wrappers (.index/.base_index). Prefers duck-typing and
-    faiss.extract_index_ivf; optionally falls back to downcast_index for
-    read-only introspection.
+    Unwraps common wrappers (IndexIDMap, IndexIDMap2). Does NOT follow the
+    .index attribute of IVF-type indices (which points to their quantizer).
+    Prefers duck-typing and faiss.extract_index_ivf; optionally falls back
+    to downcast_index for read-only introspection.
     
     Args:
         idx: FAISS index (possibly wrapped)
@@ -51,16 +52,30 @@ def unwrap_core_and_kind(
     wrappers = []
     base = idx
     
-    # Unwrap common wrappers
+    # Unwrap common wrappers (IndexIDMap, IndexIDMap2, etc.)
+    # IMPORTANT: Do NOT follow .index on IVF-type indices - that points to their
+    # quantizer (e.g., IndexFlatIP), not a wrapper. Check for IVF BEFORE unwrapping.
     for _ in range(max_depth):
-        # Try .index attribute (IndexIDMap, IndexIDMap2)
-        inner = getattr(base, "index", None)
-        if inner is not None and inner is not base:
-            wrappers.append(base)
-            base = inner
-            continue
+        # Check if current base is already an IVF-type index - if so, stop unwrapping
+        # IVF indices have .index pointing to their quantizer, not a wrapper
+        if hasattr(base, "nlist") and hasattr(base, "nprobe"):
+            break  # This is an IVF index, don't follow .index
+        if "IVF" in type(base).__name__:
+            break  # IVF, IVFPQ, etc.
         
-        # Try .base_index attribute (some wrappers)
+        # Check for HNSW before unwrapping (HNSW doesn't typically have wrappers)
+        if hasattr(base, "hnsw") or "HNSW" in type(base).__name__:
+            break
+        
+        # Only unwrap known wrapper types (IndexIDMap, IndexIDMap2)
+        if isinstance(base, (faiss.IndexIDMap, faiss.IndexIDMap2)):
+            inner = getattr(base, "index", None)
+            if inner is not None and inner is not base:
+                wrappers.append(base)
+                base = inner
+                continue
+        
+        # Try .base_index attribute (some other wrappers)
         inner = getattr(base, "base_index", None)
         if inner is not None and inner is not base:
             wrappers.append(base)
@@ -75,17 +90,17 @@ def unwrap_core_and_kind(
     if hasattr(base, "hnsw") or "HNSW" in type(base).__name__:
         return INDEX_KIND_HNSW, base, wrappers
     
-    # Check for IVF via extract_index_ivf
+    # Check for IVF via attributes (most reliable)
+    if hasattr(base, "nlist") and hasattr(base, "nprobe"):
+        return INDEX_KIND_IVF, base, wrappers
+    
+    # Check for IVF via extract_index_ivf (handles some edge cases)
     try:
         ivf = faiss.extract_index_ivf(base)
         if ivf is not None:
             return INDEX_KIND_IVF, ivf, wrappers
     except Exception:
         pass
-    
-    # Check for IVF via attributes
-    if hasattr(base, "nlist") and hasattr(base, "nprobe"):
-        return INDEX_KIND_IVF, base, wrappers
     
     # Check for Flat
     if "Flat" in type(base).__name__:

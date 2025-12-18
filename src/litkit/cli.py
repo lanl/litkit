@@ -1668,7 +1668,7 @@ def build_or_update_indices(args):
         paper_index = faiss_load(PAPER_INDEX_PATH)
 
         # --- Verify papers index family/metric (kind-aware; tolerate FlatIP) ---
-        kind, core, _ = _unwrap_core_and_kind(paper_index)
+        kind, core, _ = unwrap_core_and_kind(paper_index)
         mt = getattr(core, "metric_type", None)
         if kind == "hnsw":
             if mt != faiss.METRIC_INNER_PRODUCT:
@@ -1987,7 +1987,7 @@ def build_or_update_indices(args):
                             raise RuntimeError("IVF-PQ index not trained (is_trained=False)")
 
                         # set nprobe (no mutation elsewhere)
-                        _auto_set_nprobe(new_chunk_index, args.nprobe)
+                        auto_set_nprobe(new_chunk_index, args.nprobe)
                         chunk_index = faiss.IndexIDMap2(new_chunk_index)
 
                         if args.faiss_writer:
