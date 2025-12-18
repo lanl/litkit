@@ -1,6 +1,6 @@
 # LitKit Refactor Progress
 
-**Last Updated:** 2025-12-17 (Phase 1 Complete)  
+**Last Updated:** 2025-12-17 (Phase 2 Complete)  
 **Branch:** `feature/refactor-scope`
 
 ## Executive Summary
@@ -104,21 +104,66 @@ src/litkit/
 | `_shard_filter` | ~65 | line 3467 (nested) |
 | **Total** | **~93** | |
 
+## Completed Work (Job 9, Phase 2)
+
+### Phase 2: Import-Time Side Effect Isolation ✅ Complete
+
+**Goal:** Make `import litkit.cli` pure (no I/O, no side effects).
+
+**Solution:** Lazy singleton pattern with module-level `__getattr__`.
+
+**Implementation:**
+1. Created `_Runtime` dataclass holding all path constants
+2. Created `get_runtime()` - thread-safe lazy initialization
+3. Added module-level `__getattr__` for backward compatibility
+4. Moved all side effects into `_init_runtime()`:
+   - Directory creation (`mkdir`)
+   - Environment variable setup (`HF_HOME`, `HF_HUB_OFFLINE`, etc.)
+5. Called `get_runtime()` at start of `main()` to trigger initialization
+6. All 205+ internal uses of path constants work via `globals()` population
+
+**Code pattern:**
+```python
+@dataclass(frozen=True)
+class _Runtime:
+    """Immutable container for lazily-initialized runtime paths."""
+    root: Path
+    workspace: Path
+    sqlite_dir: Path
+    # ... 15 total path fields
+
+_runtime: _Runtime | None = None
+_runtime_lock = threading.Lock()
+
+def get_runtime() -> _Runtime:
+    """Thread-safe lazy initialization."""
+    global _runtime
+    if _runtime is not None:
+        return _runtime
+    with _runtime_lock:
+        if _runtime is not None:
+            return _runtime
+        _runtime = _init_runtime()
+        # Populate module-level globals for internal code
+        for attr_name, field_name in _LAZY_PATH_ATTRS.items():
+            globals()[attr_name] = getattr(_runtime, field_name)
+        return _runtime
+
+def __getattr__(name: str):
+    """Module-level __getattr__ for external lazy access."""
+    if name in _LAZY_PATH_ATTRS:
+        rt = get_runtime()
+        return globals()[name]
+    raise AttributeError(...)
+```
+
+**Benefits:**
+- ✅ `import litkit.cli` is now pure (no I/O)
+- ✅ All existing code works unchanged (backward compatible)
+- ✅ Thread-safe initialization
+- ✅ Testable with mock paths
+
 ## Future Work
-
-### Phase 2: Import-Time Side Effect Isolation
-
-**Goal:** Make `cli.py` importable without side effects.
-
-**Current issues:**
-- `ROOT`, `WORKSPACE` set at import time
-- Directories created at import time
-- Environment variables set at import time
-
-**Required changes:**
-1. Move all path resolution into `prepare_environment()` function
-2. Call `prepare_environment()` from `main()` only
-3. Remove global variable assignments at module scope
 
 ### Phase 3: Remaining Domain Extraction
 
@@ -157,7 +202,7 @@ Based on the detailed critique of the monolithic `cli.py`:
 |---|-------|--------|-------|
 | 1 | Scope creep | 🟡 Partial | Modules created, not integrated |
 | 2 | Massive file size | 🟡 Partial | ~4,400 lines extracted |
-| 3 | Import-time side effects | ❌ Not addressed | Phase 2 |
+| 3 | Import-time side effects | ✅ Addressed | Lazy singleton pattern |
 | 4 | Global state | 🟡 Partial | `ProcessingContext` created |
 | 5 | Monolithic build function | ❌ Not addressed | Phase 4 |
 | 6 | Locking complexity | ✅ Addressed | `FileLock` centralized |

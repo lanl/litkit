@@ -278,8 +278,148 @@ def _resolve_workspace(root: Path) -> Path:
     return Path(ws).expanduser().resolve() if ws else (root / "workspace").resolve()
 
 
-ROOT = _find_root()
-WORKSPACE = _resolve_workspace(ROOT)
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAZY RUNTIME INITIALIZATION (Phase 2 refactor)
+# ═══════════════════════════════════════════════════════════════════════════════
+# All path constants and side effects (mkdir, env vars) are deferred until first
+# access. This ensures `import litkit.cli` is pure (no I/O, no side effects).
+# Access any path constant (e.g., SQLITE_DIR) to trigger initialization.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class _Runtime:
+    """Immutable container for lazily-initialized runtime paths."""
+    root: Path
+    workspace: Path
+    hf_home: Path
+    sqlite_dir: Path
+    indices_dir: Path
+    embed_segments_dir: Path
+    db_path: Path
+    ckpt_path: Path
+    db_lock: Path
+    faiss_lock: Path
+    writer_guard: Path
+    paper_index_path: Path
+    chunk_index_path: Path
+    chunk_trained_flag: Path
+    ckpt_lock: Path
+
+
+_runtime: _Runtime | None = None
+_runtime_lock = threading.Lock()
+
+
+def get_runtime() -> _Runtime:
+    """Thread-safe lazy initialization of runtime paths and directories.
+    
+    Side effects (first call only):
+    - Creates SQLITE_DIR and INDICES_DIR directories
+    - Sets HF_HOME, HF_HUB_OFFLINE, TRANSFORMERS_OFFLINE, TOKENIZERS_PARALLELISM env vars
+    - Populates module-level globals (ROOT, WORKSPACE, DB_PATH, etc.)
+    
+    Returns:
+        _Runtime: Immutable container with all path constants.
+    """
+    global _runtime
+    if _runtime is not None:
+        return _runtime
+    with _runtime_lock:
+        if _runtime is not None:
+            return _runtime
+        _runtime = _init_runtime()
+        # Populate module-level globals for internal code that uses bare names
+        for attr_name, field_name in _LAZY_PATH_ATTRS.items():
+            globals()[attr_name] = getattr(_runtime, field_name)
+        return _runtime
+
+
+def _init_runtime() -> _Runtime:
+    """Perform all one-time initialization. Called only by get_runtime()."""
+    root = _find_root()
+    workspace = _resolve_workspace(root)
+    
+    hf_home = workspace / "hf_cache"
+    sqlite_dir = workspace / "sqlite"
+    indices_dir = workspace / "indices"
+    embed_segments_dir = workspace / "emb_segments"
+    
+    # Set environment variables (safe defaults for HPC/offline use)
+    os.environ.setdefault("HF_HOME", str(hf_home))
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("LITKIT_SEGMENT_FSYNC_DIR", "1")
+    
+    # Create required directories
+    try:
+        sqlite_dir.mkdir(parents=True, exist_ok=True)
+        indices_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        sys.stderr.write(
+            f"[paths] ERROR: cannot create {sqlite_dir} or {indices_dir}: {e}\n"
+            "[paths] Set LITKIT_WORKSPACE to a writable Lustre/NFS path and re-run.\n"
+        )
+        sys.exit(2)
+    
+    db_filename = os.environ.get("LITKIT_DB_FILE", "litkit.sqlite3")
+    
+    return _Runtime(
+        root=root,
+        workspace=workspace,
+        hf_home=hf_home,
+        sqlite_dir=sqlite_dir,
+        indices_dir=indices_dir,
+        embed_segments_dir=embed_segments_dir,
+        db_path=sqlite_dir / db_filename,
+        ckpt_path=sqlite_dir / "build_checkpoint.json",
+        db_lock=sqlite_dir / "db.writer.lock",
+        faiss_lock=sqlite_dir / "faiss.writer.lock",
+        writer_guard=sqlite_dir / "faiss_writer.guard",
+        paper_index_path=indices_dir / "papers.faiss",
+        chunk_index_path=indices_dir / "chunks.faiss",
+        chunk_trained_flag=indices_dir / "chunks.trained.json",
+        ckpt_lock=sqlite_dir / "ckpt.writer.lock",
+    )
+
+
+# Backward compatibility: module-level __getattr__ for lazy path access
+# Allows both `litkit.cli.SQLITE_DIR` and `from litkit.cli import SQLITE_DIR`
+_LAZY_PATH_ATTRS = {
+    "ROOT": "root",
+    "WORKSPACE": "workspace",
+    "HF_HOME": "hf_home",
+    "SQLITE_DIR": "sqlite_dir",
+    "INDICES_DIR": "indices_dir",
+    "EMBED_SEGMENTS_DIR": "embed_segments_dir",
+    "DB_PATH": "db_path",
+    "CKPT_PATH": "ckpt_path",
+    "DB_LOCK": "db_lock",
+    "FAISS_LOCK": "faiss_lock",
+    "WRITER_GUARD": "writer_guard",
+    "PAPER_INDEX_PATH": "paper_index_path",
+    "CHUNK_INDEX_PATH": "chunk_index_path",
+    "CHUNK_TRAINED_FLAG": "chunk_trained_flag",
+    "CKPT_LOCK": "ckpt_lock",
+}
+
+
+def __getattr__(name: str):
+    """Module-level __getattr__ for lazy initialization of path constants.
+    
+    This function is called when an attribute is not found in the module namespace.
+    On first access, we populate the module globals so subsequent local lookups work.
+    """
+    if name in _LAZY_PATH_ATTRS:
+        # Trigger full initialization and populate ALL path globals
+        rt = get_runtime()
+        for attr_name, field_name in _LAZY_PATH_ATTRS.items():
+            globals()[attr_name] = getattr(rt, field_name)
+        # Return the requested attribute
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _report_paths(
@@ -300,20 +440,6 @@ def _report_paths(
     _eprint(f"[paths] using {workspace} as writable directory for job artifacts/outputs")
 
 
-HF_HOME = WORKSPACE / "hf_cache"  # location of HF models
-SQLITE_DIR = WORKSPACE / "sqlite"  # location of SQLite DB
-INDICES_DIR = WORKSPACE / "indices"  # location of FAISS indices for papers and chunks
-
-# Temporary storage for embedding segments from producers
-#   This setting is only used if --embed-dir is set.
-EMBED_SEGMENTS_DIR = WORKSPACE / "emb_segments"
-
-os.environ.setdefault("HF_HOME", str(HF_HOME))
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("LITKIT_SEGMENT_FSYNC_DIR", "1")  # default: fsync directory entries for crash safety
-
 # Reasonable defaults for large Lustre/NFS runs:
 # ~131,072 vectors/segment ≈ 0.4 GB per file (fp32, dim=768). Half that if stored as fp16.
 DEFAULT_EMBED_SEGMENT_SIZE = int(os.environ.get("LITKIT_EMBED_SEGMENT_SIZE", "131072"))
@@ -321,20 +447,6 @@ DEFAULT_EMBED_SEGMENT_DTYPE = os.environ.get("LITKIT_EMBED_SEGMENT_DTYPE", "fp16
 
 # Default SQLite busy timeout in milliseconds (tunable for shared filesystems).
 DEFAULT_BUSY_TIMEOUT_MS = int(os.environ.get("LITKIT_SQLITE_BUSY_TIMEOUT_MS", "120000"))
-
-try:
-    SQLITE_DIR.mkdir(parents=True, exist_ok=True)
-    INDICES_DIR.mkdir(parents=True, exist_ok=True)
-except Exception as e:
-    sys.stderr.write(
-        f"[paths] ERROR: cannot create {SQLITE_DIR} or {INDICES_DIR}: {e}\n"
-        "[paths] Set LITKIT_WORKSPACE to a writable Lustre/NFS path and re-run.\n"
-    )
-    sys.exit(2)
-
-DB_FILENAME = os.environ.get("LITKIT_DB_FILE", "litkit.sqlite3")
-DB_PATH = SQLITE_DIR / DB_FILENAME
-CKPT_PATH = SQLITE_DIR / "build_checkpoint.json"
 
 
 def _shard_db_path(shard_id: int) -> Path:
@@ -563,9 +675,7 @@ class FileLock:
                     _db_lock_exit()
 
 # Always acquire in this order to avoid deadlock: DB_LOCK then FAISS_LOCK
-DB_LOCK = SQLITE_DIR / "db.writer.lock"
-FAISS_LOCK = SQLITE_DIR / "faiss.writer.lock"
-WRITER_GUARD = SQLITE_DIR / "faiss_writer.guard"
+# (These constants are now provided via lazy __getattr__ from get_runtime())
 
 # One-time advisory-lock status reporting
 _ADVISORY_LOCK_DISABLED = False
@@ -1407,10 +1517,8 @@ def _idmap_bloom(index, bits_per_key=8):
 # -------------------- FAISS index helpers --------------------
 # Single source of truth for product-quantizer bits
 PQ_BITS = 8  # keep this in sync across training & _ivfpq_index
-PAPER_INDEX_PATH = INDICES_DIR / "papers.faiss"
-CHUNK_INDEX_PATH = INDICES_DIR / "chunks.faiss"
-CHUNK_TRAINED_FLAG = INDICES_DIR / "chunks.trained.json"
-CKPT_LOCK = SQLITE_DIR / "ckpt.writer.lock"
+# (Path constants are now provided via lazy __getattr__ from get_runtime():
+#  PAPER_INDEX_PATH, CHUNK_INDEX_PATH, CHUNK_TRAINED_FLAG, CKPT_LOCK)
 # Allow a safe fallback to downcast() for reporting if duck-typing/extract fail.
 # Set LITKIT_FAISS_NO_DOWNCAST=1 to disable the downcast fallback entirely.
 USE_DOWNCAST_FALLBACK = os.environ.get("LITKIT_FAISS_NO_DOWNCAST", "") == ""
@@ -4894,6 +5002,9 @@ def _strip_citation_linelocs(text: str) -> str:
 # -------------------- Main --------------------
 def main():
     """CLI entry point."""
+    # Trigger lazy runtime initialization (creates dirs, sets env vars, populates globals)
+    get_runtime()
+    
     # declare BEFORE any references to these names in this function (to satisfy Python rule)
     global PAPER_BATCH, CHUNK_BATCH, CKPT_EVERY
     global DEFAULT_BUSY_TIMEOUT_MS
