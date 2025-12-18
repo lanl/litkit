@@ -1732,7 +1732,7 @@ def build_or_update_indices(args):
                 with FileLock(FAISS_LOCK):
                     faiss_save(chunk_index, CHUNK_INDEX_PATH)
 
-        ivf = _extract_ivf(chunk_index)
+        ivf = extract_ivf(chunk_index)
         if isinstance(ivf, faiss.IndexIVFPQ) and not getattr(ivf, "is_trained", False):
             _eprint(
                 "[train] WARNING: chunks index is IVFPQ but untrained; ignoring stale trained flag and retraining."
@@ -1769,7 +1769,7 @@ def build_or_update_indices(args):
                 )
 
     # If IVF-PQ and not trained, run training pass (one-time)
-    ivf_core = _extract_ivf(chunk_index)  # unwrap common wrappers (e.g., IndexIDMap2)
+    ivf_core = extract_ivf(chunk_index)  # unwrap common wrappers (e.g., IndexIDMap2)
     if (
         isinstance(ivf_core, faiss.IndexIVFPQ)
         and getattr(ivf_core, "ntotal", 0) == 0
