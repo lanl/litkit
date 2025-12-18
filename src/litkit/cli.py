@@ -1702,6 +1702,12 @@ def _ingest_paper_segments(
                             # Paper not in merged DB yet - skip this embedding
                             valid_mask.append(False)
                     
+                    # Log resolution failures for debugging canonicalization issues
+                    missing = np.count_nonzero(~np.array(valid_mask, dtype=bool))
+                    if missing:
+                        _eprint(f"[segments] WARNING: skipped {missing}/{len(doc_ids)} paper embeddings in {p.name} "
+                                "(doc_id not found in main DB - check doc_id canonicalization)")
+                    
                     if not resolved_ids:
                         os.remove(tmp)
                         continue
@@ -1885,6 +1891,12 @@ def _ingest_chunk_segments(
                         else:
                             # Paper not in merged DB yet - skip this embedding
                             valid_mask.append(False)
+                    
+                    # Log resolution failures for debugging canonicalization issues
+                    missing = np.count_nonzero(~np.array(valid_mask, dtype=bool))
+                    if missing:
+                        _eprint(f"[segments] WARNING: skipped {missing}/{len(paper_doc_ids)} chunk embeddings in {p.name} "
+                                "(doc_id/ord not found in main DB - check doc_id canonicalization)")
                     
                     if not resolved_ids:
                         os.remove(tmp)
@@ -3037,32 +3049,40 @@ def build_or_update_indices(args):
                         pmcid = (meta["pmcid"] or "").strip()
                         pmid = (meta["pmid"] or "").strip()
                         
-                        # Use file path as doc_id for deduplication across shards
-                        # Each tar member is unique, and load-balanced sharding ensures
-                        # each tar file goes to exactly one producer, so no cross-shard dupes.
-                        # The path is already in f = "tar://tpath!/m.name" format.
-                        doc_id = str(f)
-
-                        pid_row = None
+                        # Content-addressed doc_id: use DB's canonical doc_id when reusing
+                        # an existing paper row. This ensures segment files use the same
+                        # doc_id that's in the DB for doc_id → paper_id resolution.
+                        # 
+                        # IMPORTANT: Same paper (by pmcid/pmid) may appear at different tar paths
+                        # across runs. We canonicalize to the FIRST doc_id seen (stored in DB).
+                        
+                        existing_row = None
                         if pmcid:
-                            pid_row = cur.execute(
-                                "SELECT id FROM papers WHERE pmcid=?", (pmcid,)
+                            existing_row = cur.execute(
+                                "SELECT id, doc_id FROM papers WHERE pmcid=?", (pmcid,)
                             ).fetchone()
-                        if (pid_row is None) and pmid:
-                            pid_row = cur.execute(
-                                "SELECT id FROM papers WHERE pmid=?", (pmid,)
+                        if (existing_row is None) and pmid:
+                            existing_row = cur.execute(
+                                "SELECT id, doc_id FROM papers WHERE pmid=?", (pmid,)
                             ).fetchone()
-                        if pid_row:
-                            pid = pid_row[0]
-                            # Update doc_id if missing (for legacy rows)
-                            cur.execute(
-                                "UPDATE papers SET doc_id = ? WHERE id = ? AND (doc_id IS NULL OR doc_id = '')",
-                                (doc_id, pid)
-                            )
+                        
+                        if existing_row:
+                            pid, existing_doc_id = existing_row
+                            # Use existing doc_id if present, otherwise set it from current path
+                            if existing_doc_id:
+                                canon_doc_id = existing_doc_id
+                            else:
+                                canon_doc_id = str(f)
+                                cur.execute(
+                                    "UPDATE papers SET doc_id = ? WHERE id = ?",
+                                    (canon_doc_id, pid)
+                                )
                         else:
+                            # New paper: use current path as canonical doc_id
+                            canon_doc_id = str(f)
                             cur.execute(
                                 "INSERT INTO papers(doc_id, pmid, pmcid, title, abstract) VALUES (?,?,?,?,?)",
-                                (doc_id, pmid, pmcid, meta["title"], meta["abstract"]),
+                                (canon_doc_id, pmid, pmcid, meta["title"], meta["abstract"]),
                             )
                             pid = cur.lastrowid
 
@@ -3105,7 +3125,7 @@ def build_or_update_indices(args):
                         )
                         paper_ids_buf.append(pid)
                         paper_texts_buf.append(ta_ab)
-                        paper_doc_ids_buf.append(doc_id)
+                        paper_doc_ids_buf.append(canon_doc_id)
 
                         proposed_chunks = []
                         if ta_ab:
@@ -3137,7 +3157,7 @@ def build_or_update_indices(args):
                             cid = cur.lastrowid
                             chunk_ids_buf.append(cid)
                             chunk_texts_buf.append(text_i)
-                            chunk_paper_doc_ids_buf.append(doc_id)
+                            chunk_paper_doc_ids_buf.append(canon_doc_id)
                             chunk_ords_buf.append(ord_i)
 
                         if len(paper_ids_buf) >= PAPER_BATCH:
