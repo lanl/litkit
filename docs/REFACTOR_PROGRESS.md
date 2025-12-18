@@ -88,6 +88,37 @@ The extracted modules are now the canonical source, imported and used by `cli.py
 - ✅ Import smoke test passes
 - ✅ Multi-node architecture verified (producer → segment → consumer flow)
 
+### Phase 3.5: doc_id Canonicalization Fix (COMPLETE - 2024-12-17)
+
+Fixed a critical correctness bug in doc_id handling for multi-node builds:
+
+#### The Bug
+When a paper already exists in the DB (matched by pmcid/pmid), the code used the
+*current tar path* as `doc_id` for segment files, but the DB retained the *original*
+`doc_id` from first insertion. This caused segment ingestion to fail silently when
+the consumer couldn't resolve the new doc_id against the merged DB.
+
+#### The Fix
+1. **Canonical doc_id Resolution**: When reusing an existing paper row, fetch both
+   `id` and `doc_id` from the DB. Use the DB's canonical `doc_id` (if present) for
+   segment files instead of the current tar path.
+
+2. **Resolution Failure Logging**: Added WARNING logs in `_ingest_paper_segments()`
+   and `_ingest_chunk_segments()` when doc_id → paper_id or (doc_id, ord) → chunk_id
+   resolution fails. This surfaces canonicalization issues early.
+
+#### Changes Made
+- Modified paper lookup to `SELECT id, doc_id FROM papers WHERE pmcid/pmid=?`
+- Added `canon_doc_id` variable that uses existing doc_id or falls back to current path
+- Updated all buffer appends to use `canon_doc_id` instead of raw path
+- Added `missing` counter and WARNING log in segment ingestion functions
+
+### Dead Code Removal (PARTIAL - 2024-12-17)
+
+Removed unused local implementations that were shadowed by imported versions:
+- ✅ `_mark_in_index()` - removed (all calls use `db_mark_in_index`)
+- ✅ `_flush_pending_marks()` - removed (all calls use `db_flush_pending_marks`)
+
 ### Multi-Node Correctness (VERIFIED - 2024-12-17)
 
 The multi-node build architecture works correctly:
@@ -95,22 +126,24 @@ The multi-node build architecture works correctly:
 1. **Producers** (N nodes): 
    - Each writes to shard-specific SQLite DB (`shard_XX.sqlite3`)
    - Outputs embedding segments with content-addressed `doc_id` (globally unique file path)
+   - Uses DB's canonical `doc_id` when reusing existing paper rows
    - Marks completion via `.shard_XX_complete` marker files
 
 2. **Consumer** (1 node):
    - Polls for producer completion markers
    - Merges all shard DBs into main `litkit.sqlite3` using `merge_shard_databases()`
    - Ingests segment files, resolving `doc_id → paper_id` against merged DB
+   - Logs warnings for any doc_id resolution failures
    - Updates FAISS indices with resolved IDs
 
 ## Remaining Work
 
-### Phase 4: Dead Code Removal (NOT STARTED)
+### Phase 4: Dead Code Removal (PARTIALLY COMPLETE)
 
-cli.py still contains ~400 lines of local implementations that duplicate the
+cli.py still contains ~350+ lines of local implementations that duplicate the
 extracted modules. These should be removed:
 
-**DB helpers to remove from cli.py:**
+**Remaining DB helpers to remove from cli.py:**
 - `_IngestContext` class and methods
 - `SCHEMA`, `init_db()`, `init_shard_db()`
 - `_ensure_in_index_columns()`, `_shard_db_path()`, `_list_shard_dbs()`
@@ -119,12 +152,26 @@ extracted modules. These should be removed:
 - `already_processed()`, `register_file()`
 - `preload_paper_id_map()`, `preload_chunk_id_map()`
 
+**Index helpers to remove:**
+- Various FAISS wrappers that duplicate `litkit.index`
+
+**Segment helpers to remove:**
+- `_SegmentWriter`, `_ChunkSegmentWriter` that duplicate `litkit.segments`
+
 ### Phase 5: Final Cleanup (NOT STARTED)
 
 After dead code removal:
 - Remove the SCOPE CONTRACT comment block
 - Final lint and test pass
 - Update module docstrings
+
+### Phase 6: doc_id Path Stability (DEFERRED)
+
+Current `doc_id` uses absolute tar paths, which breaks if corpus moves to a
+different mount point. Options for future work:
+- Use `pmcid` as doc_id when available, else `pmid`, else hash
+- Use tar-relative paths (filename + member) instead of absolute paths
+- Document the limitation explicitly
 
 ## Architecture Goals
 
@@ -152,20 +199,28 @@ After each phase:
 - [ ] Build workflow with sample data passes
 - [ ] Query workflow with existing indices works
 
-## Known Limitations
-
-### doc_id Semantics (Low Priority)
-
-For **incremental multi-node updates** with different shard assignments, there's
-a theoretical edge case where stale `doc_id` entries could cause issues. This is
-a refinement for future work, not a correctness blocker for:
-- Single-node builds (works correctly)
-- First-time multi-node builds (works correctly)
-- Multi-node builds with consistent shard assignments (works correctly)
-
 ## Commit History
 
 See git log for detailed commit history. Key commits:
 - Phase 1: Module extraction
 - Phase 2: Import-time purity  
 - Phase 3: Schema fixes and DB module integration (2024-12-17)
+- Phase 3.5: doc_id canonicalization fix (2024-12-17)
+
+## Suggested Next Task
+
+**End-to-end validation with sample data**
+
+The code changes are complete but untested on real data. Before continuing with
+dead code removal, validate the build pipeline works:
+
+```bash
+# Single-node build test
+python -m litkit --build-only --faiss-writer \
+  --tar-manifest workspace/tiny_test.manifest
+
+# Verify query works
+python -m litkit "What is BioNetGen?" --no-llm
+```
+
+If builds pass, proceed with Phase 4 (dead code removal) to shrink cli.py.
