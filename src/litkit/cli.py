@@ -3155,7 +3155,7 @@ def build_or_update_indices(args):
         # This populates the main DB with all papers/chunks so that
         # doc_id → paper_id resolution works during segment ingestion.
         _eprint("[consumer] All producers complete, merging shard databases...")
-        merge_stats = merge_shard_databases(conn, delete_after_merge=True)
+        merge_stats = db_merge_shard_databases(conn, delete_after_merge=True)
         if merge_stats["shards"] > 0:
             _eprint(f"[consumer] Merged {merge_stats['shards']} shard DB(s): "
                     f"{merge_stats['papers']} papers, {merge_stats['chunks']} chunks, {merge_stats['files']} files")
