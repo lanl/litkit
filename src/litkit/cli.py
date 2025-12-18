@@ -3865,13 +3865,6 @@ def main():
             # allow read-only flows, --version, help, etc.
             pass
 
-    # Post-init advisory-lock status line
-    if (not FLOCK_AVAILABLE and sys.platform.startswith("win")) or _ADVISORY_LOCK_DISABLED:
-        global _ADVISORY_LOCK_NOTICE_PRINTED
-        if not _ADVISORY_LOCK_NOTICE_PRINTED:
-            _eprint("[lock] advisory locking disabled on this filesystem; proceeding best-effort")
-            _ADVISORY_LOCK_NOTICE_PRINTED = True
-
     _create_writer_guard_or_exit(args)
 
     # Honor --offline explicitly
