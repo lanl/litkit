@@ -4468,7 +4468,7 @@ def search_chunks_constrained(
                         params + [title_like_param] + [int(lexical_limit)],
                     )
                 else:
-                    _load_temp_candidates(db_conn, list(cand))
+                    db_load_temp_candidates(db_conn, list(cand))
                     cur.execute(
                         f"""
                         SELECT c.id
@@ -4656,7 +4656,7 @@ def _avg_chunks_for_papers(pids: list[int]) -> float:
         return 0.0
     conn = _connect_db()
     try:
-        _load_temp_candidates(conn, pids)
+        db_load_temp_candidates(conn, pids)
         rows = conn.execute(
             """
             SELECT cp.id, COUNT(c.id)
