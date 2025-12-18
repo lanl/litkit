@@ -133,6 +133,14 @@ from litkit.segments import (
     load_checkpoint as seg_load_checkpoint,
     save_checkpoint as seg_save_checkpoint,
     validate_shard_consistency as seg_validate_shard_consistency,
+    write_build_meta as seg_write_build_meta,
+    read_build_meta as seg_read_build_meta,
+    has_segment_files as seg_has_segment_files,
+    SegmentWriter,
+    ChunkSegmentWriter,
+    SegmentWriterConfig,
+    ProducerCoordinator as SegProducerCoordinator,
+    ConsumerCoordinator as SegConsumerCoordinator,
 )
 
 
