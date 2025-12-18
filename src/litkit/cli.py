@@ -1603,14 +1603,14 @@ def _add_ids_union_compat(index, ids_list, X, *, table, cur, save_path: Path):
     mask = np.array([int(i) not in present for i in ids_arr], dtype=bool)
 
     if not mask.any():
-        _mark_in_index(cur, table, [int(i) for i in ids_arr])
+        db_mark_in_index(cur, table, [int(i) for i in ids_arr])
         return 0
 
     ids_new = ids_arr[mask]
     X_new = np.ascontiguousarray(X[mask].astype("float32"))
     index.add_with_ids(X_new, ids_new)
     _faiss_save(index, save_path)
-    _mark_in_index(cur, table, [int(i) for i in ids_new])
+    db_mark_in_index(cur, table, [int(i) for i in ids_new])
     return int(ids_new.size)
 
 
@@ -1623,7 +1623,7 @@ _MARKS_FLUSH_EVERY = int(os.environ.get("LITKIT_MARKS_FLUSH_EVERY", "10"))  # 0=
 def _maybe_flush_marks_every(conn, cur, batch_counter: int) -> bool:
     if _MARKS_FLUSH_EVERY and (batch_counter % _MARKS_FLUSH_EVERY) == 0:
         with FileLock(DB_LOCK):
-            _flush_pending_marks(cur)
+            db_flush_pending_marks(cur)
             conn.commit()
         return True
     return False
@@ -1687,7 +1687,7 @@ def _flush_pending_marks(cur):
     for tbl, ids in list(_PENDING_MARKS.items()):
         if not ids:
             continue
-        _mark_in_index(cur, tbl, ids)
+        db_mark_in_index(cur, tbl, ids)
         _PENDING_MARKS[tbl].clear()
 
 
@@ -2081,7 +2081,7 @@ def _ingest_paper_segments(
                 if saved:
                     with FileLock(DB_LOCK):
                         if len(ids_added) > 0:
-                            _mark_in_index(cur, "papers", [int(i) for i in ids_added])
+                            db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
                         conn.commit()
                 else:
                     if len(ids_added) > 0:
@@ -2096,7 +2096,7 @@ def _ingest_paper_segments(
                     saved_now = _faiss_save(paper_index, PAPER_INDEX_PATH)
                 if saved_now:
                     with FileLock(DB_LOCK):
-                        _flush_pending_marks(cur)
+                        db_flush_pending_marks(cur)
                         conn.commit()
         except Exception as e:
             if not is_ingesting:
@@ -2262,7 +2262,7 @@ def _ingest_chunk_segments(
                 if saved:
                     with FileLock(DB_LOCK):
                         if len(ids_added) > 0:
-                            _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
+                            db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
                         conn.commit()
                 else:
                     if len(ids_added) > 0:
@@ -2277,7 +2277,7 @@ def _ingest_chunk_segments(
                     saved_now = _faiss_save(chunk_index, CHUNK_INDEX_PATH)
                 if saved_now:
                     with FileLock(DB_LOCK):
-                        _flush_pending_marks(cur)
+                        db_flush_pending_marks(cur)
                         conn.commit()
 
         except Exception as e:
@@ -2373,8 +2373,8 @@ def backfill_unindexed_vectors(
             ids_added = ids if added == 0 else []
         if added and saved:
             with FileLock(DB_LOCK):
-                _mark_in_index(cur, "papers", [int(i) for i in (ids_added or ids)])
-                _flush_pending_marks(cur)
+                db_mark_in_index(cur, "papers", [int(i) for i in (ids_added or ids)])
+                db_flush_pending_marks(cur)
                 conn.commit()
         else:
             if added:
@@ -2418,8 +2418,8 @@ def backfill_unindexed_vectors(
             ids_added = ids if added == 0 else []
         if added and saved:
             with FileLock(DB_LOCK):
-                _mark_in_index(cur, "chunks", [int(i) for i in (ids_added or ids)])
-                _flush_pending_marks(cur)
+                db_mark_in_index(cur, "chunks", [int(i) for i in (ids_added or ids)])
+                db_flush_pending_marks(cur)
                 conn.commit()
         else:
             if added:
@@ -2961,8 +2961,8 @@ def _flush_paper_batch(ctx: _IngestContext) -> None:
         if added:
             if saved:
                 with FileLock(DB_LOCK):
-                    _mark_in_index(ctx.cur, "papers", [int(i) for i in ids_added])
-                    _flush_pending_marks(ctx.cur)
+                    db_mark_in_index(ctx.cur, "papers", [int(i) for i in ids_added])
+                    db_flush_pending_marks(ctx.cur)
                     ctx.conn.commit()
             else:
                 _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
@@ -3017,8 +3017,8 @@ def _flush_chunk_batch(ctx: _IngestContext) -> None:
         if added:
             if saved:
                 with FileLock(DB_LOCK):
-                    _mark_in_index(ctx.cur, "chunks", [int(i) for i in ids_added])
-                    _flush_pending_marks(ctx.cur)
+                    db_mark_in_index(ctx.cur, "chunks", [int(i) for i in ids_added])
+                    db_flush_pending_marks(ctx.cur)
                     ctx.conn.commit()
             else:
                 _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
@@ -3171,7 +3171,7 @@ def build_or_update_indices(args):
             _faiss_save_force(paper_index, PAPER_INDEX_PATH)
             _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
         with FileLock(DB_LOCK):
-            _flush_pending_marks(conn.cursor())
+            db_flush_pending_marks(conn.cursor())
             conn.commit()
         
         _eprint("[consumer] Consume-only mode completed")
@@ -3833,8 +3833,8 @@ def build_or_update_indices(args):
                                 if added:
                                     if saved:
                                         with FileLock(DB_LOCK):
-                                            _mark_in_index(cur, "papers", [int(i) for i in ids_added])
-                                            _flush_pending_marks(cur)
+                                            db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
+                                            db_flush_pending_marks(cur)
                                             conn.commit()
                                     else:
                                         _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
@@ -3888,8 +3888,8 @@ def build_or_update_indices(args):
                                 if added:
                                     if saved:
                                         with FileLock(DB_LOCK):
-                                            _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
-                                            _flush_pending_marks(cur)
+                                            db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
+                                            db_flush_pending_marks(cur)
                                             conn.commit()
                                     else:
                                         _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
@@ -3960,11 +3960,11 @@ def build_or_update_indices(args):
                     if added:
                         if prior_ntotal == 0:
                             _faiss_save_force(paper_index, PAPER_INDEX_PATH)
-                            _mark_in_index(cur, "papers", [int(i) for i in ids_added])
+                            db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
                         else:
                             if _faiss_save(paper_index, PAPER_INDEX_PATH):
-                                _mark_in_index(cur, "papers", [int(i) for i in ids_added])
-                                _flush_pending_marks(cur)
+                                db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
+                                db_flush_pending_marks(cur)
                             else:
                                 _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
                 except RuntimeError:
@@ -3995,11 +3995,11 @@ def build_or_update_indices(args):
                     if added:
                         if prior_ntotal == 0:
                             _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
-                            _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
+                            db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
                         else:
                             if _faiss_save(chunk_index, CHUNK_INDEX_PATH):
-                                _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
-                                _flush_pending_marks(cur)
+                                db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
+                                db_flush_pending_marks(cur)
                             else:
                                 _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
                 except RuntimeError:
@@ -4109,7 +4109,7 @@ def build_or_update_indices(args):
             _faiss_save_force(paper_index, PAPER_INDEX_PATH)
             _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
         with FileLock(DB_LOCK):
-            _flush_pending_marks(conn.cursor())
+            db_flush_pending_marks(conn.cursor())
             conn.commit()
 
         try:
