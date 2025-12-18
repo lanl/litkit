@@ -111,6 +111,25 @@ ArticleMeta,
 from litkit.ingest import is_uncompressed_tar, shard_filter
 from litkit.index import safe_pq_m
 from litkit.pipeline import dedupe_ids_and_texts
+from litkit.db import (
+    SCHEMA as db_SCHEMA,
+    init_db as db_init_db,
+    init_shard_db as db_init_shard_db,
+    connect_db as db_connect_db,
+    DEFAULT_BUSY_TIMEOUT_MS as db_DEFAULT_BUSY_TIMEOUT_MS,
+    shard_db_path as db_shard_db_path,
+    list_shard_dbs as db_list_shard_dbs,
+    merge_shard_databases as db_merge_shard_databases,
+    already_processed as db_already_processed,
+    register_file as db_register_file,
+    preload_paper_id_map as db_preload_paper_id_map,
+    preload_chunk_id_map as db_preload_chunk_id_map,
+    chunk_ids_to_paper_ids as db_chunk_ids_to_paper_ids,
+    mark_in_index as db_mark_in_index,
+    flush_pending_marks as db_flush_pending_marks,
+    ensure_temp_candidates_table as db_ensure_temp_candidates_table,
+    load_temp_candidates as db_load_temp_candidates,
+)
 
 
 _FAISS_LOCK_DEPTH = threading.local()
