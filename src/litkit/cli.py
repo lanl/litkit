@@ -923,7 +923,7 @@ def _ingest_paper_segments(
             except RuntimeError:
                 # Compat path: hold DB_LOCK then FAISS_LOCK (lock-order invariant), and commit under DB_LOCK.
                 with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                    added = add_ids_union_compat(
+                    added = _add_ids_union_compat(
                         paper_index, ids, X, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
                     )
                     conn.commit()
@@ -1112,7 +1112,7 @@ def _ingest_chunk_segments(
                                 else faiss_save(chunk_index, CHUNK_INDEX_PATH)
             except RuntimeError:
                 with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                    added = add_ids_union_compat(
+                    added = _add_ids_union_compat(
                         chunk_index, ids, X, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
                     )
                     conn.commit()
@@ -1199,7 +1199,7 @@ def backfill_unindexed_vectors(
         except RuntimeError:
             # Fallback: _add_ids_union_compat handles db_mark_in_index internally
             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                added = add_ids_union_compat(
+                added = _add_ids_union_compat(
                     paper_index, ids, Xp, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
                 )
                 conn.commit()
@@ -1245,7 +1245,7 @@ def backfill_unindexed_vectors(
         except RuntimeError:
             # Fallback: _add_ids_union_compat handles db_mark_in_index internally
             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                added = add_ids_union_compat(
+                added = _add_ids_union_compat(
                     chunk_index, ids, Xc, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
                 )
                 conn.commit()
@@ -3938,7 +3938,7 @@ def main():
         os.environ["LITKIT_ASSUME_YES"] = "1"
     build_or_update_indices(args)
     # True "build-only": stop after indexing even if a question was provided
-    if args.build_only:
+    if args.build_only or args.init_indices_only:
         return
 
     # Resolve question (positional arg or --question-file)
