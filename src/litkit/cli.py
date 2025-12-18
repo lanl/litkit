@@ -108,7 +108,36 @@ from litkit.ingest.ingest import (
     parse_xml_fileobj,
 )
 from litkit.ingest import is_uncompressed_tar, shard_filter
-from litkit.index import safe_pq_m
+from litkit.index import (
+    # Constants
+    PQ_BITS,
+    USE_DOWNCAST_FALLBACK,
+    # Factory
+    flat_ip_index,
+    hnsw_index,
+    ivfpq_index,
+    safe_pq_m,
+    # I/O
+    faiss_save,
+    faiss_save_force,
+    faiss_load,
+    faiss_load_cached,
+    # Introspection
+    unwrap_core_and_kind,
+    kind_and_core,
+    extract_ivf,
+    report_faiss_index,
+    faiss_present_ids,
+    # IDs
+    make_id_selector,
+    safe_remove_ids,
+    # Search
+    pick_nprobe,
+    auto_set_nprobe,
+    faiss_search,
+    # Dedup
+    add_with_ids_dedup,
+)
 from litkit.pipeline import dedupe_ids_and_texts
 from litkit.db import (
     SCHEMA as db_SCHEMA,
@@ -835,14 +864,6 @@ def _phase(name: str, stream=None):
         pass
 
 
-def _pick_nprobe(nlist: int, user: int | None) -> int:
-    if user is not None:
-        target = int(user)
-    else:
-        target = int(math.sqrt(max(1, nlist)))
-    min_floor = 32 if nlist >= 16384 else 8
-    max_cap = 1024 if nlist >= 65536 else 512
-    return min(nlist, max(min_floor, min(max_cap, target)))
 
 
 
@@ -982,73 +1003,19 @@ def _idmap_bloom(index, bits_per_key=8):
 
 
 # -------------------- FAISS index helpers --------------------
-# Single source of truth for product-quantizer bits
-PQ_BITS = 8  # keep this in sync across training & _ivfpq_index
+# (Constants PQ_BITS and USE_DOWNCAST_FALLBACK are now imported from litkit.index)
 # (Path constants are now provided via lazy __getattr__ from get_runtime():
 #  PAPER_INDEX_PATH, CHUNK_INDEX_PATH, CHUNK_TRAINED_FLAG, CKPT_LOCK)
-# Allow a safe fallback to downcast() for reporting if duck-typing/extract fail.
-# Set LITKIT_FAISS_NO_DOWNCAST=1 to disable the downcast fallback entirely.
-USE_DOWNCAST_FALLBACK = os.environ.get("LITKIT_FAISS_NO_DOWNCAST", "") == ""
 
 # ------------------------------------------------------------------
 # Producer-mode segment writer handle (set in main(); read elsewhere)
 # ------------------------------------------------------------------
 
 
-def _unwrap_core_and_kind(
-    idx, max_depth: int = 12, allow_downcast_fallback: bool = USE_DOWNCAST_FALLBACK
-):
-    """Return (kind, core, wrappers) where kind in {'ivf','hnsw','flat'}.
-    Unwraps common wrappers (.index/.base_index). Prefers duck-typing and
-    faiss.extract_index_ivf; optionally falls back to downcast_index for read-only introspection.
-    """
-    base = idx
-    wrappers = [type(base).__name__]
-
-    for _ in range(max_depth):
-        if base is None:
-            break
-
-        # --- IVF via duck-typing ---
-        if hasattr(base, "nlist"):
-            return "ivf", base, wrappers
-
-        # --- IVF via FAISS helper (safe) ---
-        try:
-            ivf = faiss.extract_index_ivf(base)  # returns IndexIVF if applicable
-            return "ivf", ivf, wrappers
-        except Exception:
-            pass
-
-        # --- HNSW via duck-typing ---
-        if hasattr(base, "hnsw"):
-            return "hnsw", base, wrappers
-
-        # unwrap one layer of common wrappers
-        nxt = getattr(base, "index", None) or getattr(base, "base_index", None)
-        if nxt is None:
-            break
-        base = nxt
-        wrappers.append(type(base).__name__)
-
-    if allow_downcast_fallback:
-        # Last resort: downcast to reveal subclass attributes on some wheels
-        try:
-            obj = faiss.downcast_index(base)
-            if hasattr(obj, "nlist"):
-                return "ivf", obj, wrappers
-            if hasattr(obj, "hnsw"):
-                return "hnsw", obj, wrappers
-        except Exception:
-            pass
-
-    return "flat", base, wrappers
-
-
 def _add_ids_union_compat(index, ids_list, X, *, table, cur, save_path: Path):
     ids_arr = np.asarray(ids_list, dtype=np.int64)
 
-    present = _faiss_present_ids(index) or set()
+    present = faiss_present_ids(index) or set()
     mask = np.array([int(i) not in present for i in ids_arr], dtype=bool)
 
     if not mask.any():
@@ -1059,7 +1026,7 @@ def _add_ids_union_compat(index, ids_list, X, *, table, cur, save_path: Path):
     X_new = np.ascontiguousarray(X[mask].astype("float32"))
     faiss.normalize_L2(X_new)  # unit norm for IP == cosine (same as _add_with_ids_dedup)
     index.add_with_ids(X_new, ids_new)
-    _faiss_save(index, save_path)
+    faiss_save(index, save_path)
     db_mark_in_index(cur, table, [int(i) for i in ids_new])
     return int(ids_new.size)
 
@@ -1087,44 +1054,6 @@ def _assert_faiss_locked():
         )
 
 
-def _faiss_save(index, path: Path) -> bool:
-    _assert_faiss_locked()
-    label = "papers" if Path(path).name.startswith("papers") else "chunks"
-    now = time.time()
-    if (now - _last_save_ts.get(label, 0.0)) < _SAVE_MIN_SEC:
-        return False
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    faiss.write_index(index, str(tmp))
-    try:
-        fd = os.open(str(tmp), os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except Exception:
-        pass
-    os.replace(tmp, path)
-    _maybe_fsync_dir(path)
-    _last_save_ts[label] = now
-    return True
-
-def _faiss_save_force(index, path: Path) -> bool:
-    _assert_faiss_locked()
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    faiss.write_index(index, str(tmp))
-    try:
-        fd = os.open(str(tmp), os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except Exception:
-        pass
-    os.replace(tmp, path)
-    _maybe_fsync_dir(path)
-    label = "papers" if Path(path).name.startswith("papers") else "chunks"
-    _last_save_ts[label] = time.time()
-    return True
 
 
 
@@ -1145,124 +1074,6 @@ def _clear_chunk_trained_flag():
         _eprint(f"[train] WARNING: could not remove {CHUNK_TRAINED_FLAG}: {e}")
 
 
-def _faiss_load(path: Path):
-    """Load a FAISS index."""
-    return faiss.read_index(str(path))
-
-
-def _hnsw_index(
-    dim: int, M: int = 32, ef_construction: int = 200, ef_search: int = 128
-) -> faiss.Index:
-    # 1) Prefer explicit IP ctor
-    try:
-        idx = faiss.IndexHNSWFlat(dim, M, faiss.METRIC_INNER_PRODUCT)
-    except TypeError:
-        # 2) Older wheels: try factory with explicit metric
-        try:
-            idx = faiss.index_factory(dim, f"HNSW{M}", faiss.METRIC_INNER_PRODUCT)
-        except Exception as e:
-            # 3) Last resort: 2-arg ctor + attribute (if available) else hard fail
-            idx = faiss.IndexHNSWFlat(dim, M)
-            if hasattr(idx, "metric_type"):
-                idx.metric_type = faiss.METRIC_INNER_PRODUCT
-            else:
-                raise RuntimeError(
-                    "FAISS build does not support IP HNSW (metric_type unset and 3-arg ctor unavailable). "
-                    "Install a newer faiss (>=1.7.4, CPU or GPU) or run with --papers-index flat."
-                ) from e
-
-    idx.hnsw.efConstruction = int(ef_construction)
-    idx.hnsw.efSearch = int(ef_search)
-    return idx
-
-
-def _kind_and_core(idx):
-    kind, core, _ = _unwrap_core_and_kind(idx)
-    return kind, core
-
-
-def _report_faiss_index(label: str, path: Path):
-    """Identify and print the FAISS core index type, robust to wrappers and SWIG base-class objects.
-    Uses _unwrap_core_and_kind (duck-typing first, optional downcast fallback).
-    """
-    try:
-        idx = faiss.read_index(str(path))
-    except Exception as e:
-        _eprint(f"[faiss] {label}: (could not load index: {e.__class__.__name__})")
-        return
-
-    kind, core, wrappers = _unwrap_core_and_kind(idx)
-
-    if kind == "ivf":
-        nlist = getattr(core, "nlist", None)
-        nprobe = getattr(core, "nprobe", None)
-
-        # Detect IVFPQ via presence of .pq and pull subquantizer count robustly
-        pq = getattr(core, "pq", None)
-        m_val = None
-        if pq is not None:
-            for attr in ("M", "m", "nb_subquantizers", "nbSubquantizers"):
-                if hasattr(pq, attr):
-                    try:
-                        m_val = int(getattr(pq, attr))
-                        break
-                    except Exception:
-                        pass
-
-        if m_val is not None:
-            # IVFPQ
-            msg = f"[faiss] {label}: IVF-PQ nlist={int(nlist) if nlist is not None else 'N/A'} m={m_val}"
-            if nprobe is not None:
-                msg += f" nprobe={int(nprobe)}"
-            _eprint(msg)
-        else:
-            # Plain IVF
-            msg = f"[faiss] {label}: IVF nlist={int(nlist) if nlist is not None else 'N/A'}"
-            if nprobe is not None:
-                msg += f" nprobe={int(nprobe)}"
-            _eprint(msg)
-        return
-
-    if kind == "hnsw":
-        h = getattr(core, "hnsw", None)
-        ef = getattr(h, "efSearch", None) if h is not None else None
-
-        # Only include M if actually exposed/int-able on this wheel
-        M = None
-        if h is not None:
-            for attr in ("M", "m", "nb_neighbors", "nbNeighbors"):
-                if hasattr(h, attr):
-                    try:
-                        M = int(getattr(h, attr))
-                        break
-                    except Exception:
-                        pass
-
-        if M is not None:
-            _eprint(f"[faiss] {label}: HNSW M={M} efSearch={int(ef) if ef is not None else 'N/A'}")
-        else:
-            _eprint(f"[faiss] {label}: HNSW efSearch={int(ef) if ef is not None else 'N/A'}")
-
-        return
-
-    # FLAT
-    _eprint(f"[faiss] {label}: FLAT")
-
-    return
-
-
-def _flat_ip_index(dim: int) -> faiss.Index:
-    """Create an exact inner-product (cosine when normalized) flat index."""
-    return faiss.IndexFlatIP(dim)
-
-
-def _ivfpq_index(dim: int, nlist: int = 16384, m: int = 64, bits: int = PQ_BITS) -> faiss.Index:
-    """Create IVF-PQ index (inner product). Code size = `m` bytes per vector (8 bits/subquantizer)."""
-    quantizer = faiss.IndexFlatIP(dim)
-    idx = faiss.IndexIVFPQ(quantizer, dim, nlist, m, bits)
-    if hasattr(idx, "metric_type"):
-        idx.metric_type = faiss.METRIC_INNER_PRODUCT
-    return idx
 
 
 def _ensure_parent(path: Path):
@@ -1379,14 +1190,14 @@ def _ingest_paper_segments(
             added, ids_added, saved = 0, [], False
             try:
                 with FileLock(FAISS_LOCK):
-                    added, ids_added = _add_with_ids_dedup(paper_index, ids, X)
+                    added, ids_added = add_with_ids_dedup(paper_index, ids, X)
                     if added:
-                        saved = _faiss_save_force(paper_index, PAPER_INDEX_PATH) if prior_ntotal == 0 \
-                                else _faiss_save(paper_index, PAPER_INDEX_PATH)
+                        saved = faiss_save_force(paper_index, PAPER_INDEX_PATH) if prior_ntotal == 0 \
+                                else faiss_save(paper_index, PAPER_INDEX_PATH)
             except RuntimeError:
                 # Compat path: hold DB_LOCK then FAISS_LOCK (lock-order invariant), and commit under DB_LOCK.
                 with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                    added = _add_ids_union_compat(
+                    added = add_ids_union_compat(
                         paper_index, ids, X, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
                     )
                     conn.commit()
@@ -1407,7 +1218,7 @@ def _ingest_paper_segments(
 
             if (batch_counter % max(1, int(save_every))) == 0:
                 with FileLock(FAISS_LOCK):
-                    saved_now = _faiss_save(paper_index, PAPER_INDEX_PATH)
+                    saved_now = faiss_save(paper_index, PAPER_INDEX_PATH)
                 if saved_now:
                     with FileLock(DB_LOCK):
                         db_flush_pending_marks(cur)
@@ -1567,15 +1378,15 @@ def _ingest_chunk_segments(
             added, ids_added, saved = 0, [], False
             try:
                 with FileLock(FAISS_LOCK):
-                    sel = _make_id_selector(ids)
-                    _safe_remove_ids(chunk_index, sel)
-                    added, ids_added = _add_with_ids_dedup(chunk_index, ids, X)
+                    sel = make_id_selector(ids)
+                    safe_remove_ids(chunk_index, sel)
+                    added, ids_added = add_with_ids_dedup(chunk_index, ids, X)
                     if added:
-                        saved = _faiss_save_force(chunk_index, CHUNK_INDEX_PATH) if prior_ntotal == 0 \
-                                else _faiss_save(chunk_index, CHUNK_INDEX_PATH)
+                        saved = faiss_save_force(chunk_index, CHUNK_INDEX_PATH) if prior_ntotal == 0 \
+                                else faiss_save(chunk_index, CHUNK_INDEX_PATH)
             except RuntimeError:
                 with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                    added = _add_ids_union_compat(
+                    added = add_ids_union_compat(
                         chunk_index, ids, X, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
                     )
                     conn.commit()
@@ -1596,7 +1407,7 @@ def _ingest_chunk_segments(
 
             if (batch_counter % max(1, int(save_every))) == 0:
                 with FileLock(FAISS_LOCK):
-                    saved_now = _faiss_save(chunk_index, CHUNK_INDEX_PATH)
+                    saved_now = faiss_save(chunk_index, CHUNK_INDEX_PATH)
                 if saved_now:
                     with FileLock(DB_LOCK):
                         db_flush_pending_marks(cur)
@@ -1614,32 +1425,6 @@ def _ingest_chunk_segments(
     return chunk_index, added_total
 
 
-def _extract_ivf(index):
-    """Return IVF/IVFPQ core using the same unwrapping logic as reporting."""
-    kind, core, _ = _unwrap_core_and_kind(index)
-    if kind == "ivf" and hasattr(core, "nlist"):
-        return core
-    return None
-
-
-def _auto_set_nprobe(index, user_nprobe=None, min_probe=8, max_probe=512):
-    """Set `nprobe` on IVF indices. If `user_nprobe` is None, choose ≈ sqrt(nlist)
-    clamped to [min_probe, max_probe] and ≤ nlist. No-op for non-IVF indices.
-
-    Returns:
-    -------
-    (nprobe, nlist) or None
-    """
-    ivf = _extract_ivf(index)
-    if ivf is None:
-        return  # FLAT/HNSW; nprobe not applicable
-    nlist = int(getattr(ivf, "nlist", 0))
-    if nlist <= 0:
-        return  # untrained IVF
-
-    target = _pick_nprobe(nlist, user_nprobe)
-    ivf.nprobe = target
-    return target, nlist
 
 
 def backfill_unindexed_vectors(
@@ -1678,17 +1463,17 @@ def backfill_unindexed_vectors(
         try:
             prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
             with FileLock(FAISS_LOCK):
-                sel = _make_id_selector(ids)
-                _safe_remove_ids(paper_index, sel)
-                added, ids_added = _add_with_ids_dedup(paper_index, ids, Xp)
+                sel = make_id_selector(ids)
+                safe_remove_ids(paper_index, sel)
+                added, ids_added = add_with_ids_dedup(paper_index, ids, Xp)
                 saved = False
                 if added:
-                    saved = _faiss_save_force(paper_index, PAPER_INDEX_PATH) if prior_ntotal == 0 \
-                            else _faiss_save(paper_index, PAPER_INDEX_PATH)
+                    saved = faiss_save_force(paper_index, PAPER_INDEX_PATH) if prior_ntotal == 0 \
+                            else faiss_save(paper_index, PAPER_INDEX_PATH)
         except RuntimeError:
             # Fallback: _add_ids_union_compat handles db_mark_in_index internally
             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                added = _add_ids_union_compat(
+                added = add_ids_union_compat(
                     paper_index, ids, Xp, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
                 )
                 conn.commit()
@@ -1724,17 +1509,17 @@ def backfill_unindexed_vectors(
         try:
             prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
             with FileLock(FAISS_LOCK):
-                sel = _make_id_selector(ids)
-                _safe_remove_ids(chunk_index, sel)
-                added, ids_added = _add_with_ids_dedup(chunk_index, ids, Xc)
+                sel = make_id_selector(ids)
+                safe_remove_ids(chunk_index, sel)
+                added, ids_added = add_with_ids_dedup(chunk_index, ids, Xc)
                 saved = False
                 if added:
-                    saved = _faiss_save_force(chunk_index, CHUNK_INDEX_PATH) if prior_ntotal == 0 \
-                            else _faiss_save(chunk_index, CHUNK_INDEX_PATH)
+                    saved = faiss_save_force(chunk_index, CHUNK_INDEX_PATH) if prior_ntotal == 0 \
+                            else faiss_save(chunk_index, CHUNK_INDEX_PATH)
         except RuntimeError:
             # Fallback: _add_ids_union_compat handles db_mark_in_index internally
             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                added = _add_ids_union_compat(
+                added = add_ids_union_compat(
                     chunk_index, ids, Xc, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
                 )
                 conn.commit()
@@ -1751,44 +1536,6 @@ def backfill_unindexed_vectors(
             conn.commit()
 
 
-def _make_id_selector(ids_like):
-    """Return a FAISS IDSelector compatible with faiss build, or the raw int64 array as a last resort.
-    Supports both IDSelectorArray (newer) and IDSelectorBatch (older) names.
-    """
-    arr = np.ascontiguousarray(ids_like, dtype=np.int64)
-
-    Sel = getattr(faiss, "IDSelectorArray", None) or getattr(faiss, "IDSelectorBatch", None)
-    if Sel is not None:
-        return Sel(arr)
-
-    # Fallback: no selector types available — the only portable way is to rebuild without the ids.
-    # Callers that need removal should use this helper.
-    raise RuntimeError(
-        "FAISS build lacks IDSelectorArray/Batch; re-run with LITKIT_FAISS_COMPAT_REBUILD=1 to rebuild index without stale ids."
-    )
-
-
-def _safe_remove_ids(index, sel) -> int:
-    """Best-effort removal of ids irrespective of index family (IDMap2/HNSW/FLAT/IVF).
-    Returns the number of vectors removed (0 if unsupported or none removed).
-    """
-    # 1) Try on the current object
-    try:
-        return int(index.remove_ids(sel))
-    except Exception:
-        pass
-
-    # 2) Try to unwrap common wrappers (e.g., IndexIDMap2, IndexPreTransform)
-    base = getattr(index, "index", None)
-    for _ in range(8):
-        if base is None:
-            break
-        try:
-            return int(base.remove_ids(sel))
-        except Exception:
-            base = getattr(base, "index", None)
-
-    return 0
 
 
 def _post_build_sanity_check(conn, args):
@@ -1798,7 +1545,7 @@ def _post_build_sanity_check(conn, args):
         p_idx = faiss.read_index(str(PAPER_INDEX_PATH))
     except Exception:
         p_idx = None
-    _report_faiss_index("papers", PAPER_INDEX_PATH)
+    report_faiss_index("papers", PAPER_INDEX_PATH)
 
     cur = conn.cursor()
     n_db_p = cur.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
@@ -1811,7 +1558,7 @@ def _post_build_sanity_check(conn, args):
         c_idx = faiss.read_index(str(CHUNK_INDEX_PATH))
     except Exception:
         c_idx = None
-    _report_faiss_index("chunks", CHUNK_INDEX_PATH)
+    report_faiss_index("chunks", CHUNK_INDEX_PATH)
 
     n_db_c = cur.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
     n_in_c = cur.execute("SELECT COUNT(*) FROM chunks WHERE in_index=1").fetchone()[0]
@@ -3129,21 +2876,6 @@ def build_or_update_indices(args):
 # -------------------- Retrieval helpers --------------------
 
 
-def _faiss_present_ids(index) -> set | None:
-    """Return the set of external IDs present in an IndexIDMap2-wrapped index.
-    Returns None if we cannot enumerate (e.g., not IDMap2).
-    """
-    try:
-        if isinstance(index, faiss.IndexIDMap2):
-            # LongVector -> numpy -> python set
-            return set(int(x) for x in faiss.vector_to_array(index.id_map))
-        # Try to unwrap one layer if caller handed us a wrapper
-        base = getattr(index, "index", None)
-        if isinstance(base, faiss.IndexIDMap2):
-            return set(int(x) for x in faiss.vector_to_array(base.id_map))
-    except Exception:
-        pass
-    return None
 
 
 def reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index) -> tuple[int, int]:
@@ -3155,7 +2887,7 @@ def reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index) -> tuple[i
     reset_p = reset_c = 0
 
     # Papers
-    ids_present = _faiss_present_ids(paper_index)
+    ids_present = faiss_present_ids(paper_index)
     if ids_present is not None:
         cur.execute("SELECT id, in_index FROM papers")
         bad = [row[0] for row in cur.fetchall() if row[0] not in ids_present and row[1] == 1]
@@ -3173,7 +2905,7 @@ def reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index) -> tuple[i
             )
 
     # Chunks
-    ids_present = _faiss_present_ids(chunk_index)
+    ids_present = faiss_present_ids(chunk_index)
     if ids_present is not None:
         cur.execute("SELECT id, in_index FROM chunks")
         bad = [row[0] for row in cur.fetchall() if row[0] not in ids_present and row[1] == 1]
@@ -3194,57 +2926,6 @@ def reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index) -> tuple[i
     return reset_p, reset_c
 
 
-_TL_FAISS_CACHE = threading.local()
-
-def _faiss_load_cached(path: Path):
-    p = Path(path)
-    try:
-        st = p.stat()
-    except FileNotFoundError:
-        return _faiss_load(path)
-    mt_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
-    key = (str(p), mt_ns, int(st.st_size))
-
-    cache = getattr(_TL_FAISS_CACHE, "faiss", None)
-    if cache is None:
-        cache = {}
-        _TL_FAISS_CACHE.faiss = cache
-
-    idx = cache.get(key)
-    if idx is None:
-        # Clear this thread’s cache to avoid unbounded growth on file rotations
-        cache.clear()
-        cache[key] = faiss.read_index(str(p))
-        idx = cache[key]
-    return idx
-
-
-def _add_with_ids_dedup(index, ids: list[int], X: np.ndarray) -> tuple[int, np.ndarray]:
-    """Add (ids, X) to a possibly-wrapped FAISS index, removing stale ids first
-    when supported. Falls back to union-dedup when IDSelector is missing.
-    Returns (added_count, ids_added_array).
-    """
-    ids_arr = np.ascontiguousarray(ids, dtype=np.int64)
-    X = np.ascontiguousarray(X.astype("float32"))
-    faiss.normalize_L2(X)  # unit norm docs for IP == cosine
-    # Ensure IDMap2 for safe external id semantics everywhere
-    if not isinstance(index, faiss.IndexIDMap2):
-        index = faiss.IndexIDMap2(index)
-
-    try:
-        sel = _make_id_selector(ids_arr)
-        _safe_remove_ids(index, sel)
-        index.add_with_ids(X, ids_arr)
-        return int(ids_arr.size), ids_arr
-    except RuntimeError:
-        present = _faiss_present_ids(index) or set()
-        mask = np.array([int(i) not in present for i in ids_arr], dtype=bool)
-        if not mask.any():
-            return 0, np.empty((0,), dtype=np.int64)
-        ids_new = ids_arr[mask]
-        X_new = X[mask]
-        index.add_with_ids(X_new, ids_new)
-        return int(ids_new.size), ids_new
 
 
 @contextmanager
@@ -3271,8 +2952,8 @@ def _temporary_search_params(kind, core, *, efSearch=None, nprobe=None):
 
 
 def _faiss_search(index_path: Path, qvec: np.ndarray, k: int, **kwargs):
-    index = _faiss_load_cached(index_path)
-    kind, core = _kind_and_core(index)
+    index = faiss_load_cached(index_path)
+    kind, core = kind_and_core(index)
     info = {}
 
     if kind == "hnsw":
@@ -3280,7 +2961,7 @@ def _faiss_search(index_path: Path, qvec: np.ndarray, k: int, **kwargs):
         info["efSearch"] = ef
         ctx = _temporary_search_params(kind, core, efSearch=ef)
     elif kind == "ivf":
-        target = _pick_nprobe(int(core.nlist), kwargs.get("nprobe", None))
+        target = pick_nprobe(int(core.nlist), kwargs.get("nprobe", None))
         info["nprobe"] = target
         info["nlist"] = int(core.nlist)
         ctx = _temporary_search_params(kind, core, nprobe=target)
