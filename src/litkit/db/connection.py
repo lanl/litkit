@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -14,8 +15,20 @@ if TYPE_CHECKING:
 # Default Configuration
 # ---------------------------------------------------------------------------
 
-# Can be overridden at module level for global timeout changes
+# Fallback default (30 seconds). The CLI can override via LITKIT_SQLITE_BUSY_TIMEOUT_MS
+# environment variable, which is read at CALL TIME (not import time) to ensure
+# the CLI's --sqlite-busy-timeout-ms flag is honored.
 DEFAULT_BUSY_TIMEOUT_MS: int = 30000
+
+
+def _get_busy_timeout() -> int:
+    """Get busy timeout from environment (call-time) or return default.
+    
+    This function is called at connection time, not import time, so
+    the CLI's os.environ["LITKIT_SQLITE_BUSY_TIMEOUT_MS"] = str(...)
+    assignment in main() is honored.
+    """
+    return int(os.environ.get("LITKIT_SQLITE_BUSY_TIMEOUT_MS", str(DEFAULT_BUSY_TIMEOUT_MS)))
 
 
 # ---------------------------------------------------------------------------
@@ -35,15 +48,15 @@ def connect_db(
     
     Args:
         db_path: Path to the SQLite database file
-        busy_timeout_ms: Timeout in ms when waiting for locks (default: module
-                         global DEFAULT_BUSY_TIMEOUT_MS)
+        busy_timeout_ms: Timeout in ms when waiting for locks. If None, reads
+                         from LITKIT_SQLITE_BUSY_TIMEOUT_MS env var (default: 30000)
         autocommit: If True, set isolation_level=None for autocommit mode
     
     Returns:
         Open database connection
     """
     if busy_timeout_ms is None:
-        busy_timeout_ms = DEFAULT_BUSY_TIMEOUT_MS
+        busy_timeout_ms = _get_busy_timeout()
     
     isolation = None if autocommit else ""
     conn = sqlite3.connect(

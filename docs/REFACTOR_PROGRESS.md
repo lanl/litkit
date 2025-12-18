@@ -149,11 +149,38 @@ those tars would be re-scanned from zero.
 - `fd41c14`: Add per-shard checkpoint module (WIP)
 - `f709070`: Wire up per-shard checkpoints in build_or_update_indices
 
-### Dead Code Removal (PARTIAL - 2024-12-17)
+### Phase 4.1: SQLite Configuration Fixes (COMPLETE - 2024-12-17)
+
+Fixed busy_timeout CLI flag propagation bug:
+
+**The Bug**
+- `--sqlite-busy-timeout-ms` CLI flag wasn't being honored by `db_connect_db()` calls
+- Root cause: `DEFAULT_BUSY_TIMEOUT_MS` was evaluated at import time, not call time
+- Result: query-time connections used 30s default while build-time used user's value
+
+**The Fix**
+1. Added `_get_busy_timeout()` helper in `litkit/db/connection.py` that reads from env at call time
+2. CLI sets `os.environ["LITKIT_SQLITE_BUSY_TIMEOUT_MS"]` in `main()` after argparse
+3. Added default to `litkit/config/paths.py` `setup_environment()` for consistency
+
+**Cleaned up unused imports:**
+- Removed `db_ensure_temp_candidates_table` (already called internally by `load_temp_candidates`)
+- Removed `db_DEFAULT_BUSY_TIMEOUT_MS` (no longer needed)
+
+### Dead Code Removal (COMPLETE - 2024-12-17)
 
 Removed unused local implementations that were shadowed by imported versions:
 - ✅ `_mark_in_index()` - removed (all calls use `db_mark_in_index`)
 - ✅ `_flush_pending_marks()` - removed (all calls use `db_flush_pending_marks`)
+- ✅ `_SegmentWriter` class - removed (using `SegmentWriter` from litkit.segments)
+- ✅ `_ChunkSegmentWriter` class - removed (using `ChunkSegmentWriter` from litkit.segments)
+- ✅ `ProducerCoordinator` class - removed (using `SegProducerCoordinator` from litkit.segments)
+- ✅ `ConsumerCoordinator` class - removed (using `SegConsumerCoordinator` from litkit.segments)
+- ✅ `_write_build_meta()` - removed (using `seg_write_build_meta`)
+- ✅ `_read_build_meta()` - removed (using `seg_read_build_meta`)
+- ✅ `_has_segment_files()` - removed (using `seg_has_segment_files`)
+- ✅ `_validate_shard_consistency()` - removed (using `seg_validate_shard_consistency`)
+- ✅ `load_checkpoint()` / `save_checkpoint()` - now using `seg_load_checkpoint()` / `seg_save_checkpoint()`
 
 ### Multi-Node Correctness (VERIFIED - 2024-12-17)
 
@@ -175,35 +202,28 @@ The multi-node build architecture works correctly:
 
 ## Remaining Work
 
-### Phase 4: Dead Code Removal (IN PROGRESS)
+### Phase 4: Dead Code Removal (COMPLETE - 2024-12-17)
 
-cli.py still contains local implementations that duplicate the extracted modules.
-These should be removed to shrink cli.py toward its ~500 line target:
+All segment-related local implementations have been removed from cli.py:
 
-**Checkpoint functions (ready to remove):**
-- ✅ `load_checkpoint()` - now using `seg_load_checkpoint()`
-- ✅ `save_checkpoint()` - now using `seg_save_checkpoint()`
-- Note: Local versions still exist but only `seg_*` versions are called
+**Checkpoint functions (REMOVED):**
+- ✅ `load_checkpoint()` - removed, using `seg_load_checkpoint()`
+- ✅ `save_checkpoint()` - removed, using `seg_save_checkpoint()`
 
-**Segment classes (ready to remove):**
-- `_SegmentWriter` - duplicates `litkit.segments.writer.SegmentWriter`
-- `_ChunkSegmentWriter` - duplicates `litkit.segments.writer.ChunkSegmentWriter`
-- `ProducerCoordinator` - duplicates `litkit.segments.coordination`
-- `ConsumerCoordinator` - duplicates `litkit.segments.coordination`
+**Segment classes (REMOVED):**
+- ✅ `_SegmentWriter` - removed, using `SegmentWriter` from litkit.segments
+- ✅ `_ChunkSegmentWriter` - removed, using `ChunkSegmentWriter` from litkit.segments
+- ✅ `ProducerCoordinator` - removed, using `SegProducerCoordinator` from litkit.segments
+- ✅ `ConsumerCoordinator` - removed, using `SegConsumerCoordinator` from litkit.segments
 
-**Metadata functions (ready to remove):**
-- `_write_build_meta()` - duplicates `litkit.segments.metadata.write_build_meta`
-- `_read_build_meta()` - duplicates `litkit.segments.metadata.read_build_meta`
-- `_validate_shard_consistency()` - duplicates `litkit.segments.metadata.validate_shard_consistency`
-- `_has_segment_files()` - duplicates `litkit.segments.metadata.has_segment_files`
+**Metadata functions (REMOVED):**
+- ✅ `_write_build_meta()` - removed, using `seg_write_build_meta`
+- ✅ `_read_build_meta()` - removed, using `seg_read_build_meta`
+- ✅ `_validate_shard_consistency()` - removed, using `seg_validate_shard_consistency`
+- ✅ `_has_segment_files()` - removed, using `seg_has_segment_files`
 
-**DB helpers (still used - need careful removal):**
-- `SCHEMA`, `init_db()`, `init_shard_db()`
-- `_ensure_in_index_columns()`, `_shard_db_path()`, `_list_shard_dbs()`
-- `merge_shard_databases()`, `_connect_db()`
-- `_ensure_temp_candidates_table()`, `_load_temp_candidates()`
-- `already_processed()`, `register_file()`
-- `preload_paper_id_map()`, `preload_chunk_id_map()`
+**DB helpers (already using imported versions):**
+- All DB functions are imported from `litkit.db` and prefixed with `db_`
 
 ### Phase 5: Final Cleanup (NOT STARTED)
 
@@ -255,18 +275,39 @@ See git log for detailed commit history. Key commits:
 - Phase 3.5: doc_id canonicalization fix (2024-12-17)
 - Phase 3.6: Per-shard checkpoint module (`fd41c14`, `f709070`) (2024-12-17)
 
+## Current Status
+
+**cli.py is still ~4600 lines.** The modules have been created and imports wired up, but
+most function DEFINITIONS still live in cli.py. The next phase is to remove those local
+definitions and use the imported versions.
+
 ## Suggested Next Task
 
-**Dead Code Removal: Segment Classes**
+**Remove FAISS function definitions from cli.py**
 
-Remove local duplicates from cli.py that are now imported from extracted modules:
+cli.py still contains ~500+ lines of FAISS-related functions that already have
+equivalents in `litkit.index`:
 
-1. Remove local `load_checkpoint()` and `save_checkpoint()` (only `seg_*` versions are called)
-2. Remove local `_SegmentWriter` and `_ChunkSegmentWriter` classes
-3. Remove local `ProducerCoordinator` and `ConsumerCoordinator` classes
-4. Remove local `_write_build_meta()`, `_read_build_meta()`, `_validate_shard_consistency()`, `_has_segment_files()`
-5. Import and use versions from `litkit.segments` throughout
+| cli.py function | Use from litkit.index |
+|-----------------|----------------------|
+| `_unwrap_core_and_kind()` | `index.introspection.unwrap_core_and_kind` |
+| `_kind_and_core()` | `index.introspection.kind_and_core` |
+| `_report_faiss_index()` | `index.introspection.report_faiss_index` |
+| `_flat_ip_index()` | `index.factory.flat_ip_index` |
+| `_hnsw_index()` | `index.factory.hnsw_index` |
+| `_ivfpq_index()` | `index.factory.ivfpq_index` |
+| `_effective_nlist()` | `index.training.effective_nlist` |
+| `_pick_nprobe()` | `index.training.pick_nprobe` |
+| `_auto_set_nprobe()` | `index.training.auto_set_nprobe` |
+| `_faiss_save()`, `_faiss_save_force()` | `index.io` |
+| `_faiss_load()`, `_faiss_load_cached()` | `index.io` |
+| `_add_with_ids_dedup()` | `index.dedup.add_with_ids_dedup` |
+| `_faiss_present_ids()` | `index.dedup.faiss_present_ids` |
+| `_make_id_selector()`, `_safe_remove_ids()` | `index.ids` |
+| `_faiss_search()` | `index.search.faiss_search` |
+| `_temporary_search_params()` | `index.search` |
+| `_extract_ivf()` | `index.introspection.extract_ivf` |
 
-**Estimated reduction:** ~400-600 lines from cli.py
+**Estimated reduction:** ~500-600 lines from cli.py
 
-This directly advances Jobs 5 (Locking) and 6 (Segments) in REFACTOR_ROADMAP.md.
+This advances **Job 4 (FAISS/Index)** from REFACTOR_ROADMAP.md.

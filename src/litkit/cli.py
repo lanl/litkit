@@ -115,7 +115,6 @@ from litkit.db import (
     init_db as db_init_db,
     init_shard_db as db_init_shard_db,
     connect_db as db_connect_db,
-    DEFAULT_BUSY_TIMEOUT_MS as db_DEFAULT_BUSY_TIMEOUT_MS,
     shard_db_path as db_shard_db_path,
     list_shard_dbs as db_list_shard_dbs,
     merge_shard_databases as db_merge_shard_databases,
@@ -126,7 +125,6 @@ from litkit.db import (
     chunk_ids_to_paper_ids as db_chunk_ids_to_paper_ids,
     mark_in_index as db_mark_in_index,
     flush_pending_marks as db_flush_pending_marks,
-    ensure_temp_candidates_table as db_ensure_temp_candidates_table,
     load_temp_candidates as db_load_temp_candidates,
 )
 from litkit.segments import (
@@ -835,319 +833,6 @@ def _pick_nprobe(nlist: int, user: int | None) -> int:
     return min(nlist, max(min_floor, min(max_cap, target)))
 
 
-class _SegmentWriter:
-    """Writes paper embedding segments to disk using doc_id (globally unique file path) for identification.
-    
-    Format: NPZ with keys 'doc_ids' (object array of strings), 'vecs' (float16/float32), 'dim', 'count'.
-    The doc_id is the canonical file path (e.g., "tar:///path/to/file.tar!/member.nxml") which is
-    globally unique across all shards and stable across DB merges.
-    """
-    def __init__(self, outdir: Path, segment_size: int, dtype: str, shard_id: int, kind: str):
-        self.outdir = Path(outdir)
-        self.outdir.mkdir(parents=True, exist_ok=True)
-        self.segment_size = int(segment_size)
-        self.dtype = np.float16 if dtype == "fp16" else np.float32
-        self.shard_id = int(shard_id)
-        self.seq = 0
-        self.kind = kind
-
-    def _next_path(self) -> Path:
-        ts = int(time.time())
-        p = self.outdir / f"{self.kind}_sh{self.shard_id:02d}_{ts}_{self.seq:06d}.npz"
-        self.seq += 1
-        return p
-
-    def write(self, doc_ids: list[str], vecs: np.ndarray):
-        """Write paper embeddings to segment file.
-        
-        Args:
-            doc_ids: List of doc_id strings (globally unique file paths)
-            vecs: Embedding vectors (N x dim)
-        """
-        if len(doc_ids) == 0:
-            return
-        if vecs.dtype != self.dtype:
-            vecs = vecs.astype(self.dtype, copy=False)
-
-        N = len(doc_ids)
-        for start in range(0, N, self.segment_size):
-            end = min(N, start + self.segment_size)
-            doc_ids_i = np.array(doc_ids[start:end], dtype=object)
-            vecs_i = np.ascontiguousarray(vecs[start:end])
-            dim = vecs_i.shape[1]
-
-            final = self._next_path()
-            tmp = final.with_suffix(final.suffix + ".tmp")
-
-            # Write to a temp file, fsync, then atomic replace
-            final.parent.mkdir(parents=True, exist_ok=True)
-            with open(tmp, "wb") as fh:
-                np.savez(
-                    fh, doc_ids=doc_ids_i, vecs=vecs_i, dim=np.int32(dim), count=np.int32(len(doc_ids_i))
-                )
-                try:
-                    if os.environ.get("LITKIT_SEGMENT_FSYNC_FILE", "1") == "1":
-                        fh.flush()
-                        os.fsync(fh.fileno())
-                except Exception:
-                    pass
-
-            os.replace(tmp, final)
-            _maybe_fsync_dir(final)
-
-
-# -------------------- Build Metadata (shard consistency) --------------------
-BUILD_META_FILE = ".build_meta.json"
-
-
-def _write_build_meta(seg_dir: Path, num_shards: int, manifest_path: str | None = None, *, mode: str = "single") -> None:
-    """Write build metadata to segment directory for shard consistency checking.
-    
-    Args:
-        seg_dir: Directory to write metadata to
-        num_shards: Number of producer shards (0 or 1 for single-node mode)
-        manifest_path: Optional path to the tar manifest file
-        mode: Build mode - "single" for single-node, "multi" for multi-node producer/consumer
-    """
-    seg_dir = Path(seg_dir)
-    seg_dir.mkdir(parents=True, exist_ok=True)
-    meta_path = seg_dir / BUILD_META_FILE
-    
-    meta = {
-        "num_shards": num_shards,
-        "mode": mode,  # "single" or "multi"
-        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "timestamp": int(time.time()),
-        "hostname": socket.gethostname(),
-        "manifest": manifest_path,
-    }
-    
-    tmp = meta_path.with_suffix(".tmp")
-    with open(tmp, "w") as f:
-        f.write(json.dumps(meta, indent=2))
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except Exception:
-            pass
-    os.replace(tmp, meta_path)
-    _maybe_fsync_dir(meta_path)
-    _eprint(f"[build] Wrote build metadata: mode={mode}, num_shards={num_shards}")
-
-
-def _read_build_meta(seg_dir: Path) -> dict | None:
-    """Read build metadata from segment directory. Returns None if not found."""
-    meta_path = Path(seg_dir) / BUILD_META_FILE
-    if not meta_path.exists():
-        return None
-    try:
-        return json.loads(meta_path.read_text())
-    except Exception as e:
-        _eprint(f"[build] WARNING: could not read {meta_path}: {e}")
-        return None
-
-
-def _has_segment_files(seg_dir: Path) -> bool:
-    """Check if segment directory has any .npz files (indicating prior work)."""
-    seg_dir = Path(seg_dir)
-    if not seg_dir.exists():
-        return False
-    return bool(list(seg_dir.glob("*.npz")) or list(seg_dir.glob(".shard_*_complete")))
-
-
-def _validate_shard_consistency(seg_dir: Path, current_num_shards: int, *, current_mode: str = "single") -> None:
-    """Validate that current shard count and mode match any existing build.
-    
-    Args:
-        seg_dir: Directory containing build metadata and segments
-        current_num_shards: Number of producer shards for this run
-        current_mode: Build mode - "single" for single-node, "multi" for multi-node
-    
-    Raises SystemExit if there's a mismatch to prevent data corruption.
-    """
-    get_runtime()  # ensure SQLITE_DIR and INDICES_DIR are bound for error messages
-    seg_dir = Path(seg_dir)
-    meta = _read_build_meta(seg_dir)
-    has_segments = _has_segment_files(seg_dir)
-    
-    if meta is not None:
-        stored_shards = meta.get("num_shards")
-        stored_mode = meta.get("mode", "single")  # Default to "single" for legacy builds
-        started_at = meta.get("started_at", "unknown")
-        
-        # Check for mode mismatch (prevents resuming multi-node with single-node or vice versa)
-        if stored_mode != current_mode:
-            if stored_mode == "multi" and current_mode == "single":
-                raise SystemExit(
-                    f"\n[ERROR] Build mode mismatch!\n"
-                    f"  Existing build: multi-node ({stored_shards} shards, started {started_at})\n"
-                    f"  Current request: single-node\n"
-                    f"\n"
-                    f"You cannot resume a multi-node build with single-node mode.\n"
-                    f"\n"
-                    f"Options:\n"
-                    f"  1. Resume with multi-node:\n"
-                    f"       sbatch -N{stored_shards + 1} vector_build_multi.sbatch\n"
-                    f"       (N = num_shards + 1 for the consumer node)\n"
-                    f"\n"
-                    f"  2. Start fresh (DELETES ALL EXISTING WORK):\n"
-                    f"       rm -rf {seg_dir}/*\n"
-                    f"       rm -rf {SQLITE_DIR}/*\n"
-                    f"       rm -rf {INDICES_DIR}/*\n"
-                    f"       # Then resubmit your single-node job\n"
-                )
-            elif stored_mode == "single" and current_mode == "multi":
-                raise SystemExit(
-                    f"\n[ERROR] Build mode mismatch!\n"
-                    f"  Existing build: single-node (started {started_at})\n"
-                    f"  Current request: multi-node ({current_num_shards} shards)\n"
-                    f"\n"
-                    f"You cannot resume a single-node build with multi-node mode.\n"
-                    f"\n"
-                    f"Options:\n"
-                    f"  1. Resume with single-node:\n"
-                    f"       sbatch vector_build_single.sbatch\n"
-                    f"\n"
-                    f"  2. Start fresh (DELETES ALL EXISTING WORK):\n"
-                    f"       rm -rf {seg_dir}/*\n"
-                    f"       rm -rf {SQLITE_DIR}/*\n"
-                    f"       rm -rf {INDICES_DIR}/*\n"
-                    f"       # Then resubmit your multi-node job\n"
-                )
-        
-        # Check for shard count mismatch (only relevant for multi-node mode)
-        if current_mode == "multi" and stored_shards is not None and stored_shards != current_num_shards:
-            raise SystemExit(
-                f"\n[ERROR] Shard count mismatch!\n"
-                f"  Existing build: {stored_shards} shards (started {started_at})\n"
-                f"  Current request: {current_num_shards} shards\n"
-                f"\n"
-                f"Options:\n"
-                f"  1. Resume with matching shard count:\n"
-                f"       sbatch -N{stored_shards + 1} vector_build_multi.sbatch\n"
-                f"       (N = num_shards + 1 for the consumer node)\n"
-                f"\n"
-                f"  2. Start fresh (DELETES ALL EXISTING WORK):\n"
-                f"       rm -rf {seg_dir}/*\n"
-                f"       rm -rf {SQLITE_DIR}/*\n"
-                f"       rm -rf {INDICES_DIR}/*\n"
-                f"       # Then resubmit your job\n"
-            )
-        # Mode and shard count match, good to proceed
-        return
-    
-    # No metadata file
-    if has_segments:
-        # Legacy case: segments exist but no metadata
-        _eprint(
-            f"[build] WARNING: Found segment files but no {BUILD_META_FILE}. "
-            f"Assuming current settings (mode={current_mode}, shards={current_num_shards}) are correct. "
-            f"Writing metadata for future runs."
-        )
-        _write_build_meta(seg_dir, current_num_shards, mode=current_mode)
-    # else: Fresh start, metadata will be written by the first producer
-
-
-class ProducerCoordinator:
-    """Manages producer completion signaling for multi-node coordination."""
-    
-    def __init__(self, outdir: Path, shard_id: int, num_shards: int):
-        self.outdir = Path(outdir)
-        self.shard_id = int(shard_id)
-        self.num_shards = int(num_shards)
-        self.marker_file = self.outdir / f".shard_{self.shard_id:02d}_complete"
-    
-    def mark_complete(self):
-        """Signal that this producer shard has finished processing."""
-        self.outdir.mkdir(parents=True, exist_ok=True)
-        tmp = self.marker_file.with_suffix(".tmp")
-        
-        marker_data = {
-            "shard_id": self.shard_id,
-            "num_shards": self.num_shards,
-            "timestamp": time.time(),
-            "hostname": socket.gethostname(),
-            "pid": os.getpid()
-        }
-        
-        with open(tmp, "w") as f:
-            f.write(json.dumps(marker_data, indent=2))
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                pass
-        
-        os.replace(tmp, self.marker_file)
-        _maybe_fsync_dir(self.marker_file)
-        _eprint(f"[producer] Shard {self.shard_id}/{self.num_shards} marked complete")
-
-
-class ConsumerCoordinator:
-    """Manages consumer polling for producer completion in multi-node scenarios."""
-    
-    def __init__(self, outdir: Path, num_shards: int):
-        self.outdir = Path(outdir)
-        self.num_shards = int(num_shards)
-    
-    def count_complete_shards(self) -> int:
-        """Return the number of producer shards that have completed."""
-        if not self.outdir.exists():
-            return 0
-        
-        complete = 0
-        for i in range(self.num_shards):
-            marker = self.outdir / f".shard_{i:02d}_complete"
-            if marker.exists():
-                complete += 1
-        return complete
-    
-    def all_producers_complete(self) -> bool:
-        """Check if all producer shards have completed."""
-        return self.count_complete_shards() == self.num_shards
-    
-    def wait_for_completion(
-        self, 
-        poll_interval: float = 10.0, 
-        timeout: float = 14400.0,
-        progress_callback=None
-    ) -> bool:
-        """Wait for all producers to signal completion.
-        
-        Args:
-            poll_interval: How often to check for completion (seconds)
-            timeout: Maximum time to wait (seconds), default 4 hours
-            progress_callback: Optional function called with (complete, total) each poll
-        
-        Returns:
-            True if all completed within timeout, False if timed out
-        """
-        start = time.time()
-        last_report = 0.0
-        report_interval = 60.0  # Report progress every minute
-        
-        while time.time() - start < timeout:
-            complete = self.count_complete_shards()
-            
-            if progress_callback:
-                progress_callback(complete, self.num_shards)
-            
-            # Periodic progress report
-            now = time.time()
-            if (now - last_report) >= report_interval:
-                _eprint(f"[consumer] Waiting for producers: {complete}/{self.num_shards} complete")
-                last_report = now
-            
-            if complete == self.num_shards:
-                _eprint(f"[consumer] All {self.num_shards} producers complete!")
-                return True
-            
-            time.sleep(poll_interval)
-        
-        complete = self.count_complete_shards()
-        _eprint(f"[consumer] TIMEOUT after {timeout}s: only {complete}/{self.num_shards} producers complete")
-        return False
-
 
 # --- lightweight progress line (stderr), dependency-free ---
 class _Progress:
@@ -1436,75 +1121,6 @@ _PENDING_MARKS = defaultdict(list)
 
 
 
-
-class _ChunkSegmentWriter:
-    """Writes chunk embedding segments to disk using (paper_doc_id, ord) for identification.
-    
-    Format: NPZ with keys:
-      - 'paper_doc_ids': object array of strings (parent paper's doc_id)
-      - 'ords': int32 array (chunk ordinal within paper: -1=title/abstract, 0,1,2...=body)
-      - 'vecs': float16/float32 embedding vectors
-      - 'dim': int32 embedding dimension
-      - 'count': int32 number of vectors
-    
-    The combination (paper_doc_id, ord) uniquely identifies a chunk globally across all shards.
-    File name format: chunks_sh{shard:02d}_{ts}_{seq:06d}.npz
-    """
-
-    def __init__(self, outdir: Path, segment_size: int, dtype: str, shard_id: int):
-        self.outdir = Path(outdir)
-        self.segment_size = int(segment_size)
-        self.dtype = np.float16 if dtype == "fp16" else np.float32
-        self.shard_id = int(shard_id)
-        self.seq = 0
-        self.outdir.mkdir(parents=True, exist_ok=True)
-
-    def _next_path(self) -> Path:
-        ts = int(time.time())
-        p = self.outdir / f"chunks_sh{self.shard_id:02d}_{ts}_{self.seq:06d}.npz"
-        self.seq += 1
-        return p
-
-    def write(self, paper_doc_ids: list[str], ords: list[int], vecs: np.ndarray):
-        """Write chunk embeddings to segment file.
-        
-        Args:
-            paper_doc_ids: List of doc_id strings for each chunk's parent paper
-            ords: List of chunk ordinals (-1 for title/abstract, 0+ for body chunks)
-            vecs: Embedding vectors (N x dim)
-        """
-        if len(paper_doc_ids) == 0:
-            return
-        assert len(paper_doc_ids) == len(ords) == vecs.shape[0], "paper_doc_ids/ords/vecs length mismatch"
-        if vecs.dtype != self.dtype:
-            vecs = vecs.astype(self.dtype, copy=False)
-
-        N = len(paper_doc_ids)
-        for start in range(0, N, self.segment_size):
-            end = min(N, start + self.segment_size)
-            doc_ids_i = np.array(paper_doc_ids[start:end], dtype=object)
-            ords_i = np.array(ords[start:end], dtype=np.int32)
-            vecs_i = np.ascontiguousarray(vecs[start:end])
-            dim = vecs_i.shape[1]
-
-            final = self._next_path()  # e.g., chunks_shXX_<ts>_<seq>.npz
-            tmp = final.with_suffix(final.suffix + ".tmp")
-
-            final.parent.mkdir(parents=True, exist_ok=True)
-            with open(tmp, "wb") as fh:
-                np.savez(
-                    fh, paper_doc_ids=doc_ids_i, ords=ords_i, vecs=vecs_i, 
-                    dim=np.int32(dim), count=np.int32(len(doc_ids_i))
-                )
-                try:
-                    if os.environ.get("LITKIT_SEGMENT_FSYNC_FILE", "1") == "1":
-                        fh.flush()
-                        os.fsync(fh.fileno())
-                except Exception:
-                    pass
-
-            os.replace(tmp, final)  # atomic rename on same filesystem
-            _maybe_fsync_dir(final)
 
 
 def _clear_chunk_trained_flag():
@@ -2414,24 +2030,24 @@ def build_or_update_indices(args):
     seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
     
     # Always validate if segment directory exists with prior work
-    if _has_segment_files(seg_dir) or _read_build_meta(seg_dir) is not None:
-        _validate_shard_consistency(seg_dir, args.num_shards, current_mode=build_mode)
+    if seg_has_segment_files(seg_dir) or seg_read_build_meta(seg_dir) is not None:
+        seg_validate_shard_consistency(seg_dir, args.num_shards, current_mode=build_mode)
     
     # Write build metadata if this is a fresh start
     # For multi-node: producer 0 writes it; for single-node: the writer writes it
     if is_multi_node:
         if args.embed_producer and args.shard_id == 0:
-            meta = _read_build_meta(seg_dir)
+            meta = seg_read_build_meta(seg_dir)
             if meta is None:
                 manifest_path = str(args.tar_manifest) if args.tar_manifest else None
-                _write_build_meta(seg_dir, args.num_shards, manifest_path, mode="multi")
+                seg_write_build_meta(seg_dir, args.num_shards, manifest_path, mode="multi")
     else:
         # Single-node mode: write metadata if fresh start
         if args.faiss_writer:
-            meta = _read_build_meta(seg_dir)
+            meta = seg_read_build_meta(seg_dir)
             if meta is None and not args.init_indices_only:
                 manifest_path = str(args.tar_manifest) if args.tar_manifest else None
-                _write_build_meta(seg_dir, args.num_shards, manifest_path, mode="single")
+                seg_write_build_meta(seg_dir, args.num_shards, manifest_path, mode="single")
 
     # Use shard-specific DB for producers (lock-free parallel writes)
     if args.embed_producer and not args.faiss_writer:
@@ -2485,7 +2101,7 @@ def build_or_update_indices(args):
         paper_index = _faiss_load(PAPER_INDEX_PATH)
         chunk_index = _faiss_load(CHUNK_INDEX_PATH)
         
-        consumer_coordinator = ConsumerCoordinator(seg_dir, args.num_shards)
+        consumer_coordinator = SegConsumerCoordinator(seg_dir, args.num_shards)
         
         def progress_callback(complete, total):
             _eprint(f"[consumer] Progress: {complete}/{total} producers complete")
@@ -3430,7 +3046,7 @@ def build_or_update_indices(args):
     # Write completion marker for producer
     if args.embed_producer:
         seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
-        producer_coordinator = ProducerCoordinator(seg_dir, args.shard_id, args.num_shards)
+        producer_coordinator = SegProducerCoordinator(seg_dir, args.shard_id, args.num_shards)
         producer_coordinator.mark_complete()
         _eprint(f"[producer] Shard {args.shard_id}/{args.num_shards} marked complete")
 
@@ -4704,8 +4320,9 @@ def main():
         except Exception:
             return False
 
-    # Make all later db_connect_db() calls honor the user's timeout setting:
-    DEFAULT_BUSY_TIMEOUT_MS = int(args.sqlite_busy_timeout_ms)
+    # Make all later db_connect_db() calls honor the user's timeout setting
+    # by setting the env var that litkit.db.connection reads:
+    os.environ["LITKIT_SQLITE_BUSY_TIMEOUT_MS"] = str(args.sqlite_busy_timeout_ms)
 
     # Do we need tar shards?
     # Note: --consume-only doesn't need corpus (it only ingests pre-computed segments)
@@ -4878,14 +4495,14 @@ def main():
         outdir = args.embed_outdir or EMBED_SEGMENTS_DIR
         # producer_id = f"{socket.gethostname()}-{os.getpid()}"
 
-        paper_seg_writer = _SegmentWriter(
+        paper_seg_writer = SegmentWriter(
             outdir=outdir,
             segment_size=DEFAULT_EMBED_SEGMENT_SIZE,
             dtype=DEFAULT_EMBED_SEGMENT_DTYPE,
             shard_id=args.shard_id,
             kind="papers",
         )
-        chunk_seg_writer = _ChunkSegmentWriter(
+        chunk_seg_writer = ChunkSegmentWriter(
             outdir=outdir,
             segment_size=DEFAULT_EMBED_SEGMENT_SIZE,
             dtype=DEFAULT_EMBED_SEGMENT_DTYPE,
