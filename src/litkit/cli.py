@@ -204,6 +204,10 @@ def _maybe_cleanup_own_stale_guard():
 
 
 def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
+    """Create a writer guard file or exit if another writer is active.
+    
+    Uses a bounded retry loop (max 2 attempts) to handle stale guard cleanup.
+    """
     get_runtime()  # ensure WRITER_GUARD is bound
     _maybe_cleanup_own_stale_guard()
     if not getattr(args, "faiss_writer", False):
@@ -218,53 +222,61 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
         except Exception:
             pass
 
-    try:
-        fd = os.open(WRITER_GUARD, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(
-            fd, f"{os.getpid()} {socket.gethostname()} {int(time.time())}\n".encode()
-        )
+    max_attempts = 2  # initial try + one retry after stale cleanup
+    for attempt in range(max_attempts):
         try:
-            os.fsync(fd)
-        except Exception:
-            pass
-        os.close(fd)
-        atexit.register(_cleanup_guard)
-        try:
-            if threading.current_thread() is threading.main_thread():
-                # ensure guard is removed, then hard-exit the process safely
-                signal.signal(signal.SIGINT,  lambda *_: (_cleanup_guard(), os._exit(1)))
-                signal.signal(signal.SIGTERM, lambda *_: (_cleanup_guard(), os._exit(1)))
-        except Exception:
-            pass
-    except FileExistsError:
-        info = "unknown"
-        try:
-            info = Path(WRITER_GUARD).read_text().strip()
-            parts = info.split()
-            # ts = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
-            ts = 0
-            if len(parts) >= 3:
-                try: ts = int(parts[2])
-                except ValueError: ts = 0
-            if ts and (time.time() - ts) > ttl_sec:
-                _eprint(f"[writer] Guard appears stale (> {ttl_sec}s): {info}. Attempting exclusive cleanup.")
-                try:
-                    stale = WRITER_GUARD.with_suffix(".guard.stale."+str(os.getpid()))
-                    # Atomic claim: if this replace fails, someone else is cleaning.
-                    os.replace(WRITER_GUARD, stale)
-                    stale.unlink(missing_ok=False)
-                    # success: retry once non-recursively
-                    return _create_writer_guard_or_exit(args, ttl_sec=ttl_sec)
-                except Exception as e:
-                    _eprint(f"[writer] ERROR: failed to remove guard: {e}.")
-                    sys.exit(2)
-        except Exception:
-            pass
-        sys.stderr.write(
-            f"[writer] Another FAISS writer appears active (guard {WRITER_GUARD} exists: {info}).\n"
-            "Stop the other job or remove the stale guard if you are sure it is dead.\n"
-        )
-        sys.exit(2)
+            fd = os.open(WRITER_GUARD, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(
+                fd, f"{os.getpid()} {socket.gethostname()} {int(time.time())}\n".encode()
+            )
+            try:
+                os.fsync(fd)
+            except Exception:
+                pass
+            os.close(fd)
+            atexit.register(_cleanup_guard)
+            try:
+                if threading.current_thread() is threading.main_thread():
+                    # ensure guard is removed, then hard-exit the process safely
+                    signal.signal(signal.SIGINT,  lambda *_: (_cleanup_guard(), os._exit(1)))
+                    signal.signal(signal.SIGTERM, lambda *_: (_cleanup_guard(), os._exit(1)))
+            except Exception:
+                pass
+            return  # Success - guard created
+        except FileExistsError:
+            info = "unknown"
+            stale_cleaned = False
+            try:
+                info = Path(WRITER_GUARD).read_text().strip()
+                parts = info.split()
+                ts = 0
+                if len(parts) >= 3:
+                    try: ts = int(parts[2])
+                    except ValueError: ts = 0
+                # Only attempt cleanup on first attempt and if guard is stale
+                if ts and (time.time() - ts) > ttl_sec and attempt == 0:
+                    _eprint(f"[writer] Guard appears stale (> {ttl_sec}s): {info}. Attempting exclusive cleanup.")
+                    try:
+                        stale = WRITER_GUARD.with_suffix(".guard.stale."+str(os.getpid()))
+                        # Atomic claim: if this replace fails, someone else is cleaning.
+                        os.replace(WRITER_GUARD, stale)
+                        stale.unlink(missing_ok=False)
+                        stale_cleaned = True  # retry once via continue
+                    except Exception as e:
+                        _eprint(f"[writer] ERROR: failed to remove guard: {e}.")
+                        sys.exit(2)
+            except Exception:
+                pass
+            
+            if stale_cleaned:
+                continue  # Retry exactly once after successful cleanup
+            
+            # Not stale, or already retried, or couldn't determine staleness
+            sys.stderr.write(
+                f"[writer] Another FAISS writer appears active (guard {WRITER_GUARD} exists: {info}).\n"
+                "Stop the other job or remove the stale guard if you are sure it is dead.\n"
+            )
+            sys.exit(2)
 
 # -- Paths / offline env --
 
