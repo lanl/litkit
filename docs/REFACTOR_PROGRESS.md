@@ -405,18 +405,259 @@ Investigated whether cli.py's `_add_ids_union_compat` fallback is still needed:
 3. **Conclusion:** The cli.py `_add_ids_union_compat` is effectively dead code.
    Safe to remove along with the local `_ingest_*` functions.
 
-## Next Steps (Phase 5)
+## Completed 2024-12-18 (Session 3)
 
-1. **Immediate:**
-   - Remove `_ingest_paper_segments`, `_ingest_chunk_segments`, `_add_ids_union_compat` from cli.py (~400 lines)
-   - Test with `./test_build.sh --clean`
+### Removed Dead Code
 
-2. **Final Cleanup:**
-   - Remove the SCOPE CONTRACT comment block once cli.py is stable
-   - Final lint and test pass
-   - Update module docstrings
+**Commit `06bea4d`:** `refactor(cli): remove dead _ingest_* and _add_ids_union_compat code (-374 lines)`
 
-3. **Future Extraction Candidates:**
-   - Move citation normalization to `litkit.formatting.answers`
-   - Move lexical search helpers to `litkit.db.queries`
-   - Extract `build_or_update_indices` to `litkit.build` module
+Removed dead code from cli.py now that segment ingestion uses the module:
+- `_ingest_paper_segments()` (~150 lines) - REMOVED
+- `_ingest_chunk_segments()` (~160 lines) - REMOVED
+- `_add_ids_union_compat()` (~18 lines) - REMOVED
+- All `except RuntimeError` fallback blocks referencing `_add_ids_union_compat`
+
+cli.py: 4054 → 3680 lines (-374 lines, 9.2% reduction)
+
+---
+
+## Phase 6: Extract `build_or_update_indices` to `litkit.build` Module
+
+### Overview
+
+The `build_or_update_indices()` function (~750 lines) is the main orchestrator for:
+1. Index bootstrap (`--init-indices-only`)
+2. Consumer mode (`--consume-only`)
+3. IVF-PQ training (when chunks index is new)
+4. Tar scanning & article ingestion
+5. Final buffer flush
+6. SQLite/FAISS reconciliation
+
+This section documents the extraction plan.
+
+### Target Module Structure
+
+```
+litkit/build/
+├── __init__.py        # Re-exports: build_or_update_indices, BuildConfig
+├── config.py          # BuildConfig dataclass (from args namespace)
+├── helpers.py         # pack_paragraphs, dedupe, ensure_parent, etc.
+├── backfill.py        # backfill_unindexed_vectors, reconcile, sanity_check
+├── training.py        # IVF-PQ training logic
+└── orchestrator.py    # build_or_update_indices (main entry point)
+```
+
+### Function Signatures (Target)
+
+```python
+# litkit/build/orchestrator.py
+def build_or_update_indices(
+    cfg: BuildConfig,
+    *,
+    paper_seg_writer: SegmentWriter | None = None,
+    chunk_seg_writer: ChunkSegmentWriter | None = None,
+) -> None:
+    ...
+
+# litkit/build/training.py
+def train_chunks_ivfpq(
+    *,
+    chunk_index: faiss.Index,
+    chunk_embedder: Embedder,
+    cfg: BuildConfig,
+    tar_paths: Sequence[Path],
+) -> faiss.Index:
+    """Returns new trained index (or FLAT fallback). Does NOT save to disk."""
+    ...
+```
+
+### Phased Extraction Plan
+
+#### Phase 6.1: Extract Helpers + Backfill
+
+**Functions to move to `litkit.build.helpers`:**
+- `pack_paragraphs()` (~30 lines) - text chunking
+- `_dedupe_papers_with_doc_ids()` (~15 lines)
+- `_dedupe_chunks_with_doc_ids()` (~15 lines)
+- `_effective_nlist()` (~15 lines) - already in litkit.index.training, verify usage
+- `_ensure_parent()` (~3 lines)
+- `_clear_chunk_trained_flag()` (~8 lines)
+- `_maybe_fsync_dir()` (~10 lines)
+
+**Functions to move to `litkit.build.backfill`:**
+- `backfill_unindexed_vectors()` (~50 lines)
+- `reconcile_sqlite_flags_with_faiss()` (~40 lines)
+- `_post_build_sanity_check()` (~25 lines)
+
+**Technical debt to fix during this phase:**
+- **Kill `_PENDING_MARKS`**: Either wire it properly into backfill/reconciliation,
+  or drop it and rely on `reconcile_sqlite_flags_with_faiss()` + backfill to repair.
+  *Recommendation: Remove it.*
+- **De-globalize locks**: `backfill_unindexed_vectors()` and `reconcile_sqlite_flags_with_faiss()`
+  should accept lock paths or a lock factory as parameters, not reach into cli.py.
+
+**Restart point:** After this phase, helpers and backfill are modular; orchestrator
+still in cli.py. Safe to commit and resume later.
+
+#### Phase 6.2: Create BuildConfig Dataclass
+
+**Create `litkit/build/config.py`:**
+```python
+@dataclass
+class BuildConfig:
+    # Paths (from WorkspacePaths)
+    db_path: Path
+    paper_index_path: Path
+    chunk_index_path: Path
+    sqlite_dir: Path
+    embed_segments_dir: Path
+    ckpt_path: Path
+    chunk_trained_flag: Path
+    db_lock: Path
+    faiss_lock: Path
+    ckpt_lock: Path
+    
+    # Build mode flags
+    rebuild: bool
+    update: bool
+    build_only: bool
+    consume_only: bool
+    init_indices_only: bool
+    faiss_writer: bool
+    embed_producer: bool
+    consume_segments: bool
+    
+    # Sharding
+    shard_id: int
+    num_shards: int
+    
+    # Index params
+    papers_index: str  # "hnsw" | "flat"
+    chunks_index: str  # "ivfpq" | "flat"
+    hnsw_m: int
+    efconstruction: int
+    efsearch: int
+    ivf_nlist: int
+    pq_m: int
+    nprobe: int | None
+    
+    # Embedding
+    embed_devices: str
+    embed_workers: int
+    paper_embed_bs: int
+    chunk_embed_bs: int
+    
+    # Chunking
+    chunk_target_chars: int
+    chunk_min_chars: int
+    chunk_overlap: int
+    
+    # SQLite
+    sqlite_journal_mode: str
+    sqlite_busy_timeout_ms: int
+    
+    # Corpus
+    tar_dir: Path | None
+    tar_manifest: Path | None
+    embed_outdir: Path | None
+    
+    # Misc
+    quiet: bool
+    
+    @classmethod
+    def from_args(cls, args, runtime: WorkspacePaths) -> "BuildConfig":
+        ...
+```
+
+**Technical debt to fix during this phase:**
+- **Lazy path globals vs library use**: `BuildConfig.from_args()` takes `WorkspacePaths`
+  explicitly. The build module no longer relies on cli's lazy globals.
+
+**Restart point:** Config dataclass ready; orchestrator still in cli.py.
+
+#### Phase 6.3: Extract IVF-PQ Training
+
+**Create `litkit/build/training.py`:**
+- Move the ~200-line training block into `train_chunks_ivfpq()`
+- Return trained index; let orchestrator handle persistence
+- Clear interface: chunk_index, embedder, config, tar_paths → trained index
+
+**Restart point:** Training logic modular; main orchestrator still in cli.py.
+
+#### Phase 6.4: Extract Main Orchestrator
+
+**Create `litkit/build/orchestrator.py`:**
+- Move `build_or_update_indices()` with explicit parameters
+- Move `iter_tar_articles()` helper (or keep in cli.py as it's also used elsewhere)
+- Inject segment writers as parameters (no globals)
+
+**Technical debt to fix during this phase:**
+- **CLI flag compatibility checking**: Explicitly reject invalid combinations
+  (e.g., `--embed-producer + --faiss-writer` if not well-defined)
+- **Centralize role logic**: Single node writer / multi-node producers / consumer-only
+  should be determined in one place
+
+**Final signature:**
+```python
+# cli.py main()
+from litkit.build import build_or_update_indices, BuildConfig
+
+cfg = BuildConfig.from_args(args, get_runtime())
+build_or_update_indices(
+    cfg,
+    paper_seg_writer=paper_seg_writer,
+    chunk_seg_writer=chunk_seg_writer,
+)
+```
+
+### Known Technical Debt
+
+**To address during extraction:**
+
+| Issue | Description | Phase |
+|-------|-------------|-------|
+| `_PENDING_MARKS` semantics | `defaultdict(list)` populated but marks never flushed reliably | 6.1 |
+| `_auto_top_papers` leak | Opens DB connection, doesn't close on all paths | Fix immediately in cli.py |
+| Lazy path globals | `DB_PATH`, `PAPER_INDEX_PATH` etc. as magical globals | 6.2 |
+| FileLock coupling | cli.py subclass binds paths; should be in `litkit.concurrent` | 6.1 |
+| Flag incompatibility | `--embed-producer + --faiss-writer` semantics unclear | 6.4 |
+
+### FileLock Migration Plan
+
+**Current state (cli.py):**
+```python
+class FileLock(_FileLockBase):
+    def __init__(self, path: Path):
+        get_runtime()  # triggers lazy globals
+        super().__init__(path, db_lock_path=DB_LOCK, faiss_lock_path=FAISS_LOCK)
+```
+
+**Target state:**
+1. `litkit.concurrent.FileLock` accepts optional `db_lock_path`, `faiss_lock_path`
+2. cli.py provides factory helpers after `get_runtime()`:
+   ```python
+   def make_file_lock(path: Path) -> FileLock:
+       return FileLock(path, db_lock_path=DB_LOCK, faiss_lock_path=FAISS_LOCK)
+   ```
+3. `litkit.build` accepts paths or lock factory; constructs `FileLock` locally
+
+### Restart Points Summary
+
+| After Phase | State | Can Resume? |
+|-------------|-------|-------------|
+| 6.1 | Helpers + backfill in module; orchestrator in cli.py | ✅ |
+| 6.2 | BuildConfig ready; orchestrator in cli.py | ✅ |
+| 6.3 | Training extracted; orchestrator in cli.py | ✅ |
+| 6.4 | Fully extracted; cli.py is thin | ✅ |
+
+---
+
+## Current Status
+
+**cli.py is now 3680 lines** (down from ~4723 at start of session).
+
+### Next Immediate Steps
+
+1. **Fix `_auto_top_papers` leak** - trivial fix, do immediately
+2. **Begin Phase 6.1** - create `litkit/build/` skeleton, move helpers
+3. **Test after each sub-phase** with `./test_build.sh --clean`
