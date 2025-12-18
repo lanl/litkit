@@ -170,7 +170,8 @@ class WorkspacePaths:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         os.environ.setdefault("LITKIT_SEGMENT_FSYNC_DIR", "1")
         # SQLite busy timeout (in ms) - CLI can override via --sqlite-busy-timeout-ms
-        os.environ.setdefault("LITKIT_SQLITE_BUSY_TIMEOUT_MS", "30000")
+        # Use 120s default for shared NFS/Lustre filesystems
+        os.environ.setdefault("LITKIT_SQLITE_BUSY_TIMEOUT_MS", "120000")
     
     def shard_db_path(self, shard_id: int) -> Path:
         """Return path to shard-specific SQLite database for producer mode."""

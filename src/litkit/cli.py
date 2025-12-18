@@ -286,42 +286,8 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
             sys.exit(2)
 
 # -- Paths / offline env --
-
-
-def _find_root() -> Path:
-    """Return repo root.
-    Preference:
-    1) LITKIT_ROOT
-    2) CWD or its parents containing .git or pyproject.toml
-    3) Package path or its parents containing .git or pyproject.toml
-    4) CWD if it has src/litkit
-    5) site-packages parent (last resort)
-    """
-    env = os.getenv("LITKIT_ROOT")
-    if env:
-        return Path(env).expanduser().resolve()
-
-    here = Path(__file__).resolve().parent
-    cwd = Path.cwd().resolve()
-
-    for p in [cwd] + list(cwd.parents):
-        if (p / ".git").exists() or (p / "pyproject.toml").exists():
-            return p
-    for p in [here] + list(here.parents):
-        if (p / ".git").exists() or (p / "pyproject.toml").exists():
-            return p
-    if (cwd / "src" / "litkit").exists():
-        return cwd
-    try:
-        return here.parents[1]
-    except IndexError:
-        return here
-
-
-def _resolve_workspace(root: Path) -> Path:
-    """Return path to the workspace directory."""
-    ws = os.getenv("LITKIT_WORKSPACE")
-    return Path(ws).expanduser().resolve() if ws else (root / "workspace").resolve()
+# Path discovery and workspace configuration now delegated to litkit.config.paths
+from litkit.config.paths import WorkspacePaths
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -332,33 +298,11 @@ def _resolve_workspace(root: Path) -> Path:
 # Access any path constant (e.g., SQLITE_DIR) to trigger initialization.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-from dataclasses import dataclass
-
-@dataclass(frozen=True)
-class _Runtime:
-    """Immutable container for lazily-initialized runtime paths."""
-    root: Path
-    workspace: Path
-    hf_home: Path
-    sqlite_dir: Path
-    indices_dir: Path
-    embed_segments_dir: Path
-    db_path: Path
-    ckpt_path: Path
-    db_lock: Path
-    faiss_lock: Path
-    writer_guard: Path
-    paper_index_path: Path
-    chunk_index_path: Path
-    chunk_trained_flag: Path
-    ckpt_lock: Path
-
-
-_runtime: _Runtime | None = None
+_runtime: WorkspacePaths | None = None
 _runtime_lock = threading.Lock()
 
 
-def get_runtime() -> _Runtime:
+def get_runtime() -> WorkspacePaths:
     """Thread-safe lazy initialization of runtime paths and directories.
     
     Side effects (first call only):
@@ -367,7 +311,7 @@ def get_runtime() -> _Runtime:
     - Populates module-level globals (ROOT, WORKSPACE, DB_PATH, etc.)
     
     Returns:
-        _Runtime: Immutable container with all path constants.
+        WorkspacePaths: Immutable container with all path constants.
     """
     global _runtime
     if _runtime is not None:
@@ -382,35 +326,15 @@ def get_runtime() -> _Runtime:
         return _runtime
 
 
-def _init_runtime() -> _Runtime:
+def _init_runtime() -> WorkspacePaths:
     """Perform all one-time initialization. Called only by get_runtime()."""
-    root = _find_root()
-    workspace = _resolve_workspace(root)
-    
-    hf_home = workspace / "hf_cache"
-    sqlite_dir = workspace / "sqlite"
-    indices_dir = workspace / "indices"
-    embed_segments_dir = workspace / "emb_segments"
+    paths = WorkspacePaths.from_env_or_default()
     
     # Set environment variables (safe defaults for HPC/offline use)
-    os.environ.setdefault("HF_HOME", str(hf_home))
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    os.environ.setdefault("LITKIT_SEGMENT_FSYNC_DIR", "1")
+    paths.setup_environment()
     
     # Create required directories
-    try:
-        sqlite_dir.mkdir(parents=True, exist_ok=True)
-        indices_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        sys.stderr.write(
-            f"[paths] ERROR: cannot create {sqlite_dir} or {indices_dir}: {e}\n"
-            "[paths] Set LITKIT_WORKSPACE to a writable Lustre/NFS path and re-run.\n"
-        )
-        sys.exit(2)
-    
-    db_filename = os.environ.get("LITKIT_DB_FILE", "litkit.sqlite3")
+    paths.ensure_directories()
     
     # Set deterministic FAISS seed (deferred from import-time for import purity)
     try:
@@ -419,23 +343,7 @@ def _init_runtime() -> _Runtime:
     except Exception:
         pass
     
-    return _Runtime(
-        root=root,
-        workspace=workspace,
-        hf_home=hf_home,
-        sqlite_dir=sqlite_dir,
-        indices_dir=indices_dir,
-        embed_segments_dir=embed_segments_dir,
-        db_path=sqlite_dir / db_filename,
-        ckpt_path=sqlite_dir / "build_checkpoint.json",
-        db_lock=sqlite_dir / "db.writer.lock",
-        faiss_lock=sqlite_dir / "faiss.writer.lock",
-        writer_guard=sqlite_dir / "faiss_writer.guard",
-        paper_index_path=indices_dir / "papers.faiss",
-        chunk_index_path=indices_dir / "chunks.faiss",
-        chunk_trained_flag=indices_dir / "chunks.trained.json",
-        ckpt_lock=sqlite_dir / "ckpt.writer.lock",
-    )
+    return paths
 
 
 # Backward compatibility: module-level __getattr__ for lazy path access
