@@ -40,6 +40,7 @@ The following modules have been extracted from `cli.py`:
 - `metadata.py` - Build metadata for shard consistency
 - `coordination.py` - ProducerCoordinator, ConsumerCoordinator classes
 - `ingest.py` - Segment ingestion functions
+- `checkpoint.py` - Per-shard checkpoint management (NEW - 2024-12-17)
 - Re-exported via `__init__.py`
 
 #### 5. `litkit.ingest` - Tar/XML ingestion
@@ -113,6 +114,41 @@ the consumer couldn't resolve the new doc_id against the merged DB.
 - Updated all buffer appends to use `canon_doc_id` instead of raw path
 - Added `missing` counter and WARNING log in segment ingestion functions
 
+### Phase 3.6: Multi-Process Checkpoint Safety (COMPLETE - 2024-12-17)
+
+Fixed the "last writer wins" checkpoint bug in multi-node builds:
+
+#### The Bug
+Multiple producer processes shared a single checkpoint file. Each process:
+1. Loaded the checkpoint once at start
+2. Mutated its local copy during processing
+3. Wrote the entire dict back under a lock
+
+This caused **checkpoint data loss**: Shard 0 writes `{"/tar0": 500}`, then Shard 1
+(which loaded `{}`) writes `{"/tar1": 500}` → overwrites `/tar0` entry. On restart,
+those tars would be re-scanned from zero.
+
+#### The Fix
+1. **Per-shard checkpoints**: Each producer writes to `build_checkpoint_shard_XX.json`
+   - No conflicts between producers
+   - Each shard owns its own checkpoint file completely
+
+2. **New checkpoint module**: `litkit/segments/checkpoint.py`
+   - `shard_ckpt_path(sqlite_dir, shard_id)` - per-shard path helper
+   - `load_checkpoint(ckpt_path, shard_id=None)` - load shared or per-shard
+   - `save_checkpoint(..., shard_id=None)` - save to shared or per-shard
+   - `clear_shard_checkpoints(sqlite_dir, num_shards)` - cleanup on resharding
+
+3. **Resharding support**: When shard count changes (M→N), the code now:
+   - WARNs instead of ERRORs
+   - Clears invalidated per-shard checkpoint files
+   - Falls back to DB-based resume (`already_processed()` checks)
+   - Updates build metadata to reflect new shard count
+
+#### Commits
+- `fd41c14`: Add per-shard checkpoint module (WIP)
+- `f709070`: Wire up per-shard checkpoints in build_or_update_indices
+
 ### Dead Code Removal (PARTIAL - 2024-12-17)
 
 Removed unused local implementations that were shadowed by imported versions:
@@ -125,7 +161,8 @@ The multi-node build architecture works correctly:
 
 1. **Producers** (N nodes): 
    - Each writes to shard-specific SQLite DB (`shard_XX.sqlite3`)
-   - Outputs embedding segments with content-addressed `doc_id` (globally unique file path)
+   - Each writes to shard-specific checkpoint (`build_checkpoint_shard_XX.json`)
+   - Outputs embedding segments with content-addressed `doc_id`
    - Uses DB's canonical `doc_id` when reusing existing paper rows
    - Marks completion via `.shard_XX_complete` marker files
 
@@ -138,25 +175,35 @@ The multi-node build architecture works correctly:
 
 ## Remaining Work
 
-### Phase 4: Dead Code Removal (PARTIALLY COMPLETE)
+### Phase 4: Dead Code Removal (IN PROGRESS)
 
-cli.py still contains ~350+ lines of local implementations that duplicate the
-extracted modules. These should be removed:
+cli.py still contains local implementations that duplicate the extracted modules.
+These should be removed to shrink cli.py toward its ~500 line target:
 
-**Remaining DB helpers to remove from cli.py:**
-- `_IngestContext` class and methods
+**Checkpoint functions (ready to remove):**
+- ✅ `load_checkpoint()` - now using `seg_load_checkpoint()`
+- ✅ `save_checkpoint()` - now using `seg_save_checkpoint()`
+- Note: Local versions still exist but only `seg_*` versions are called
+
+**Segment classes (ready to remove):**
+- `_SegmentWriter` - duplicates `litkit.segments.writer.SegmentWriter`
+- `_ChunkSegmentWriter` - duplicates `litkit.segments.writer.ChunkSegmentWriter`
+- `ProducerCoordinator` - duplicates `litkit.segments.coordination`
+- `ConsumerCoordinator` - duplicates `litkit.segments.coordination`
+
+**Metadata functions (ready to remove):**
+- `_write_build_meta()` - duplicates `litkit.segments.metadata.write_build_meta`
+- `_read_build_meta()` - duplicates `litkit.segments.metadata.read_build_meta`
+- `_validate_shard_consistency()` - duplicates `litkit.segments.metadata.validate_shard_consistency`
+- `_has_segment_files()` - duplicates `litkit.segments.metadata.has_segment_files`
+
+**DB helpers (still used - need careful removal):**
 - `SCHEMA`, `init_db()`, `init_shard_db()`
 - `_ensure_in_index_columns()`, `_shard_db_path()`, `_list_shard_dbs()`
 - `merge_shard_databases()`, `_connect_db()`
 - `_ensure_temp_candidates_table()`, `_load_temp_candidates()`
 - `already_processed()`, `register_file()`
 - `preload_paper_id_map()`, `preload_chunk_id_map()`
-
-**Index helpers to remove:**
-- Various FAISS wrappers that duplicate `litkit.index`
-
-**Segment helpers to remove:**
-- `_SegmentWriter`, `_ChunkSegmentWriter` that duplicate `litkit.segments`
 
 ### Phase 5: Final Cleanup (NOT STARTED)
 
@@ -183,7 +230,7 @@ litkit/
 ├── concurrent/         # Locking primitives
 ├── db/                 # All SQLite operations
 ├── index/              # All FAISS operations
-├── segments/           # Embedding segment I/O
+├── segments/           # Embedding segment I/O + checkpoints
 ├── ingest/             # Tar/XML parsing
 ├── pipeline/           # Build pipeline logic
 ├── embeddings/         # (existing) Embedding models
@@ -206,21 +253,20 @@ See git log for detailed commit history. Key commits:
 - Phase 2: Import-time purity  
 - Phase 3: Schema fixes and DB module integration (2024-12-17)
 - Phase 3.5: doc_id canonicalization fix (2024-12-17)
+- Phase 3.6: Per-shard checkpoint module (`fd41c14`, `f709070`) (2024-12-17)
 
 ## Suggested Next Task
 
-**End-to-end validation with sample data**
+**Dead Code Removal: Segment Classes**
 
-The code changes are complete but untested on real data. Before continuing with
-dead code removal, validate the build pipeline works:
+Remove local duplicates from cli.py that are now imported from extracted modules:
 
-```bash
-# Single-node build test
-python -m litkit --build-only --faiss-writer \
-  --tar-manifest workspace/tiny_test.manifest
+1. Remove local `load_checkpoint()` and `save_checkpoint()` (only `seg_*` versions are called)
+2. Remove local `_SegmentWriter` and `_ChunkSegmentWriter` classes
+3. Remove local `ProducerCoordinator` and `ConsumerCoordinator` classes
+4. Remove local `_write_build_meta()`, `_read_build_meta()`, `_validate_shard_consistency()`, `_has_segment_files()`
+5. Import and use versions from `litkit.segments` throughout
 
-# Verify query works
-python -m litkit "What is BioNetGen?" --no-llm
-```
+**Estimated reduction:** ~400-600 lines from cli.py
 
-If builds pass, proceed with Phase 4 (dead code removal) to shrink cli.py.
+This directly advances Jobs 5 (Locking) and 6 (Segments) in REFACTOR_ROADMAP.md.
