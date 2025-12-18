@@ -329,15 +329,45 @@ Replaced local `eprint`, `Progress`, `Pulse`, `phase` with imports from `litkit.
 - `_normalize_and_strip_citations()` (~40 lines) - preprocessing step before existing module
 - `_faiss_search()`, `_temporary_search_params()` (~40 lines) - thin wrappers
 
-### Summary
+### Bug Fixes (Post-Wiring)
+
+After the main refactoring, three runtime bugs were discovered during build testing:
+
+#### 5. Dead Code Reference (-7 lines)
+**Commit:** `fix(cli): remove dead _ADVISORY_LOCK_DISABLED code after FileLock refactor`
+
+The `_ADVISORY_LOCK_DISABLED` and `_ADVISORY_LOCK_NOTICE_PRINTED` variables were
+referenced in `main()` but never defined after the FileLock code was moved to
+`litkit.concurrent`. The locking fallback logic is now handled internally by the
+`FileLock` class.
+
+#### 6. Underscore-Prefixed Function Calls (59 replacements)
+**Commit:** `fix(cli): remove underscore prefixes from FAISS function calls`
+
+When the FAISS functions were imported from `litkit.index`, the imports used
+non-underscore names (e.g., `hnsw_index`), but 58+ call sites still used the old
+underscore-prefixed names (e.g., `_hnsw_index`). Fixed via sed replacement.
+
+#### 7. Missed extract_ivf Call
+**Commit:** `fix(cli): _extract_ivf -> extract_ivf`
+
+One additional underscore-prefixed call (`_extract_ivf`) was missed in the initial
+sed replacement.
+
+### Final Summary
 
 | Metric | Before | After | Change |
 |--------|--------|-------|--------|
-| cli.py lines | 4723 | 4066 | -657 |
+| cli.py lines | 4723 | ~4059 | **-664 (14%)** |
 | FAISS local defs | 17 | 0 | -17 |
 | Progress local defs | 4 | 0 | -4 |
 | FileLock local | 1 | 0 (wrapper) | -1 |
 | Runtime/paths local | 3 | 0 | -3 |
+
+### Build Validation
+- ✅ Import smoke test passes (`python -c "import litkit.cli"`)
+- ✅ Mac local build completes successfully (`./test_build.sh --clean --verbose`)
+- Note: `[faiss] remove_ids not supported` warning is expected and harmless (HNSW indices don't support ID removal)
 
 ## Next Steps (Phase 5)
 
