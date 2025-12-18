@@ -97,6 +97,12 @@ from litkit.progress import (
     Pulse as _Pulse,
     phase as _phase,
 )
+from litkit.concurrent import (
+    FileLock as _FileLockBase,
+    FLOCK_AVAILABLE,
+    in_faiss_lock as _in_faiss_lock,
+    in_db_lock as _in_db_lock,
+)
 from litkit.embeddings.devices import configure_threads, detect_device
 from litkit.embeddings.factory import make_chunk_embedder, make_paper_embedder
 from litkit.formatting.answers import (
@@ -177,32 +183,6 @@ from litkit.segments import (
 )
 
 
-_FAISS_LOCK_DEPTH = threading.local()
-
-def _faiss_lock_enter():
-    _FAISS_LOCK_DEPTH.n = getattr(_FAISS_LOCK_DEPTH, "n", 0) + 1
-
-def _faiss_lock_exit():
-    _FAISS_LOCK_DEPTH.n = max(0, getattr(_FAISS_LOCK_DEPTH, "n", 0) - 1)
-
-def _in_faiss_lock() -> bool:
-    return getattr(_FAISS_LOCK_DEPTH, "n", 0) > 0
-
-_DB_LOCK_DEPTH = threading.local()
-
-def _db_lock_enter():  _DB_LOCK_DEPTH.n = getattr(_DB_LOCK_DEPTH, "n", 0) + 1
-def _db_lock_exit():   _DB_LOCK_DEPTH.n = max(0, getattr(_DB_LOCK_DEPTH, "n", 0) - 1)
-def _in_db_lock() -> bool: return getattr(_DB_LOCK_DEPTH, "n", 0) > 0
-
-
-# fcntl is not available on Windows
-try:
-    import fcntl
-
-    FLOCK_AVAILABLE = True
-except ModuleNotFoundError:
-    fcntl = None
-    FLOCK_AVAILABLE = False
 
 # logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
@@ -525,61 +505,16 @@ DEFAULT_BUSY_TIMEOUT_MS = int(os.environ.get("LITKIT_SQLITE_BUSY_TIMEOUT_MS", "1
 PROMPT_HEADROOM_TOKENS = int(os.environ.get("LITKIT_PROMPT_HEADROOM_TOKENS", "200"))
 
 
-class FileLock:
+# FileLock wrapper that binds the DB_LOCK and FAISS_LOCK paths at runtime
+# for lock depth tracking. Uses litkit.concurrent.FileLock as the base.
+class FileLock(_FileLockBase):
+    """File lock with runtime binding of DB_LOCK and FAISS_LOCK paths."""
     def __init__(self, path: Path):
-        self.path = path
-        self._fd = None
-        self._faiss_depth_bumped = False  # only for our FAISS depth counter
-
-    def __enter__(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = open(self.path, "w")
-
-        acquired = True
-        if FLOCK_AVAILABLE and fcntl is not None:
-            try:
-                fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX)
-            except OSError as e:
-                # Treat ENOTSUP/EOPNOTSUPP as “best-effort” (no advisory locking),
-                # but continue as if acquired.
-                if e.errno not in (getattr(errno, "ENOTSUP", 95), getattr(errno, "EOPNOTSUPP", 95)):
-                    raise
-                _eprint(f"[lock] WARNING: flock unsupported on {self.path}; proceeding best-effort.")
-                globals()["_ADVISORY_LOCK_DISABLED"] = True
-
-        # Always bump our logical counters if we ‘acquired’ (best-effort counts as acquired)
-        if self.path == DB_LOCK:
-            _db_lock_enter()
-        if self.path == FAISS_LOCK:
-            _faiss_lock_enter()
-            self._faiss_depth_bumped = True
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        try:
-            # Always try to unlock the OS file lock if available.
-            if FLOCK_AVAILABLE and fcntl is not None:
-                try:
-                    fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
-                except OSError as e:
-                    if e.errno not in (getattr(errno, "ENOTSUP", 95), getattr(errno, "EOPNOTSUPP", 95)):
-                        raise
-        finally:
-            try:
-                self._fd.close()
-            finally:
-                if self.path == FAISS_LOCK and self._faiss_depth_bumped:
-                    _faiss_lock_exit()
-                    self._faiss_depth_bumped = False
-                if self.path == DB_LOCK:
-                    _db_lock_exit()
+        get_runtime()  # ensure DB_LOCK and FAISS_LOCK are initialized
+        super().__init__(path, db_lock_path=DB_LOCK, faiss_lock_path=FAISS_LOCK)
 
 # Always acquire in this order to avoid deadlock: DB_LOCK then FAISS_LOCK
 # (These constants are now provided via lazy __getattr__ from get_runtime())
-
-# One-time advisory-lock status reporting
-_ADVISORY_LOCK_DISABLED = False
-_ADVISORY_LOCK_NOTICE_PRINTED = False
 
 # Producer-mode segment writers (set in main)
 chunk_seg_writer = None
@@ -935,12 +870,6 @@ def _maybe_flush_marks_every(conn, cur, batch_counter: int) -> bool:
     return False
 
 
-def _assert_faiss_locked():
-    if not _in_faiss_lock():
-        raise AssertionError(
-            "FAISS save called without holding FAISS_LOCK. "
-            "If you also update SQLite, acquire DB_LOCK first."
-        )
 
 
 

@@ -6,6 +6,9 @@ from litkit.concurrent.locking import (
     LockManager,
     FLOCK_AVAILABLE,
     has_real_file_locks,
+    in_faiss_lock,
+    in_db_lock,
+    assert_faiss_locked,
 )
 
 __all__ = [
@@ -13,4 +16,7 @@ __all__ = [
     "LockManager",
     "FLOCK_AVAILABLE",
     "has_real_file_locks",
+    "in_faiss_lock",
+    "in_db_lock",
+    "assert_faiss_locked",
 ]
