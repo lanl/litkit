@@ -91,6 +91,12 @@ from litkit.embeddings.base import (
 from litkit.embeddings.base import (
     progress_write as _progress_write,
 )
+from litkit.progress import (
+    eprint as _eprint,
+    Progress as _Progress,
+    Pulse as _Pulse,
+    phase as _phase,
+)
 from litkit.embeddings.devices import configure_threads, detect_device
 from litkit.embeddings.factory import make_chunk_embedder, make_paper_embedder
 from litkit.formatting.answers import (
@@ -187,14 +193,6 @@ _DB_LOCK_DEPTH = threading.local()
 def _db_lock_enter():  _DB_LOCK_DEPTH.n = getattr(_DB_LOCK_DEPTH, "n", 0) + 1
 def _db_lock_exit():   _DB_LOCK_DEPTH.n = max(0, getattr(_DB_LOCK_DEPTH, "n", 0) - 1)
 def _in_db_lock() -> bool: return getattr(_DB_LOCK_DEPTH, "n", 0) > 0
-
-
-def _eprint(msg: str = "", *, end: str = "\n") -> None:
-    sys.stderr.write(msg + end)
-    try:
-        sys.stderr.flush()
-    except Exception:
-        pass
 
 
 # fcntl is not available on Windows
@@ -845,115 +843,6 @@ import numpy as np
 # Note: faiss.cvar.seed is set inside _init_runtime() to avoid import-time side effects
 
 
-# --- shared progress line state (prevents line collisions) ---
-
-
-def _phase(name: str, stream=None):
-    """Print a simple phase banner (operator log only)."""
-    stream = stream or sys.stderr
-    try:
-        _progress_newline(stream)
-    except Exception:
-        pass
-    stream.write(f"[phase] {name}\n")
-    stream.flush()
-    try:
-        with _PROGRESS_LOCK:
-            globals()["_PROGRESS_LAST_LEN"] = 0
-    except Exception:
-        pass
-
-
-
-
-
-# --- lightweight progress line (stderr), dependency-free ---
-class _Progress:
-    def __init__(
-        self,
-        label: str,
-        total: int | None = None,
-        start: int = 0,
-        min_interval: float = 0.2,
-        stream=None,
-        emit_final_line: bool = True,
-    ):
-        self.label = label
-        self.total = total if (total is not None and total > 0) else None
-        self.done = int(start)
-        self.start_ts = time.time()
-        self.last_ts = 0.0
-        self.min_interval = float(min_interval)
-        self.stream = stream if stream is not None else sys.stderr
-        self.emit_final_line = bool(emit_final_line)
-        self._last_len = 0
-
-    def _write_line(self, s: str):
-        _progress_write(s, self.stream)
-
-    def _fmt(self) -> str:
-        elapsed = max(1e-3, time.time() - self.start_ts)
-        rate = self.done / elapsed
-        if self.total is None:
-            return f"[progress] {self.label}: {self.done}  ({rate:.1f}/s)"
-        pct = 100.0 * self.done / max(1, self.total)
-        return f"[progress] {self.label}: {self.done}/{self.total}  ({pct:.1f}%)  {rate:.1f}/s"
-
-    def tick(self, inc: int = 1, force: bool = False):
-        self.done += inc
-        now = time.time()
-        if force or (now - self.last_ts) >= self.min_interval:
-            self._write_line(self._fmt())
-            self.last_ts = now
-
-
-    def finish(self, emit_final_line: bool | None = None):
-        # Use instance default unless overridden per-call
-        do_emit = self.emit_final_line if emit_final_line is None else bool(emit_final_line)
-        if do_emit:
-            _progress_write(self._fmt(), self.stream)
-        _progress_newline(self.stream)
-
-
-class _Pulse:
-    """Background heartbeat that refreshes a single progress line with elapsed time."""
-
-    def __init__(self, label: str, period: float = 0.5, stream=None):
-        self.label = label
-        self.period = float(period)
-        self.stream = stream if stream is not None else sys.stderr
-        self._stop = threading.Event()
-        self._t0 = time.time()
-        self._thr = threading.Thread(target=self._run, daemon=True)
-        self._thr.start()
-
-    def _print_line(self, s: str):
-        _progress_write(s, self.stream)
-
-    def _run(self):
-        while not self._stop.is_set():
-            elapsed = int(time.time() - self._t0)
-            self._print_line(f"[progress] {self.label}: training... {elapsed}s elapsed")
-            self._stop.wait(self.period)
-
-    def stop(self):
-        self._stop.set()
-        try:
-            self._thr.join(timeout=2.0)
-        except Exception:
-            pass
-        # Always terminate the line so the next writer doesn't append mid-line.
-        if _progress_is_append():
-            _progress_write(
-                f"[progress] {self.label}: completed in {int(time.time()-self._t0)}s",
-                self.stream,
-            )
-            _progress_newline(self.stream)
-        else:
-            self._print_line(
-                f"[progress] {self.label}: training… {int(time.time()-self._t0)}s elapsed"
-            )
-            _progress_newline(self.stream)
 
 def _idmap_bloom(index, bits_per_key=8):
     # Build once per process when needed
