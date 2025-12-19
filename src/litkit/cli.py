@@ -3020,8 +3020,8 @@ def main():
         sys.stderr.write("[env] Python >= 3.10 required.\n")
         sys.exit(2)
     
-    # Trigger lazy runtime initialization (creates dirs, sets env vars, populates globals)
-    get_runtime()
+    # NOTE: get_runtime() is called AFTER --offline handling so that HF_HUB_OFFLINE
+    # is set before setup_environment() runs. See below after parse_args().
     
     # declare BEFORE any references to these names in this function (to satisfy Python rule)
     global PAPER_BATCH, CHUNK_BATCH, CKPT_EVERY
@@ -3502,10 +3502,13 @@ def main():
 
     _create_writer_guard_or_exit(args)
 
-    # Honor --offline explicitly
+    # Honor --offline explicitly (must be BEFORE get_runtime() so setup_environment sees it)
     if args.offline:
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    # NOW trigger lazy runtime initialization - after --offline has set env vars
+    get_runtime()
 
     if args.hnsw_recall == "high" and args.papers_index == "hnsw":
         args.hnsw_m = max(args.hnsw_m, 48)
