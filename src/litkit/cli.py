@@ -3349,6 +3349,14 @@ def main():
         _eprint(f"[version] {_version_banner()}")
         _eprint(f"[device] using {device}")
 
+    # Honor --offline explicitly (must be BEFORE get_runtime() so setup_environment sees it)
+    if args.offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    # Trigger lazy runtime initialization - populates path globals like WORKSPACE, DB_PATH, etc.
+    # This must happen before any code that uses path globals (e.g., _vector_store_exists).
+    get_runtime()
 
     # Do we have a vector store?
     def _vector_store_exists() -> bool:
@@ -3513,14 +3521,6 @@ def main():
         )
 
     _create_writer_guard_or_exit(args)
-
-    # Honor --offline explicitly (must be BEFORE get_runtime() so setup_environment sees it)
-    if args.offline:
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
-
-    # NOW trigger lazy runtime initialization - after --offline has set env vars
-    get_runtime()
 
     if args.hnsw_recall == "high" and args.papers_index == "hnsw":
         args.hnsw_m = max(args.hnsw_m, 48)
