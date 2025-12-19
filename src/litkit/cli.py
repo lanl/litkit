@@ -222,7 +222,11 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
     if not getattr(args, "faiss_writer", False):
         return
     if ttl_sec is None:
-        ttl_sec = int(os.environ.get("LITKIT_WRITER_GUARD_TTL", "86400"))  # 24h default
+        try:
+            ttl_sec = int(os.environ.get("LITKIT_WRITER_GUARD_TTL", "86400"))
+        except ValueError:
+            _eprint("[writer] WARNING: invalid LITKIT_WRITER_GUARD_TTL; using 86400s")
+            ttl_sec = 86400
 
     def _cleanup_guard():
         try:
