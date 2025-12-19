@@ -3475,6 +3475,27 @@ def main():
             # allow read-only flows, --version, help, etc.
             pass
 
+    # ---- Validate mutually exclusive flag combinations ----
+    if args.embed_producer and args.faiss_writer:
+        sys.exit(
+            "[args] ERROR: --embed-producer and --faiss-writer are mutually exclusive.\n"
+            "  • Producers write embedding segments to disk (not FAISS).\n"
+            "  • Writers mutate FAISS indices directly (or ingest segments with --consume-only).\n"
+            "Use --embed-producer for producer nodes, --faiss-writer for the single writer/consumer."
+        )
+    if args.consume_only and args.embed_producer:
+        sys.exit(
+            "[args] ERROR: --consume-only and --embed-producer are mutually exclusive.\n"
+            "  • Consumers ingest pre-computed segments; they don't produce embeddings.\n"
+            "Use --embed-producer on producer nodes, --consume-only on the writer node."
+        )
+    if args.init_indices_only and args.embed_producer:
+        sys.exit(
+            "[args] ERROR: --init-indices-only and --embed-producer are mutually exclusive.\n"
+            "  • --init-indices-only only creates empty FAISS indices (bootstrap step).\n"
+            "Run --init-indices-only first, then start producers separately."
+        )
+
     _create_writer_guard_or_exit(args)
 
     # Honor --offline explicitly
