@@ -995,21 +995,28 @@ def _query_terms(s: str) -> list[str]:
 
 
 def _auto_top_papers() -> int:
+    """Heuristic for Stage-1 shortlist size based on corpus size."""
     get_runtime()  # ensure path globals are initialized for library use
+    
+    def _piecewise_heuristic(n: int) -> int:
+        if n < 50_000:
+            return 500
+        if n < 500_000:
+            return 1000
+        if n < 2_000_000:
+            return 2000
+        return 4000
+    
+    conn = None
     try:
         conn = db_connect_db(DB_PATH)
         n = conn.execute("SELECT COUNT(1) FROM papers").fetchone()[0]
-        conn.close()
+        return _piecewise_heuristic(n)
     except Exception:
-        n = 0
-    # piecewise heuristic: stable and cheap
-    if n < 50_000:
-        return 500
-    if n < 500_000:
-        return 1000
-    if n < 2_000_000:
-        return 2000
-    return 4000
+        return _piecewise_heuristic(0)
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _sqlite_norm_expr(field: str = "text") -> str:
