@@ -250,7 +250,10 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
             atexit.register(_cleanup_guard)
             try:
                 if threading.current_thread() is threading.main_thread():
-                    # ensure guard is removed, then hard-exit the process safely
+                    # HARD KILL on SIGINT/SIGTERM: clean up guard file, then os._exit(1).
+                    # This bypasses pending DB commits and atexit handlers to avoid
+                    # corrupt partial writes. FAISS indices may have unflushed data,
+                    # but the guard file removal allows a clean restart.
                     signal.signal(signal.SIGINT,  lambda *_: (_cleanup_guard(), os._exit(1)))
                     signal.signal(signal.SIGTERM, lambda *_: (_cleanup_guard(), os._exit(1)))
             except Exception:
@@ -3349,6 +3352,15 @@ def main():
 
     # Do we have a vector store?
     def _vector_store_exists() -> bool:
+        """Return True only if ALL three required paths exist:
+        - PAPER_INDEX_PATH (FAISS paper index)
+        - CHUNK_INDEX_PATH (FAISS chunk index)
+        - DB_PATH (SQLite database)
+        
+        If any component is missing, returns False (treat as "no vector store").
+        This is intentional: a partial store (e.g., DB exists but one index missing)
+        requires a fresh build or --init-indices-only to bootstrap.
+        """
         try:
             return PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists() and DB_PATH.exists()
         except Exception:
