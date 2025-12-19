@@ -705,11 +705,116 @@ Before beginning Phase 6.1 extraction, we addressed bugs identified in code revi
 
 ---
 
+## Work Completed 2024-12-19 (Phase 6 Extraction)
+
+### Phase 6.1: Extract helpers and backfill to litkit.build (COMPLETE)
+
+Created the `litkit/build/` module skeleton and extracted helper functions.
+
+**Commit `5e2eec9`:** `refactor(cli): extract helpers to litkit.build module (Phase 6.1)`
+
+Created `litkit/build/helpers.py` with:
+- `pack_paragraphs()` - Greedy text chunking with overlap
+- `dedupe_papers_with_doc_ids()` - Deduplicate paper buffers
+- `dedupe_chunks_with_doc_ids()` - Deduplicate chunk buffers
+- `ensure_parent()` - Create parent directory if needed
+- `maybe_fsync_dir()` - Optional directory fsync for NFS safety
+
+cli.py: ~3610 lines (down from ~3700, removed ~90 lines of local definitions)
+
+**Commit `b4fcc51`:** `refactor(build): add backfill module to litkit.build (Phase 6.1b)`
+
+Created `litkit/build/backfill.py` with parameterized module versions:
+- `backfill_unindexed_vectors()` - Embed and add rows missing from FAISS
+- `reconcile_sqlite_flags_with_faiss()` - Sync in_index flags with FAISS state
+- `post_build_sanity_check()` - Summary report after build
+
+Module functions accept explicit path/lock parameters for decoupled use.
+cli.py imports module versions but still had local definitions shadowing them.
+
+**Commit `8d55639`:** `refactor(cli): convert backfill functions to thin wrappers (Phase 6.1c)`
+
+Replaced local implementations with thin wrappers that delegate to module:
+- `backfill_unindexed_vectors()`: ~90 lines → 15 lines
+- `reconcile_sqlite_flags_with_faiss()`: ~45 lines → 3 lines
+- `_post_build_sanity_check()`: ~25 lines → 7 lines
+
+cli.py: 3506 lines (down from 3633, -127 lines)
+
+### Phase 6.2: Create BuildConfig and extract index bootstrap (IN PROGRESS)
+
+**Commit `602498b`:** `refactor(build): add BuildConfig dataclass (Phase 6.2a)`
+
+Created `litkit/build/config.py` with:
+- `BuildConfig` dataclass encapsulating all build parameters
+- Properties: `is_multi_node`, `build_mode`, `effective_embed_outdir`
+- Methods: `needs_corpus()`, `validate()`
+- Factory: `build_config_from_args(args, paths={})`
+
+Design principles:
+- All paths explicit (no globals accessed by module functions)
+- Sensible defaults matching cli.py constants
+- Validation methods for flag consistency
+
+**Commit `71c4556`:** `refactor(build): extract init_empty_indices to litkit.build.indices (Phase 6.2b)`
+
+Created `litkit/build/indices.py` with:
+- `init_empty_indices()` - Create empty FAISS indices for bootstrap mode (`--init-indices-only`)
+
+cli.py now uses `BuildConfig` to delegate to module function:
+```python
+cfg = BuildConfig(
+    faiss_writer=args.faiss_writer,
+    papers_index=args.papers_index,
+    # ... other params
+    paper_index_path=PAPER_INDEX_PATH,
+    chunk_index_path=CHUNK_INDEX_PATH,
+    faiss_lock=FAISS_LOCK,
+)
+build_init_empty_indices(cfg, FileLock=FileLock)
+```
+
+cli.py: 3492 lines (down from 3506, -14 lines)
+
+### Current Module Structure
+
+```
+src/litkit/build/
+├── __init__.py       # Package exports (12 items)
+├── helpers.py        # Text chunking & deduplication (~148 lines)
+├── backfill.py       # FAISS/SQLite reconciliation (~268 lines)
+├── config.py         # BuildConfig dataclass (~270 lines)
+└── indices.py        # Index creation utilities (~85 lines)
+```
+
+### Remaining Phase 6.2 Steps
+
+| Step | Description | Est. Lines |
+|------|-------------|------------|
+| 6.2c | Extract `run_consume_only_mode()` | ~55 |
+| 6.2d | Extract index load/create functions | ~100 |
+| 6.2e | Extract IVF-PQ training | ~250 |
+| 6.2f | Extract tar processing loop | ~500 |
+| 6.2g | Final cleanup extraction | ~80 |
+
+---
+
 ## Current Status
 
-**cli.py is now ~3700 lines** (down from ~4723 at start of 2024-12-18 session).
+**cli.py is now ~3492 lines** (down from ~4723 at start of 2024-12-18 session, **-1231 lines / 26% reduction**).
+
+### Summary of Reductions
+
+| Phase | Description | Lines Removed |
+|-------|-------------|---------------|
+| 2024-12-18 | FAISS, Progress, FileLock, Runtime extraction | ~664 |
+| 2024-12-18 | Dead code removal (_ingest_*, _add_ids_union_compat) | ~374 |
+| 2024-12-19 | Bug fixes + minor cleanup | ~23 |
+| 2024-12-19 | Phase 6.1 helpers + backfill extraction | ~127 |
+| 2024-12-19 | Phase 6.2a-b (BuildConfig, init_empty_indices) | ~43 |
 
 ### Next Immediate Steps
 
-1. **Begin Phase 6.1** - create `litkit/build/` skeleton, move helpers
-2. **Test after each sub-phase** with `./test_build.sh --clean`
+1. **Pause extraction** - User wants to discuss potential bugs
+2. **After bug discussion** - Continue with Phase 6.2c (run_consume_only_mode)
+3. **Test after each sub-phase** with `./test_build.sh --clean`
