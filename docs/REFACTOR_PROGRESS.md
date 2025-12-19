@@ -652,12 +652,64 @@ class FileLock(_FileLockBase):
 
 ---
 
+## Work Completed 2024-12-19 (Bug Fix Session)
+
+### Pre-Extraction Bug Fixes (8 commits)
+
+Before beginning Phase 6.1 extraction, we addressed bugs identified in code review:
+
+| Commit | Fix | Lines |
+|--------|-----|-------|
+| `c0a788c` | Add `get_runtime()` to 5 helpers for library use safety | +5 |
+| `eb27902` | Fix connection leak in `_auto_top_papers` (try/finally) | +8 |
+| `e380547` | Remove dead `_PENDING_MARKS` tracking | -23 |
+| `9500990` | Reject incompatible flag combinations early in main() | +21 |
+| `bbbc8f1` | Handle invalid `LITKIT_WRITER_GUARD_TTL` gracefully | +4 |
+| `93298d3` | Move `get_runtime()` after `--offline` handling | +3 |
+| `096cccd` | Document `_vector_store_exists` and signal handler semantics | +12 |
+| `394c811` | Fix regression: move `get_runtime()` right after `--offline` | +3 |
+
+**Key fixes:**
+
+1. **Lazy runtime safety (`c0a788c`)**: Added `get_runtime()` calls to 5 helper functions
+   that access path globals (`_maybe_cleanup_own_stale_guard`, `_create_writer_guard_or_exit`,
+   `backfill_unindexed_vectors`, `_post_build_sanity_check`, `_auto_top_papers`). This ensures
+   library use (importing and calling these functions outside `main()`) works correctly.
+
+2. **Connection leak (`eb27902`)**: `_auto_top_papers()` now uses try/finally to ensure
+   the DB connection closes on all exit paths.
+
+3. **Dead code removal (`e380547`)**: Removed `_PENDING_MARKS` mechanism that was:
+   - Populated when FAISS save failed (to defer marking)
+   - Never actually consumed/flushed
+   - Causing marks to be lost, requiring manual reconcile runs
+   
+   Now relies entirely on `reconcile_sqlite_flags_with_faiss()` which runs at end of writer builds.
+
+4. **Flag validation (`9500990`)**: Added early rejection of incompatible flag combinations:
+   - `--embed-producer + --faiss-writer` (mutually exclusive)
+   - `--consume-only + --embed-producer` (mutually exclusive)
+   - `--init-indices-only + --embed-producer` (mutually exclusive)
+
+5. **TTL parsing (`bbbc8f1`)**: `LITKIT_WRITER_GUARD_TTL` env var parsing now catches
+   `ValueError` and falls back to 86400s with a warning instead of crashing.
+
+6. **--offline ordering (`93298d3`, `394c811`)**: Fixed ordering so `--offline` sets
+   `HF_HUB_OFFLINE` before `get_runtime()` calls `setup_environment()`. Then fixed
+   regression where `get_runtime()` was moved too far down, causing `NameError` for
+   path globals used before initialization.
+
+7. **Documentation (`096cccd`)**: Added docstring to `_vector_store_exists()` explaining
+   it requires ALL three paths (both FAISS indices + DB). Added comment explaining
+   the signal handler's hard kill via `os._exit(1)` is intentional.
+
+---
+
 ## Current Status
 
-**cli.py is now 3680 lines** (down from ~4723 at start of session).
+**cli.py is now ~3700 lines** (down from ~4723 at start of 2024-12-18 session).
 
 ### Next Immediate Steps
 
-1. **Fix `_auto_top_papers` leak** - trivial fix, do immediately
-2. **Begin Phase 6.1** - create `litkit/build/` skeleton, move helpers
-3. **Test after each sub-phase** with `./test_build.sh --clean`
+1. **Begin Phase 6.1** - create `litkit/build/` skeleton, move helpers
+2. **Test after each sub-phase** with `./test_build.sh --clean`
