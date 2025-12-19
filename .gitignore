@@ -3,6 +3,7 @@ __pycache__/
 .DS_Store
 dist/
 build/
+!src/litkit/build/
 *.egg-info/
 .venv/
 .pytest_cache/

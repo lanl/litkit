@@ -157,6 +157,9 @@ from litkit.build import (
     dedupe_chunks_with_doc_ids,
     ensure_parent,
     maybe_fsync_dir,
+    backfill_unindexed_vectors as build_backfill_unindexed_vectors,
+    reconcile_sqlite_flags_with_faiss as build_reconcile_sqlite_flags,
+    post_build_sanity_check as build_post_build_sanity_check,
 )
 from litkit.db import (
     SCHEMA as db_SCHEMA,
