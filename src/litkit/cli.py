@@ -151,6 +151,13 @@ from litkit.index import (
     add_with_ids_dedup,
 )
 from litkit.pipeline import dedupe_ids_and_texts
+from litkit.build import (
+    pack_paragraphs,
+    dedupe_papers_with_doc_ids,
+    dedupe_chunks_with_doc_ids,
+    ensure_parent,
+    maybe_fsync_dir,
+)
 from litkit.db import (
     SCHEMA as db_SCHEMA,
     init_db as db_init_db,
@@ -607,87 +614,6 @@ def _resolve_question(args) -> str | None:
     return q.strip()
 
 
-def _maybe_fsync_dir(p: Path):
-    # Optional: fsync the containing directory for extra safety on some NFS setups
-    if os.environ.get("LITKIT_SEGMENT_FSYNC_DIR", "1") != "1":
-        return
-    try:
-        dfd = os.open(str(p.parent), os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
-    except Exception:
-        pass
-
-
-# -------------------- Utils --------------------
-def pack_paragraphs(
-    paras, max_chars=CHUNK_TARGET_CHARS, min_chars=BODY_MIN_CHARS, overlap_chars=CHUNK_OVERLAP_CHARS
-):
-    """Greedy pack paragraphs, then add a small character overlap between
-    consecutive chunks to reduce claim-splitting.
-    """
-    chunks, buf, total = [], [], 0
-
-    def _flush_buf():
-        nonlocal chunks, buf, total
-        if not buf:
-            return
-        cur = " ".join(buf)
-        if len(cur) < min_chars and chunks:
-            chunks[-1] = chunks[-1] + " " + cur
-        else:
-            chunks.append(cur)
-        buf, total = [], 0
-
-    for p in paras:
-        if buf and total + len(p) + 1 > max_chars:
-            _flush_buf()
-        buf.append(p)
-        total += len(p) + 1
-    _flush_buf()
-
-    if overlap_chars > 0 and len(chunks) > 1:
-        out = [chunks[0]]
-        for i in range(1, len(chunks)):
-            tail = chunks[i - 1][-overlap_chars:]
-            out.append((tail + " " + chunks[i]).strip())
-        chunks = out
-    return chunks
-
-
-def _dedupe_papers_with_doc_ids(
-    ids: list[int], texts: list[str], doc_ids: list[str]
-) -> tuple[list[int], list[str], list[str]]:
-    """Keep the first occurrence of each id; return aligned id/text/doc_id lists."""
-    out_ids, out_texts, out_doc_ids, seen = [], [], [], set()
-    for i, t, d in zip(ids, texts, doc_ids, strict=False):
-        if i in seen:
-            continue
-        seen.add(i)
-        out_ids.append(i)
-        out_texts.append(t)
-        out_doc_ids.append(d)
-    return out_ids, out_texts, out_doc_ids
-
-
-def _dedupe_chunks_with_doc_ids(
-    ids: list[int], texts: list[str], paper_doc_ids: list[str], ords: list[int]
-) -> tuple[list[int], list[str], list[str], list[int]]:
-    """Keep the first occurrence of each id; return aligned id/text/paper_doc_id/ord lists."""
-    out_ids, out_texts, out_doc_ids, out_ords, seen = [], [], [], [], set()
-    for i, t, d, o in zip(ids, texts, paper_doc_ids, ords, strict=False):
-        if i in seen:
-            continue
-        seen.add(i)
-        out_ids.append(i)
-        out_texts.append(t)
-        out_doc_ids.append(d)
-        out_ords.append(o)
-    return out_ids, out_texts, out_doc_ids, out_ords
-
-
 # -------------------- Embedders --------------------
 import faiss
 import numpy as np
@@ -771,11 +697,6 @@ def _clear_chunk_trained_flag():
         _eprint(f"[train] WARNING: could not remove {CHUNK_TRAINED_FLAG}: {e}")
 
 
-
-
-def _ensure_parent(path: Path):
-    """Ensure parent directory of `path` exists."""
-    path.parent.mkdir(parents=True, exist_ok=True)
 
 
 # -------------------- Embedding segment I/O (producer↔writer) --------------------
@@ -1177,7 +1098,7 @@ def build_or_update_indices(args):
             ef_search=args.efsearch,
         )
         paper_index = faiss.IndexIDMap2(paper_index)
-        _ensure_parent(PAPER_INDEX_PATH)
+        ensure_parent(PAPER_INDEX_PATH)
         with FileLock(FAISS_LOCK):
             faiss_save_force(paper_index, PAPER_INDEX_PATH)
         
@@ -1189,7 +1110,7 @@ def build_or_update_indices(args):
             chunk_index = ivfpq_index(chunk_dim, nlist=args.ivf_nlist, m=m_safe)
         
         chunk_index = faiss.IndexIDMap2(chunk_index)
-        _ensure_parent(CHUNK_INDEX_PATH)
+        ensure_parent(CHUNK_INDEX_PATH)
         with FileLock(FAISS_LOCK):
             faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
         
@@ -1330,7 +1251,7 @@ def build_or_update_indices(args):
             )
 
         paper_index = faiss.IndexIDMap2(base)
-        _ensure_parent(PAPER_INDEX_PATH)
+        ensure_parent(PAPER_INDEX_PATH)
         if args.faiss_writer:
             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
                 faiss_save(paper_index, PAPER_INDEX_PATH)
@@ -1366,7 +1287,7 @@ def build_or_update_indices(args):
             base = flat_ip_index(chunk_dim)
             chunk_index = faiss.IndexIDMap2(base)
             _clear_chunk_trained_flag()
-            _ensure_parent(CHUNK_INDEX_PATH)
+            ensure_parent(CHUNK_INDEX_PATH)
             if args.faiss_writer:
                 with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
                     faiss_save(chunk_index, CHUNK_INDEX_PATH)
@@ -1385,7 +1306,7 @@ def build_or_update_indices(args):
             eff_nlist = 16
             chunk_index = ivfpq_index(chunk_dim, nlist=eff_nlist, m=m_safe)
 
-            _ensure_parent(CHUNK_INDEX_PATH)
+            ensure_parent(CHUNK_INDEX_PATH)
             if not args.faiss_writer:
                 raise RuntimeError(
                     "CHUNK index does not exist. Start a writer with --faiss-writer or precreate the index."
@@ -1536,7 +1457,7 @@ def build_or_update_indices(args):
             n_train = int(X_train.shape[0])
 
             _eprint(f"[train] chunk training samples: target={train_samples} collected={n_train}")
-            _ensure_parent(CHUNK_INDEX_PATH)
+            ensure_parent(CHUNK_INDEX_PATH)
 
             pq_bits = PQ_BITS
             k = (1 << pq_bits)
@@ -1623,7 +1544,7 @@ def build_or_update_indices(args):
                                                         "nlist": eff_nlist, "m": m}, indent=2))
                                     fh.flush(); os.fsync(fh.fileno())
                                 os.replace(_tf_tmp, CHUNK_TRAINED_FLAG)
-                                _maybe_fsync_dir(CHUNK_TRAINED_FLAG)
+                                maybe_fsync_dir(CHUNK_TRAINED_FLAG)
 
                     except Exception as e:
                         _eprint(
@@ -1883,7 +1804,7 @@ def build_or_update_indices(args):
                             chunk_ords_buf.append(ord_i)
 
                         if len(paper_ids_buf) >= PAPER_BATCH:
-                            u_ids, u_texts, u_doc_ids = _dedupe_papers_with_doc_ids(
+                            u_ids, u_texts, u_doc_ids = dedupe_papers_with_doc_ids(
                                 paper_ids_buf, paper_texts_buf, paper_doc_ids_buf
                             )
 
@@ -1935,7 +1856,7 @@ def build_or_update_indices(args):
                             paper_doc_ids_buf.clear()
 
                         if len(chunk_ids_buf) >= CHUNK_BATCH:
-                            u_ids, u_texts, u_paper_doc_ids, u_ords = _dedupe_chunks_with_doc_ids(
+                            u_ids, u_texts, u_paper_doc_ids, u_ords = dedupe_chunks_with_doc_ids(
                                 chunk_ids_buf, chunk_texts_buf, chunk_paper_doc_ids_buf, chunk_ords_buf
                             )
 
@@ -2090,7 +2011,7 @@ def build_or_update_indices(args):
 
         # papers: embed and write segment file(s)
         if paper_ids_buf:
-            u_ids, u_texts, u_doc_ids = _dedupe_papers_with_doc_ids(
+            u_ids, u_texts, u_doc_ids = dedupe_papers_with_doc_ids(
                 paper_ids_buf, paper_texts_buf, paper_doc_ids_buf
             )
             Xp = paper_embedder.encode(
@@ -2108,7 +2029,7 @@ def build_or_update_indices(args):
 
         # chunks: embed and write segment file(s)
         if chunk_ids_buf:
-            u_ids, u_texts, u_paper_doc_ids, u_ords = _dedupe_chunks_with_doc_ids(
+            u_ids, u_texts, u_paper_doc_ids, u_ords = dedupe_chunks_with_doc_ids(
                 chunk_ids_buf, chunk_texts_buf, chunk_paper_doc_ids_buf, chunk_ords_buf
             )
             Xc = chunk_embedder.encode(
