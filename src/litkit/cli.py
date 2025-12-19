@@ -750,25 +750,6 @@ def _idmap_bloom(index, bits_per_key=8):
 _SAVE_MIN_SEC = int(os.environ.get("LITKIT_SAVE_EVERY_SEC", "120"))
 _last_save_ts = {"papers": 0.0, "chunks": 0.0}
 
-_MARKS_FLUSH_EVERY = int(os.environ.get("LITKIT_MARKS_FLUSH_EVERY", "10"))  # 0=off
-
-def _maybe_flush_marks_every(conn, cur, batch_counter: int) -> bool:
-    if _MARKS_FLUSH_EVERY and (batch_counter % _MARKS_FLUSH_EVERY) == 0:
-        with FileLock(DB_LOCK):
-            db_flush_pending_marks(cur)
-            conn.commit()
-        return True
-    return False
-
-
-
-
-
-
-
-from collections import defaultdict
-
-_PENDING_MARKS = defaultdict(list)
 
 
 
@@ -841,8 +822,8 @@ def backfill_unindexed_vectors(
                 db_flush_pending_marks(cur)
                 conn.commit()
         else:
-            if added:
-                _PENDING_MARKS["papers"].extend([int(i) for i in ids_added])
+            # Save failed - vectors are in FAISS but not marked in DB.
+            # reconcile_sqlite_flags_with_faiss() will fix this on next run.
             conn.commit()
 
     # Chunks
@@ -877,8 +858,8 @@ def backfill_unindexed_vectors(
                 db_flush_pending_marks(cur)
                 conn.commit()
         else:
-            if added:
-                _PENDING_MARKS["chunks"].extend([int(i) for i in ids_added])
+            # Save failed - vectors are in FAISS but not marked in DB.
+            # reconcile_sqlite_flags_with_faiss() will fix this on next run.
             conn.commit()
 
 
@@ -1935,8 +1916,7 @@ def build_or_update_indices(args):
                                             db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
                                             db_flush_pending_marks(cur)
                                             conn.commit()
-                                    else:
-                                        _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
+                                    # else: save failed, reconcile_sqlite_flags_with_faiss() will fix
                                 papers_added_total += int(added) 
 
                             else:
@@ -1990,8 +1970,7 @@ def build_or_update_indices(args):
                                             db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
                                             db_flush_pending_marks(cur)
                                             conn.commit()
-                                    else:
-                                        _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
+                                    # else: save failed, reconcile_sqlite_flags_with_faiss() will fix
 
                                 chunks_added_total += int(added)
 
@@ -2063,8 +2042,7 @@ def build_or_update_indices(args):
                         if faiss_save(paper_index, PAPER_INDEX_PATH):
                             db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
                             db_flush_pending_marks(cur)
-                        else:
-                            _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
+                        # else: save failed, reconcile_sqlite_flags_with_faiss() will fix
                 conn.commit()
             papers_added_total += int(added)
 
@@ -2093,8 +2071,7 @@ def build_or_update_indices(args):
                         if faiss_save(chunk_index, CHUNK_INDEX_PATH):
                             db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
                             db_flush_pending_marks(cur)
-                        else:
-                            _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
+                        # else: save failed, reconcile_sqlite_flags_with_faiss() will fix
                 conn.commit()
             chunks_added_total += int(added)
 
