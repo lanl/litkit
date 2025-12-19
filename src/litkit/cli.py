@@ -803,6 +803,7 @@ def backfill_unindexed_vectors(
     chunk_bs=None,
 ):
     """Embed and add any rows that exist in SQLite but were never added to FAISS (in_index=0)."""
+    get_runtime()  # ensure path globals are initialized for library use
     cur = conn.cursor()
 
     # Papers
@@ -885,6 +886,7 @@ def backfill_unindexed_vectors(
 
 def _post_build_sanity_check(conn, args):
     """Sanity print after build: DB vs FAISS counts and index types (papers & chunks)."""
+    get_runtime()  # ensure path globals are initialized for library use
     # ----- papers -----
     try:
         p_idx = faiss.read_index(str(PAPER_INDEX_PATH))
@@ -993,6 +995,7 @@ def _query_terms(s: str) -> list[str]:
 
 
 def _auto_top_papers() -> int:
+    get_runtime()  # ensure path globals are initialized for library use
     try:
         conn = db_connect_db(DB_PATH)
         n = conn.execute("SELECT COUNT(1) FROM papers").fetchone()[0]
@@ -2333,6 +2336,7 @@ def shortlist_papers(
     """Stage 1: encode the question with SPECTER2 and retrieve top-k paper IDs
     from the paper index (HNSW by default). Returns a list of paper ids.
     """
+    get_runtime()  # ensure path globals are initialized for library use
     enc = embedder or make_paper_embedder()[0]
     q = enc.encode([question]).astype("float32", copy=False)
     faiss.normalize_L2(q)
@@ -2371,6 +2375,7 @@ def search_chunks_constrained(
         chunk_ids: top-k ranked chunk IDs (lexical-first, de-duped, then ANN order).
         meta: effective FAISS search params for the last query (e.g., {"nprobe": int, "nlist": int}).
     """
+    get_runtime()  # ensure path globals are initialized for library use
     enc = embedder or make_chunk_embedder()[0]
     q = enc.encode([question]).astype("float32", copy=False)
     faiss.normalize_L2(q)
