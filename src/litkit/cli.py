@@ -714,115 +714,31 @@ def backfill_unindexed_vectors(
     paper_bs=None,
     chunk_bs=None,
 ):
-    """Embed and add any rows that exist in SQLite but were never added to FAISS (in_index=0)."""
-    get_runtime()  # ensure path globals are initialized for library use
-    cur = conn.cursor()
-
-    # Papers
-    while True:
-        rows = cur.execute(
-            "SELECT id, (COALESCE(title,'') || ' ' || COALESCE(abstract,'')) AS txt "
-            "FROM papers WHERE in_index=0 LIMIT ?",
-            (batch,),
-        ).fetchall()
-        if not rows:
-            break
-        ids = [r[0] for r in rows]
-        texts = [(r[1] or "untitled").strip() for r in rows]
-        Xp = paper_embedder.encode(
-            texts, progress_label=f"Embedding papers (backfill, {len(texts)})", 
-            batch_size=paper_bs,
-            progress_done_summary=False,
-        )
-
-        if not isinstance(paper_index, faiss.IndexIDMap2):
-            paper_index = faiss.IndexIDMap2(paper_index)
-
-        prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
-        with FileLock(FAISS_LOCK):
-            sel = make_id_selector(ids)
-            safe_remove_ids(paper_index, sel)
-            added, ids_added = add_with_ids_dedup(paper_index, ids, Xp)
-            saved = False
-            if added:
-                saved = faiss_save_force(paper_index, PAPER_INDEX_PATH) if prior_ntotal == 0 \
-                        else faiss_save(paper_index, PAPER_INDEX_PATH)
-        if added and saved:
-            with FileLock(DB_LOCK):
-                db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
-                db_flush_pending_marks(cur)
-                conn.commit()
-        else:
-            # Save failed - vectors are in FAISS but not marked in DB.
-            # reconcile_sqlite_flags_with_faiss() will fix this on next run.
-            conn.commit()
-
-    # Chunks
-    while True:
-        rows = cur.execute(
-            "SELECT id, text FROM chunks WHERE in_index=0 LIMIT ?", (batch,)
-        ).fetchall()
-        if not rows:
-            break
-        ids = [r[0] for r in rows]
-        texts = [r[1] for r in rows]
-        Xc = chunk_embedder.encode(
-            texts, progress_label=f"Embedding chunks (backfill, {len(texts)})", 
-            batch_size=chunk_bs,
-            progress_done_summary=False,
-        )
-        if not isinstance(chunk_index, faiss.IndexIDMap2):
-            chunk_index = faiss.IndexIDMap2(chunk_index)
-
-        prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
-        with FileLock(FAISS_LOCK):
-            sel = make_id_selector(ids)
-            safe_remove_ids(chunk_index, sel)
-            added, ids_added = add_with_ids_dedup(chunk_index, ids, Xc)
-            saved = False
-            if added:
-                saved = faiss_save_force(chunk_index, CHUNK_INDEX_PATH) if prior_ntotal == 0 \
-                        else faiss_save(chunk_index, CHUNK_INDEX_PATH)
-        if added and saved:
-            with FileLock(DB_LOCK):
-                db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
-                db_flush_pending_marks(cur)
-                conn.commit()
-        else:
-            # Save failed - vectors are in FAISS but not marked in DB.
-            # reconcile_sqlite_flags_with_faiss() will fix this on next run.
-            conn.commit()
+    """Thin wrapper: delegates to litkit.build.backfill with runtime paths."""
+    get_runtime()
+    return build_backfill_unindexed_vectors(
+        conn, paper_embedder, chunk_embedder, paper_index, chunk_index,
+        paper_index_path=PAPER_INDEX_PATH,
+        chunk_index_path=CHUNK_INDEX_PATH,
+        faiss_lock_path=FAISS_LOCK,
+        db_lock_path=DB_LOCK,
+        FileLock=FileLock,
+        batch=batch,
+        paper_bs=paper_bs,
+        chunk_bs=chunk_bs,
+    )
 
 
 
 
 def _post_build_sanity_check(conn, args):
-    """Sanity print after build: DB vs FAISS counts and index types (papers & chunks)."""
-    get_runtime()  # ensure path globals are initialized for library use
-    # ----- papers -----
-    try:
-        p_idx = faiss.read_index(str(PAPER_INDEX_PATH))
-    except Exception:
-        p_idx = None
-    report_faiss_index("papers", PAPER_INDEX_PATH)
-
-    cur = conn.cursor()
-    n_db_p = cur.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
-    n_in_p = cur.execute("SELECT COUNT(*) FROM papers WHERE in_index=1").fetchone()[0]
-    n_faiss_p = int(getattr(p_idx, "ntotal", 0) or 0)
-    _eprint(f"[summary] papers: db={n_db_p} in_index={n_in_p} faiss_ntotal={n_faiss_p}")
-
-    # ----- chunks -----
-    try:
-        c_idx = faiss.read_index(str(CHUNK_INDEX_PATH))
-    except Exception:
-        c_idx = None
-    report_faiss_index("chunks", CHUNK_INDEX_PATH)
-
-    n_db_c = cur.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-    n_in_c = cur.execute("SELECT COUNT(*) FROM chunks WHERE in_index=1").fetchone()[0]
-    n_faiss_c = int(getattr(c_idx, "ntotal", 0) or 0)
-    _eprint(f"[summary] chunks: db={n_db_c} in_index={n_in_c} faiss_ntotal={n_faiss_c}")
+    """Thin wrapper: delegates to litkit.build.backfill with runtime paths."""
+    get_runtime()
+    return build_post_build_sanity_check(
+        conn,
+        paper_index_path=PAPER_INDEX_PATH,
+        chunk_index_path=CHUNK_INDEX_PATH,
+    )
 
 
 _STOPWORDS = {
@@ -2144,51 +2060,8 @@ def build_or_update_indices(args):
 
 
 def reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index) -> tuple[int, int]:
-    """For each table, if FAISS lacks some IDs that SQLite thinks are in the index,
-    reset those rows to in_index=0 so the normal backfill can re-add them.
-    Returns (papers_reset, chunks_reset).
-    """
-    cur = conn.cursor()
-    reset_p = reset_c = 0
-
-    # Papers
-    ids_present = faiss_present_ids(paper_index)
-    if ids_present is not None:
-        cur.execute("SELECT id, in_index FROM papers")
-        bad = [row[0] for row in cur.fetchall() if row[0] not in ids_present and row[1] == 1]
-        good_missing_flag = [
-            row[0]
-            for row in cur.execute("SELECT id FROM papers WHERE in_index=0").fetchall()
-            if row[0] in ids_present
-        ]
-        if bad:
-            cur.executemany("UPDATE papers SET in_index=0 WHERE id=?", [(i,) for i in bad])
-            reset_p = len(bad)
-        if good_missing_flag:
-            cur.executemany(
-                "UPDATE papers SET in_index=1 WHERE id=?", [(i,) for i in good_missing_flag]
-            )
-
-    # Chunks
-    ids_present = faiss_present_ids(chunk_index)
-    if ids_present is not None:
-        cur.execute("SELECT id, in_index FROM chunks")
-        bad = [row[0] for row in cur.fetchall() if row[0] not in ids_present and row[1] == 1]
-        good_missing_flag = [
-            row[0]
-            for row in cur.execute("SELECT id FROM chunks WHERE in_index=0").fetchall()
-            if row[0] in ids_present
-        ]
-        if bad:
-            cur.executemany("UPDATE chunks SET in_index=0 WHERE id=?", [(i,) for i in bad])
-            reset_c = len(bad)
-        if good_missing_flag:
-            cur.executemany(
-                "UPDATE chunks SET in_index=1 WHERE id=?", [(i,) for i in good_missing_flag]
-            )
-
-    conn.commit()
-    return reset_p, reset_c
+    """Thin wrapper: delegates to litkit.build.backfill."""
+    return build_reconcile_sqlite_flags(conn, paper_index, chunk_index)
 
 
 
