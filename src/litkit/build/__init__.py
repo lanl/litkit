@@ -23,6 +23,9 @@ from litkit.build.config import (
     BuildConfig,
     build_config_from_args,
 )
+from litkit.build.indices import (
+    init_empty_indices,
+)
 
 __all__ = [
     # helpers
@@ -38,4 +41,6 @@ __all__ = [
     # config
     "BuildConfig",
     "build_config_from_args",
+    # indices
+    "init_empty_indices",
 ]

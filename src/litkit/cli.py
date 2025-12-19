@@ -160,6 +160,9 @@ from litkit.build import (
     backfill_unindexed_vectors as build_backfill_unindexed_vectors,
     reconcile_sqlite_flags_with_faiss as build_reconcile_sqlite_flags,
     post_build_sanity_check as build_post_build_sanity_check,
+    BuildConfig,
+    build_config_from_args,
+    init_empty_indices as build_init_empty_indices,
 )
 from litkit.db import (
     SCHEMA as db_SCHEMA,
@@ -1002,38 +1005,21 @@ def build_or_update_indices(args):
     cur = conn.cursor()
 
     if args.init_indices_only:
-        if not args.faiss_writer:
-            raise ValueError("--init-indices-only requires --faiss-writer")
-        _eprint("[bootstrap] Creating empty FAISS indices...")
-        
-        paper_dim = 768  # SPECTER2 dimension
-        chunk_dim = 768  # SBERT dimension
-        
-        # Create paper index (always HNSW for papers)
-        paper_index = hnsw_index(
-            paper_dim,
-            M=args.hnsw_m,
-            ef_construction=args.efconstruction,
-            ef_search=args.efsearch,
+        # Build a minimal config for the module function
+        cfg = BuildConfig(
+            faiss_writer=args.faiss_writer,
+            papers_index=args.papers_index,
+            chunks_index=args.chunks_index,
+            hnsw_m=args.hnsw_m,
+            efconstruction=args.efconstruction,
+            efsearch=args.efsearch,
+            ivf_nlist=args.ivf_nlist,
+            pq_m=args.pq_m,
+            paper_index_path=PAPER_INDEX_PATH,
+            chunk_index_path=CHUNK_INDEX_PATH,
+            faiss_lock=FAISS_LOCK,
         )
-        paper_index = faiss.IndexIDMap2(paper_index)
-        ensure_parent(PAPER_INDEX_PATH)
-        with FileLock(FAISS_LOCK):
-            faiss_save_force(paper_index, PAPER_INDEX_PATH)
-        
-        # Create chunk index (FLAT or IVF-PQ based on args)
-        if args.chunks_index == "flat":
-            chunk_index = flat_ip_index(chunk_dim)
-        else:  # ivfpq
-            m_safe = safe_pq_m(chunk_dim, args.pq_m)
-            chunk_index = ivfpq_index(chunk_dim, nlist=args.ivf_nlist, m=m_safe)
-        
-        chunk_index = faiss.IndexIDMap2(chunk_index)
-        ensure_parent(CHUNK_INDEX_PATH)
-        with FileLock(FAISS_LOCK):
-            faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
-        
-        _eprint("[bootstrap] Empty indices created. Exiting.")
+        build_init_empty_indices(cfg, FileLock=FileLock)
         return
 
     if args.consume_only:
