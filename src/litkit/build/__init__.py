@@ -19,6 +19,10 @@ from litkit.build.backfill import (
     reconcile_sqlite_flags_with_faiss,
     post_build_sanity_check,
 )
+from litkit.build.config import (
+    BuildConfig,
+    build_config_from_args,
+)
 
 __all__ = [
     # helpers
@@ -31,4 +35,7 @@ __all__ = [
     "backfill_unindexed_vectors",
     "reconcile_sqlite_flags_with_faiss",
     "post_build_sanity_check",
+    # config
+    "BuildConfig",
+    "build_config_from_args",
 ]
