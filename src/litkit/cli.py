@@ -1016,63 +1016,22 @@ def build_or_update_indices(args):
     if args.consume_only:
         if not args.faiss_writer:
             raise ValueError("--consume-only requires --faiss-writer")
-        _eprint("[consumer] Starting consume-only mode")
+        
         seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
-        paper_index = faiss_load(PAPER_INDEX_PATH)
-        chunk_index = faiss_load(CHUNK_INDEX_PATH)
-        
-        consumer_coordinator = SegConsumerCoordinator(seg_dir, args.num_shards)
-        
-        def progress_callback(complete, total):
-            _eprint(f"[consumer] Progress: {complete}/{total} producers complete")
-        
-        # Wait for all producers to complete WITHOUT ingesting segments yet.
-        # We cannot ingest segments until the DB merge is complete, because
-        # segment files use doc_id (content-addressed) which must be resolved
-        # against the merged main database, not the empty initial DB.
-        _eprint("[consumer] Waiting for producers to complete...")
-        
-        # Wait for completion or timeout (10 hours / 36000s to match the cluster's max job time)
-        completed = consumer_coordinator.wait_for_completion(
-            poll_interval=30, timeout=36000, progress_callback=progress_callback
+        completed = build_run_consume_only_mode(
+            conn,
+            seg_dir=seg_dir,
+            num_shards=args.num_shards,
+            paper_index_path=PAPER_INDEX_PATH,
+            chunk_index_path=CHUNK_INDEX_PATH,
+            faiss_lock_path=FAISS_LOCK,
+            db_lock_path=DB_LOCK,
+            FileLock=FileLock,
         )
-        if not completed:
-            _eprint("[consumer] TIMEOUT waiting for producers; aborting consume-only run.")
-            return
-        _eprint("[consumer] All producers have completed")
-        
-        # Merge all shard databases into the main database FIRST.
-        # This populates the main DB with all papers/chunks so that
-        # doc_id → paper_id resolution works during segment ingestion.
-        _eprint("[consumer] All producers complete, merging shard databases...")
-        merge_stats = db_merge_shard_databases(conn, delete_after_merge=True)
-        if merge_stats["shards"] > 0:
-            _eprint(f"[consumer] Merged {merge_stats['shards']} shard DB(s): "
-                    f"{merge_stats['papers']} papers, {merge_stats['chunks']} chunks, {merge_stats['files']} files")
-        
-        # NOW ingest segments - the main DB has all the data for doc_id resolution
-        _eprint("[consumer] Ingesting embedding segments...")
-        paper_index, p_added = seg_ingest_paper_segments(
-            conn, paper_index, seg_dir, FAISS_LOCK, PAPER_INDEX_PATH, DB_LOCK,
-            FileLock=FileLock
-        )
-        chunk_index, c_added = seg_ingest_chunk_segments(
-            conn, chunk_index, seg_dir, FAISS_LOCK, CHUNK_INDEX_PATH, DB_LOCK,
-            FileLock=FileLock
-        )
-        _eprint(f"[consumer] Ingested {p_added} paper vectors and {c_added} chunk vectors")
-        
-        # Force save indices after ingestion
-        with FileLock(FAISS_LOCK):
-            faiss_save_force(paper_index, PAPER_INDEX_PATH)
-            faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
-        with FileLock(DB_LOCK):
-            db_flush_pending_marks(conn.cursor())
-            conn.commit()
-        
-        _eprint("[consumer] Consume-only mode completed")
         conn.close()
-        return  # End consume-only mode
+        if not completed:
+            return  # Timeout - already logged in module
+        return  # Success - end consume-only mode
 
     # Embedders
     paper_embedder, _paper_cfg = make_paper_embedder()
