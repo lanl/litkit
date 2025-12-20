@@ -77,6 +77,35 @@ LitKit uses a **two-stage retrieval** approach:
 --chunk-embed-bs 64    # Chunk embedding batch size
 ```
 
+## Concurrency Model
+
+LitKit supports multi-node builds with a **producer/consumer architecture**:
+
+| Role | Database | Description |
+|------|----------|-------------|
+| **Producers** (`--embed-producer`) | Shard-specific DB | Each producer writes to its own SQLite file |
+| **Consumer** (`--consume-only --faiss-writer`) | Main DB | Merges shard DBs and ingests embedding segments |
+| **Single-node** (`--faiss-writer`) | Main DB | All operations in one process |
+
+### ⚠️ Important: Do NOT Share a Main DB Across Writers
+
+SQLite handles concurrent *readers* well, but concurrent *writers* to the same database file will cause `SQLITE_BUSY` errors, especially on network filesystems (NFS/Lustre).
+
+**Correct multi-node setup:**
+```bash
+# Producers (one per node, each gets own shard DB)
+srun --ntasks=N litkit --embed-producer --shard-id $SLURM_PROCID --num-shards N
+
+# Consumer (single node, merges DBs at end)
+litkit --consume-only --faiss-writer --num-shards N
+```
+
+**Incorrect (will fail):**
+```bash
+# WRONG: Multiple processes writing to same main DB
+srun --ntasks=N litkit --faiss-writer ...  # Race conditions!
+```
+
 ## Environment Variables
 
 | Variable | Description |

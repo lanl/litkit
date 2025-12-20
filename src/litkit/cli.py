@@ -994,6 +994,28 @@ def build_or_update_indices(args):
                 manifest_path = str(args.tar_manifest) if args.tar_manifest else None
                 seg_write_build_meta(seg_dir, args.num_shards, manifest_path, mode="single")
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # DATABASE CONCURRENCY CONTRACT
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 
+    # SQLite concurrency model for litkit builds:
+    #
+    #   1. PRODUCERS (--embed-producer): Each gets its own shard-specific DB file.
+    #      No external locking needed; SQLite handles single-writer internally.
+    #
+    #   2. CONSUMER/WRITER (--faiss-writer): Uses the main DB exclusively.
+    #      Pure-DB writes (INSERT, UPDATE) rely on SQLite busy_timeout.
+    #      Cross-resource ops (DB + FAISS) use FileLock(DB_LOCK) + FileLock(FAISS_LOCK).
+    #
+    #   3. QUERIES (search path): Read-only; no locking required.
+    #
+    # ⚠️  DO NOT run multiple --faiss-writer processes against the same DB!
+    #     SQLite handles concurrent readers, but concurrent writers to the same
+    #     file WILL cause SQLITE_BUSY errors, especially on NFS/Lustre.
+    #
+    # See README.md "Concurrency Model" for the correct multi-node setup.
+    # ═══════════════════════════════════════════════════════════════════════════
+    
     # Use shard-specific DB for producers (lock-free parallel writes)
     if args.embed_producer and not args.faiss_writer:
         _eprint(f"[build] Producer mode: using shard-specific DB for shard {args.shard_id}")
