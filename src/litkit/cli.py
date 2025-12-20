@@ -1556,13 +1556,10 @@ def build_or_update_indices(args):
         # Skip exactly 'start_persisted' members (they are guaranteed persisted)
         skipped = 0
 
-        for m, fobj in iter_tar_xml_streams(tpath):
+        # Use iter_tar_articles for parallel XML parsing (--parse-workers)
+        for m, meta in iter_tar_articles(tpath, parse_workers=args.parse_workers):
             if skipped < start_persisted:
                 skipped += 1
-                try:
-                    fobj.close()
-                except Exception:
-                    pass
                 if skipped == start_persisted:
                     _render(force=True)  # render resume point
                 continue
@@ -1596,19 +1593,10 @@ def build_or_update_indices(args):
                 if not args.rebuild and db_already_processed(cur, str(f), st):
                     handled_ok = True
 
+                # iter_tar_articles already parsed the XML; meta is None if unparsable
+                elif meta is None:
+                    handled_ok = True  # permanently skip bad member next time
                 else:
-                    # Parse the member; treat unparsable as handled to avoid infinite retries
-                    try:
-                        meta = parse_xml_fileobj(fobj)
-                    finally:
-                        try:
-                            fobj.close()
-                        except Exception:
-                            pass
-
-                    if not meta:
-                        handled_ok = True  # permanently skip bad member next time
-                    else:
                         # ---------- BEGIN INGEST BODY (same semantics; no member-based checkpointing here) ----------
                         pmcid = (meta["pmcid"] or "").strip()
                         pmid = (meta["pmid"] or "").strip()
