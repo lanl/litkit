@@ -150,7 +150,6 @@ from litkit.index import (
     # Dedup
     add_with_ids_dedup,
 )
-from litkit.pipeline import dedupe_ids_and_texts
 from litkit.build import (
     pack_paragraphs,
     dedupe_papers_with_doc_ids,
@@ -1888,7 +1887,10 @@ def build_or_update_indices(args):
     if args.faiss_writer:
 
         if paper_ids_buf:
-            u_ids, u_texts = dedupe_ids_and_texts(paper_ids_buf, paper_texts_buf)
+            # Use same dedupe function as mid-batch for consistency (discard doc_ids)
+            u_ids, u_texts, _ = dedupe_papers_with_doc_ids(
+                paper_ids_buf, paper_texts_buf, paper_doc_ids_buf
+            )
             Xp = paper_embedder.encode(
                 u_texts,
                 progress_label=f"Embedding papers (batch of {len(u_texts)})",
@@ -1917,7 +1919,10 @@ def build_or_update_indices(args):
         paper_texts_buf.clear()
 
         if chunk_ids_buf:
-            u_ids, u_texts = dedupe_ids_and_texts(chunk_ids_buf, chunk_texts_buf)
+            # Use same dedupe function as mid-batch for consistency (discard doc_ids/ords)
+            u_ids, u_texts, _, _ = dedupe_chunks_with_doc_ids(
+                chunk_ids_buf, chunk_texts_buf, chunk_paper_doc_ids_buf, chunk_ords_buf
+            )
             Xc = chunk_embedder.encode(
                 u_texts,
                 progress_label=f"Embedding chunks (batch of {len(u_texts)})",
