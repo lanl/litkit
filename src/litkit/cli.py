@@ -686,7 +686,7 @@ def backfill_unindexed_vectors(
 
 
 def _post_build_sanity_check(conn, args):
-    """Thin wrapper: delegates to litkit.build.backfill with runtime paths."""
+    """Thin wrapper: delegates to litkit.build.post_build_sanity_check with runtime paths."""
     get_runtime()
     return build_post_build_sanity_check(
         conn,
