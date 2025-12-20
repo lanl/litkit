@@ -26,6 +26,9 @@ from litkit.build.config import (
 from litkit.build.indices import (
     init_empty_indices,
 )
+from litkit.build.consume import (
+    run_consume_only_mode,
+)
 
 __all__ = [
     # helpers
@@ -43,4 +46,6 @@ __all__ = [
     "build_config_from_args",
     # indices
     "init_empty_indices",
+    # consume
+    "run_consume_only_mode",
 ]
