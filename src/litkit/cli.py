@@ -163,6 +163,8 @@ from litkit.build import (
     build_config_from_args,
     init_empty_indices as build_init_empty_indices,
     run_consume_only_mode as build_run_consume_only_mode,
+    load_or_create_paper_index as build_load_or_create_paper_index,
+    load_or_create_chunk_index as build_load_or_create_chunk_index,
 )
 from litkit.db import (
     init_db as db_init_db,
