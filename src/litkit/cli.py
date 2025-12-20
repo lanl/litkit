@@ -3178,9 +3178,11 @@ def main():
 
     # Do we need tar shards?
     # Note: --consume-only doesn't need corpus (it only ingests pre-computed segments)
+    # Note: --reconcile-only doesn't need corpus (it only fixes in_index flags)
     # Note: --faiss-writer is a role flag (may mutate indices), not "must scan tars"
     needs_corpus = (
         not args.consume_only
+        and not args.reconcile_only
         and (
             args.rebuild
             or args.update
