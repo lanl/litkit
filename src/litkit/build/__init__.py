@@ -25,6 +25,8 @@ from litkit.build.config import (
 )
 from litkit.build.indices import (
     init_empty_indices,
+    load_or_create_paper_index,
+    load_or_create_chunk_index,
 )
 from litkit.build.consume import (
     run_consume_only_mode,
@@ -46,6 +48,8 @@ __all__ = [
     "build_config_from_args",
     # indices
     "init_empty_indices",
+    "load_or_create_paper_index",
+    "load_or_create_chunk_index",
     # consume
     "run_consume_only_mode",
 ]
