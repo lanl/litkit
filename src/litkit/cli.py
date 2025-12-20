@@ -164,7 +164,6 @@ from litkit.build import (
     init_empty_indices as build_init_empty_indices,
 )
 from litkit.db import (
-    SCHEMA as db_SCHEMA,
     init_db as db_init_db,
     init_shard_db as db_init_shard_db,
     connect_db as db_connect_db,
@@ -624,54 +623,6 @@ import faiss
 import numpy as np
 
 # Note: faiss.cvar.seed is set inside _init_runtime() to avoid import-time side effects
-
-
-
-def _idmap_bloom(index, bits_per_key=8):
-    # Build once per process when needed
-    ids = None
-    try:
-        if isinstance(index, faiss.IndexIDMap2):
-            ids = faiss.vector_to_array(index.id_map)
-        elif hasattr(index, "index") and isinstance(index.index, faiss.IndexIDMap2):
-            ids = faiss.vector_to_array(index.index.id_map)
-    except Exception:
-        return None
-    if ids is None:
-        return None
-    import hashlib
-    import math
-
-    n = len(ids)
-    if n == 0:
-        return None
-    m = max(1024, n * bits_per_key)  # bits
-    k = max(2, int(round((m / n) * math.log(2))))  # hash rounds
-    bitarr = bytearray((m + 7) // 8)
-
-    def _set(h):
-        i = h % m
-        bitarr[i // 8] = bitarr[i // 8] | (1 << (i % 8))
-
-    def _hashes(x):
-        b = int(x).to_bytes(8, "little", signed=False)
-        h1 = int(hashlib.blake2b(b, digest_size=8).hexdigest(), 16)
-        h2 = int(hashlib.sha1(b).hexdigest(), 16)
-        for t in range(k):
-            yield (h1 + t * h2)
-
-    for x in ids:
-        for h in _hashes(x):
-            _set(h)
-
-    def contains(x):
-        for h in _hashes(int(x)):
-            i = h % m
-            if (bitarr[i // 8] >> (i % 8)) & 1 == 0:
-                return False
-        return True
-
-    return contains
 
 
 # -------------------- FAISS index helpers --------------------
@@ -3200,10 +3151,18 @@ def main():
         If any component is missing, returns False (treat as "no vector store").
         This is intentional: a partial store (e.g., DB exists but one index missing)
         requires a fresh build or --init-indices-only to bootstrap.
+        
+        Note: FileNotFoundError is expected (no store yet), but permission errors
+        and path misconfigurations are re-raised so they aren't silently masked.
         """
         try:
             return PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists() and DB_PATH.exists()
-        except Exception:
+        except (FileNotFoundError, OSError) as e:
+            # OSError covers permission denied, path too long, etc.
+            if isinstance(e, FileNotFoundError):
+                return False
+            # For other OSErrors (permissions, etc.), warn but don't mask
+            _eprint(f"[warning] _vector_store_exists() failed: {e.__class__.__name__}: {e}")
             return False
 
     # Early guard for --consume-only with missing indices
