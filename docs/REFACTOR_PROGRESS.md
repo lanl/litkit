@@ -872,3 +872,159 @@ paused the Phase 6 extraction to fix correctness issues before continuing.
 - **13 commits** for bug fixes and documentation
 - **3 items** reviewed and confirmed correct (no changes)
 - **Most critical**: SAVEPOINT fix (1.1) and buffer/rollback desync (1.2) prevented potential data loss during tar member processing errors
+
+---
+
+## Work Completed 2024-12-19 (Evening Session)
+
+### Phase 6.2c: Extract run_consume_only_mode (COMPLETE)
+
+Extracted the `--consume-only` mode logic into a reusable module function.
+
+| Commit | Description |
+|--------|-------------|
+| `14ce911` | Document bug fix session in REFACTOR_PROGRESS.md |
+| `c6fb45f` | Create `litkit/build/consume.py` module with `run_consume_only_mode()` |
+| `1bcb084` | Wire cli.py to use module function (-41 lines) |
+
+**Created `litkit/build/consume.py`** (~120 lines):
+
+```python
+def run_consume_only_mode(
+    conn: Connection,
+    *,
+    seg_dir: Path,
+    num_shards: int,
+    paper_index_path: Path,
+    chunk_index_path: Path,
+    faiss_lock_path: Path,
+    db_lock_path: Path,
+    FileLock: type,
+    poll_interval: int = 30,
+    timeout: int = 36000,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> bool:
+    """Run consumer-only mode: wait for producers, merge DBs, ingest segments."""
+```
+
+The function handles:
+- Polling for producer completion markers
+- Merging shard databases into main DB (via `merge_shard_databases`)
+- Ingesting paper/chunk embedding segments
+- Saving consolidated FAISS indices
+
+cli.py: 3492 → 3450 lines (-42 lines)
+
+### Phase 6.2d: Create load_or_create functions (IN PROGRESS)
+
+Added index load/create functions to the module, but wiring to cli.py is deferred.
+
+| Commit | Description |
+|--------|-------------|
+| `1b1d312` | Add `load_or_create_paper_index` and `load_or_create_chunk_index` to indices.py |
+| `627eff7` | Add imports to cli.py (wiring deferred) |
+
+**Added to `litkit/build/indices.py`** (~220 lines):
+
+```python
+def load_or_create_paper_index(
+    *,
+    paper_index_path: Path,
+    faiss_lock_path: Path,
+    db_lock_path: Path,
+    FileLock: type,
+    paper_dim: int,
+    papers_index: str,
+    hnsw_m: int,
+    efconstruction: int,
+    efsearch: int,
+    is_faiss_writer: bool,
+) -> faiss.Index:
+    """Load existing or create HNSW/FLAT paper index."""
+
+def load_or_create_chunk_index(
+    *,
+    chunk_index_path: Path,
+    chunk_trained_flag: Path,
+    faiss_lock_path: Path,
+    db_lock_path: Path,
+    FileLock: type,
+    chunk_dim: int,
+    chunks_index: str,
+    ivf_nlist: int,
+    pq_m: int,
+    is_faiss_writer: bool,
+) -> tuple[faiss.Index, bool]:
+    """Load existing or create FLAT/IVF-PQ chunk index. Returns (index, needs_training)."""
+
+def _clear_trained_flag(flag_path: Path) -> None:
+    """Remove the chunk trained flag file if it exists."""
+```
+
+**Status:** Module functions ready but NOT yet replacing inline code in cli.py.
+The inline index load/create logic is intertwined with IVF-PQ training detection
+(~200 lines) and requires careful refactoring to extract cleanly.
+
+cli.py: 3450 → 3480 lines (+30 lines from added imports; net effect minimal)
+
+### Updated Module Structure
+
+```
+src/litkit/build/
+├── __init__.py       # Package exports (14 items)
+├── helpers.py        # Text chunking & deduplication (~148 lines)
+├── backfill.py       # FAISS/SQLite reconciliation (~268 lines)
+├── config.py         # BuildConfig dataclass (~270 lines)
+├── indices.py        # Index creation utilities (~305 lines) ← expanded
+└── consume.py        # Consumer-only mode (~120 lines) ← NEW
+```
+
+### Progress Summary
+
+| Metric | Value |
+|--------|-------|
+| cli.py at session start | ~3492 lines |
+| cli.py now | ~3480 lines |
+| **Session reduction** | **-12 lines** |
+| **Total reduction (since 2024-12-18)** | **~1285 lines (27%)** |
+
+### Remaining Phase 6.2 Steps
+
+| Step | Description | Status | Est. Lines |
+|------|-------------|--------|------------|
+| 6.2c | Extract `run_consume_only_mode()` | ✅ COMPLETE | -42 |
+| 6.2d | Extract index load/create functions | 🔄 Module ready, wiring deferred | ~100 |
+| 6.2e | Extract IVF-PQ training | Not started | ~250 |
+| 6.2f | Extract tar processing loop | Not started | ~500 |
+| 6.2g | Final cleanup extraction | Not started | ~80 |
+
+### Next Steps (Resume Point)
+
+**Option A - Continue Phase 6.2d:**
+- Carefully extract IVF-PQ training detection into the module
+- Then wire cli.py to call `load_or_create_paper_index` and `load_or_create_chunk_index`
+
+**Option B - Skip to Phase 6.2e:**
+- Extract retrieval helpers (`shortlist_papers`, `search_chunks_constrained`)
+- These are cleaner extraction targets with less interdependency
+
+The IVF-PQ training logic is tightly coupled with index creation, so Option A
+may require extracting training as part of the same refactoring step.
+
+---
+
+## Current Status
+
+**cli.py is now ~3480 lines** (down from ~4723 at start of 2024-12-18 session, **~1285 lines / 27% reduction**).
+
+### Summary of Reductions
+
+| Phase | Description | Lines Removed |
+|-------|-------------|---------------|
+| 2024-12-18 | FAISS, Progress, FileLock, Runtime extraction | ~664 |
+| 2024-12-18 | Dead code removal (_ingest_*, _add_ids_union_compat) | ~374 |
+| 2024-12-19 | Bug fixes + minor cleanup | ~23 |
+| 2024-12-19 | Phase 6.1 helpers + backfill extraction | ~127 |
+| 2024-12-19 | Phase 6.2a-b (BuildConfig, init_empty_indices) | ~43 |
+| 2024-12-19 | Phase 6.2c (run_consume_only_mode) | ~42 |
+| 2024-12-19 | Phase 6.2d (load_or_create functions - module only) | ~12 |
