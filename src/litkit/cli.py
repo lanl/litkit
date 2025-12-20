@@ -790,7 +790,7 @@ _STOPWORDS = {
 }
 
 # optional kill-switch for lexical prefilter on very large DBs
-DISABLE_LEXICAL = os.environ.get("LITKIT_NO_LEXICAL", "") != ""
+DISABLE_LEXICAL = os.environ.get("LITKIT_NO_LEXICAL", "0") == "1"
 
 # one-shot guard for noisy sqlite3.OperationalError logging in lexical prefilter
 _LEXICAL_WARN_ONCE = False
