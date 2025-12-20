@@ -1572,6 +1572,18 @@ def build_or_update_indices(args):
                 st_size=int(getattr(m, "size", 0)), st_mtime=float(getattr(m, "mtime", 0.0) or 0.0)
             )
 
+            # Snapshot buffer lengths BEFORE processing so we can truncate on rollback.
+            # This ensures in-memory buffers stay in sync with SQLite savepoint rollbacks.
+            buf_snapshot = (
+                len(paper_ids_buf),
+                len(paper_texts_buf),
+                len(paper_doc_ids_buf),
+                len(chunk_ids_buf),
+                len(chunk_texts_buf),
+                len(chunk_paper_doc_ids_buf),
+                len(chunk_ords_buf),
+            )
+
             # Use savepoint for per-member transactionality. On exception, only
             # this member is rolled back; prior successful work is preserved.
             conn.execute("SAVEPOINT member_sp")
@@ -1834,6 +1846,19 @@ def build_or_update_indices(args):
                     conn.execute("RELEASE SAVEPOINT member_sp")  # Clean up savepoint
                 except Exception:
                     pass
+                
+                # Truncate in-memory buffers back to pre-member state to stay in sync
+                # with the SQLite savepoint rollback. Without this, buffers could contain
+                # IDs that were rolled back and no longer exist in the DB.
+                (p_len, pt_len, pd_len, c_len, ct_len, cp_len, co_len) = buf_snapshot
+                del paper_ids_buf[p_len:]
+                del paper_texts_buf[pt_len:]
+                del paper_doc_ids_buf[pd_len:]
+                del chunk_ids_buf[c_len:]
+                del chunk_texts_buf[ct_len:]
+                del chunk_paper_doc_ids_buf[cp_len:]
+                del chunk_ords_buf[co_len:]
+                
                 handled_ok = False  # do not advance processed_count; retry next run
 
             # Update progress & checkpoint only after a successful handle
