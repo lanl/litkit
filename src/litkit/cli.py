@@ -213,6 +213,17 @@ def _effective_nlist(n_train: int, requested_nlist: int, min_nlist: int = 16, *,
 
 
 def _maybe_cleanup_own_stale_guard():
+    """Best-effort cleanup of a guard file left by THIS process.
+    
+    Only removes the guard if the recorded PID matches os.getpid().
+    This handles the case where the same process tries to re-create
+    a guard (e.g., after a soft restart), but does NOT clean up
+    guards left by crashed processes with different PIDs - that's
+    handled by TTL-based stale detection in _create_writer_guard_or_exit.
+    
+    Note: PID reuse is theoretically possible after a crash, but rare
+    enough that we accept this as a benign edge case.
+    """
     get_runtime()  # ensure WRITER_GUARD is bound
     try:
         if WRITER_GUARD.exists():
