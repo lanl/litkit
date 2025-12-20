@@ -615,7 +615,12 @@ def _resolve_question(args) -> str | None:
         if p.is_file():
             return p.read_text(encoding="utf-8", errors="ignore").strip()
 
-    # 2b) treat as literal question
+    # 2b) bare path to existing file (e.g., ./question.txt)
+    p = Path(q)
+    if p.is_file():
+        return p.read_text(encoding="utf-8", errors="ignore").strip()
+
+    # 2c) treat as literal question
     return q.strip()
 
 
