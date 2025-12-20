@@ -280,8 +280,9 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
                 if len(parts) >= 3:
                     try: ts = int(parts[2])
                     except ValueError: ts = 0
-                # Only attempt cleanup on first attempt and if guard is stale
-                if ts and (time.time() - ts) > ttl_sec and attempt == 0:
+                # Only attempt cleanup on first attempt and if guard is stale.
+                # TTL ≤ 0 means "never consider guards stale" (manual cleanup required).
+                if ttl_sec > 0 and ts and (time.time() - ts) > ttl_sec and attempt == 0:
                     _eprint(f"[writer] Guard appears stale (> {ttl_sec}s): {info}. Attempting exclusive cleanup.")
                     try:
                         stale = WRITER_GUARD.with_suffix(".guard.stale."+str(os.getpid()))
