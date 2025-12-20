@@ -815,6 +815,60 @@ src/litkit/build/
 
 ### Next Immediate Steps
 
-1. **Pause extraction** - User wants to discuss potential bugs
-2. **After bug discussion** - Continue with Phase 6.2c (run_consume_only_mode)
+1. ~~**Pause extraction** - User wants to discuss potential bugs~~ ✅ Done
+2. **Resume refactor** - Continue with Phase 6.2c (run_consume_only_mode)
 3. **Test after each sub-phase** with `./test_build.sh --clean`
+
+---
+
+## Work Completed 2024-12-19 (Bug Fix Aside Session)
+
+### Code Review Bug Fixes (14 commits)
+
+Comprehensive bug fix session addressing issues found in code review. This work
+paused the Phase 6 extraction to fix correctness issues before continuing.
+
+#### Critical Fixes
+
+| Commit | Issue | Description |
+|--------|-------|-------------|
+| `4bb8f6e` | **DATA LOSS** | Checkpoint/rollback: `conn.commit()` was releasing savepoint, causing partial member data to be committed even on error. Fixed with proper SAVEPOINT/RELEASE/ROLLBACK pattern. |
+| `6a3214e` | **DATA LOSS** | Buffer/rollback desync: In-memory buffers could contain IDs rolled back in SQLite. Now truncates buffers to pre-member snapshot on error. |
+| `759976d` | **RESOURCE LEAK** | DB connection leak in `_auto_top_papers()`: Early returns bypassed `conn.close()`. Fixed with try/finally. |
+| `7f97812` | **BUG** | `LITKIT_NO_LEXICAL` env var checked `!= "0"` instead of `== "1"`, meaning any value (even "false") disabled lexical. |
+| `d6b7196` | **DEAD CODE** | `--parse-workers` flag was parsed but never passed to `iter_tar_articles()`. Now wired through. |
+| `a6ab735` | **REGRESSION** | `_resolve_question()` lost bare-path logic: `litkit ./question.txt` treated path as literal question instead of reading file. |
+
+#### Edge Case Fixes
+
+| Commit | Issue | Description |
+|--------|-------|-------------|
+| `277e127` | **SEMANTICS** | `LITKIT_WRITER_GUARD_TTL=0` previously meant "always steal guard" (any guard is >0s old). Now means "never auto-cleanup" (manual deletion required). |
+| `37a25b6` | **ERROR HANDLING** | `_vector_store_exists()` silently returned False on permission errors. Now exits with clear error message for OSError (permissions, path issues). |
+| `32f1de4` | **UX** | `--reconcile-only` with no existing store hit misleading "No tar shards" error. Now falls through to proper "run a build first" message. |
+
+#### Documentation & Hygiene
+
+| Commit | Issue | Description |
+|--------|-------|-------------|
+| `e75f064` | **DOCS** | Added SQLite concurrency model documentation to README.md and contract comment in cli.py. Prevents future "optimization" attempts that cause SQLITE_BUSY. |
+| `f0eae03` | **HYGIENE** | Removed dead `db_SCHEMA` import, `_idmap_bloom` function (~45 lines). Improved `_vector_store_exists()` exception handling. |
+| `eabeea5` | **HYGIENE** | Final flush used different dedupe function than mid-batch flush. Now uses same `dedupe_*_with_doc_ids()` functions throughout. |
+| `69d78b0` | **DOCS** | Fixed copy-paste error in `_post_build_sanity_check` docstring (said "backfill" instead of "sanity_check"). |
+| `763f9ea` | **DOCS** | Added docstring to `_maybe_cleanup_own_stale_guard` explaining it only cleans THIS process's guards (PID match), not general stale guards. |
+
+#### Reviewed but No Action Required
+
+| Item | Assessment |
+|------|------------|
+| Writer guard TTL semantics | Correct as-is: TTL≤0 → never auto-cleanup |
+| Stale guard cleanup exit behavior | Correct: fail-fast on FS errors is appropriate |
+| `_init_runtime()` FAISS seed exception | Silent catch is fine; failure would break more than seed |
+| `use_tar` assigned twice | Intentional: different scopes (training vs scanning) |
+| `FileLock.__init__` calls `get_runtime()` | Documented design; lock paths require runtime |
+
+### Summary
+
+- **13 commits** for bug fixes and documentation
+- **3 items** reviewed and confirmed correct (no changes)
+- **Most critical**: SAVEPOINT fix (1.1) and buffer/rollback desync (1.2) prevented potential data loss during tar member processing errors
