@@ -1572,6 +1572,9 @@ def build_or_update_indices(args):
                 st_size=int(getattr(m, "size", 0)), st_mtime=float(getattr(m, "mtime", 0.0) or 0.0)
             )
 
+            # Use savepoint for per-member transactionality. On exception, only
+            # this member is rolled back; prior successful work is preserved.
+            conn.execute("SAVEPOINT member_sp")
             try:
                 # inline heartbeat/progress refresh
                 _render()
@@ -1820,11 +1823,15 @@ def build_or_update_indices(args):
 
                         handled_ok = True
 
+                # Release savepoint on success (keep changes in transaction)
+                conn.execute("RELEASE SAVEPOINT member_sp")
+
             except Exception as e:
                 _eprint(f"[ingest] ERROR tar://{tpath}!/{m.name}: {e.__class__.__name__}: {e}")
+                # Rollback ONLY this member's changes via savepoint, preserving prior work
                 try:
-                    with FileLock(DB_LOCK):
-                        conn.rollback()
+                    conn.execute("ROLLBACK TO SAVEPOINT member_sp")
+                    conn.execute("RELEASE SAVEPOINT member_sp")  # Clean up savepoint
                 except Exception:
                     pass
                 handled_ok = False  # do not advance processed_count; retry next run
