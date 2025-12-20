@@ -3153,18 +3153,17 @@ def main():
         This is intentional: a partial store (e.g., DB exists but one index missing)
         requires a fresh build or --init-indices-only to bootstrap.
         
-        Note: FileNotFoundError is expected (no store yet), but permission errors
-        and path misconfigurations are re-raised so they aren't silently masked.
+        FileNotFoundError → return False (no store yet, expected case).
+        Other OSError → fatal exit (permissions, path misconfiguration).
         """
         try:
             return PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists() and DB_PATH.exists()
-        except (FileNotFoundError, OSError) as e:
-            # OSError covers permission denied, path too long, etc.
-            if isinstance(e, FileNotFoundError):
-                return False
-            # For other OSErrors (permissions, etc.), warn but don't mask
-            _eprint(f"[warning] _vector_store_exists() failed: {e.__class__.__name__}: {e}")
+        except FileNotFoundError:
             return False
+        except OSError as e:
+            # Permission denied, path too long, etc. - fail fast with clear message
+            _eprint(f"[error] cannot access vector store paths: {e.__class__.__name__}: {e}")
+            raise SystemExit(2)
 
     # Early guard for --consume-only with missing indices
     if args.consume_only and not _vector_store_exists():
