@@ -1020,6 +1020,7 @@ def build_or_update_indices(args):
             faiss_lock=FAISS_LOCK,
         )
         build_init_empty_indices(cfg, FileLock=FileLock)
+        conn.close()
         return
 
     if args.consume_only:
@@ -1080,6 +1081,7 @@ def build_or_update_indices(args):
             conn.commit()
         
         _eprint("[consumer] Consume-only mode completed")
+        conn.close()
         return  # End consume-only mode
 
     # Embedders
