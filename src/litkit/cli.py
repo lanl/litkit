@@ -94,7 +94,7 @@ if TYPE_CHECKING:
 # called at the top of any function that uses these dependencies.
 
 _heavy_lock = threading.Lock()
-_heavy_loaded = False
+_deps: SimpleNamespace | None = None  # Populated by _load_heavy_deps()
 
 def _load_heavy_deps() -> None:
     """Idempotent, thread-safe loader for heavy dependencies.
@@ -108,25 +108,16 @@ def _load_heavy_deps() -> None:
     
     Safe to call multiple times from multiple threads; only loads once.
     Uses double-checked locking to avoid races while minimizing lock contention.
+    
+    After loading, access dependencies via `_deps.name` (e.g., `_deps.db_connect_db`).
+    This consolidates all deferred imports into a single namespace for maintainability.
     """
-    global _heavy_loaded
-    if _heavy_loaded:
+    global _deps
+    if _deps is not None:
         return
     with _heavy_lock:
-        if _heavy_loaded:  # Double-check inside lock
+        if _deps is not None:  # Double-check inside lock
             return
-        
-        # Declare all globals we're about to bind (inside lock)
-        global configure_threads, detect_device, make_paper_embedder, make_chunk_embedder
-        global normalize_answer_and_build_refs, render_references
-        global iter_tar_paths, iter_tar_xml_streams, parallel_iter_tar_articles, parse_xml_fileobj
-        global is_uncompressed_tar, shard_filter
-        global db_init_db, db_init_shard_db, db_connect_db, db_shard_db_path
-        global db_chunk_ids_to_paper_ids, db_flush_pending_marks, db_load_temp_candidates
-        global seg_validate_shard_consistency, seg_write_build_meta, seg_read_build_meta
-        global seg_has_segment_files, SegmentWriter, ChunkSegmentWriter
-        global SegProducerCoordinator, SegConsumerCoordinator
-        global seg_ingest_paper_segments, seg_ingest_chunk_segments
         
         from litkit.embeddings.devices import configure_threads, detect_device
         from litkit.embeddings.factory import make_chunk_embedder, make_paper_embedder
@@ -168,7 +159,43 @@ def _load_heavy_deps() -> None:
         except Exception:
             pass
         
-        _heavy_loaded = True
+        # Consolidate all imports into a single namespace
+        _deps = SimpleNamespace(
+            # Embeddings
+            configure_threads=configure_threads,
+            detect_device=detect_device,
+            make_paper_embedder=make_paper_embedder,
+            make_chunk_embedder=make_chunk_embedder,
+            # Formatting
+            normalize_answer_and_build_refs=normalize_answer_and_build_refs,
+            render_references=render_references,
+            # Ingest
+            iter_tar_paths=iter_tar_paths,
+            iter_tar_xml_streams=iter_tar_xml_streams,
+            parallel_iter_tar_articles=parallel_iter_tar_articles,
+            parse_xml_fileobj=parse_xml_fileobj,
+            is_uncompressed_tar=is_uncompressed_tar,
+            shard_filter=shard_filter,
+            # DB
+            db_init_db=db_init_db,
+            db_init_shard_db=db_init_shard_db,
+            db_connect_db=db_connect_db,
+            db_shard_db_path=db_shard_db_path,
+            db_chunk_ids_to_paper_ids=db_chunk_ids_to_paper_ids,
+            db_flush_pending_marks=db_flush_pending_marks,
+            db_load_temp_candidates=db_load_temp_candidates,
+            # Segments
+            seg_validate_shard_consistency=seg_validate_shard_consistency,
+            seg_write_build_meta=seg_write_build_meta,
+            seg_read_build_meta=seg_read_build_meta,
+            seg_has_segment_files=seg_has_segment_files,
+            SegmentWriter=SegmentWriter,
+            ChunkSegmentWriter=ChunkSegmentWriter,
+            SegProducerCoordinator=SegProducerCoordinator,
+            SegConsumerCoordinator=SegConsumerCoordinator,
+            seg_ingest_paper_segments=seg_ingest_paper_segments,
+            seg_ingest_chunk_segments=seg_ingest_chunk_segments,
+        )
 
 
 
@@ -758,7 +785,7 @@ def _auto_top_papers() -> int:
     
     conn = None
     try:
-        conn = db_connect_db(DB_PATH)
+        conn = _deps.db_connect_db(DB_PATH)
         n = conn.execute("SELECT COUNT(1) FROM papers").fetchone()[0]
         return _piecewise_heuristic(n)
     except Exception:
@@ -787,20 +814,20 @@ def iter_tar_articles(
         - article_meta is the parsed ArticleMeta dict
     """
     _load_heavy_deps()  # ensure iter_tar_xml_streams, etc. are available
-    use_parallel = parse_workers > 1 and is_uncompressed_tar(tar_path)
+    use_parallel = parse_workers > 1 and _deps.is_uncompressed_tar(tar_path)
     
     if use_parallel:
         # Parallel path for uncompressed tars
         from litkit.progress import is_quiet
         if not is_quiet():
             _eprint(f"[scan] using parallel XML parsing ({parse_workers} workers) for {tar_path.name}")
-        for member_meta, article_meta in parallel_iter_tar_articles(tar_path, workers=parse_workers):
+        for member_meta, article_meta in _deps.parallel_iter_tar_articles(tar_path, workers=parse_workers):
             yield member_meta, article_meta
     else:
         # Sequential path for compressed tars (or when parallel disabled)
-        for tarinfo, fobj in iter_tar_xml_streams(tar_path):
+        for tarinfo, fobj in _deps.iter_tar_xml_streams(tar_path):
             try:
-                article_meta = parse_xml_fileobj(fobj)
+                article_meta = _deps.parse_xml_fileobj(fobj)
                 if article_meta is not None:
                     # Wrap TarInfo in SimpleNamespace for consistent interface
                     member_meta = SimpleNamespace(
@@ -860,24 +887,24 @@ def build_or_update_indices(args):
     seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
     
     # Always validate if segment directory exists with prior work
-    if seg_has_segment_files(seg_dir) or seg_read_build_meta(seg_dir) is not None:
-        seg_validate_shard_consistency(seg_dir, args.num_shards, current_mode=build_mode)
+    if _deps.seg_has_segment_files(seg_dir) or _deps.seg_read_build_meta(seg_dir) is not None:
+        _deps.seg_validate_shard_consistency(seg_dir, args.num_shards, current_mode=build_mode)
     
     # Write build metadata if this is a fresh start
     # For multi-node: producer 0 writes it; for single-node: the writer writes it
     if is_multi_node:
         if args.embed_producer and args.shard_id == 0:
-            meta = seg_read_build_meta(seg_dir)
+            meta = _deps.seg_read_build_meta(seg_dir)
             if meta is None:
                 manifest_path = str(args.tar_manifest) if args.tar_manifest else None
-                seg_write_build_meta(seg_dir, args.num_shards, manifest_path, mode="multi")
+                _deps.seg_write_build_meta(seg_dir, args.num_shards, manifest_path, mode="multi")
     else:
         # Single-node mode: write metadata if fresh start
         if args.faiss_writer:
-            meta = seg_read_build_meta(seg_dir)
+            meta = _deps.seg_read_build_meta(seg_dir)
             if meta is None and not args.init_indices_only:
                 manifest_path = str(args.tar_manifest) if args.tar_manifest else None
-                seg_write_build_meta(seg_dir, args.num_shards, manifest_path, mode="single")
+                _deps.seg_write_build_meta(seg_dir, args.num_shards, manifest_path, mode="single")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # DATABASE CONCURRENCY CONTRACT
@@ -904,10 +931,10 @@ def build_or_update_indices(args):
     # Use shard-specific DB for producers (lock-free parallel writes)
     if args.embed_producer and not args.faiss_writer:
         _eprint(f"[build] Producer mode: using shard-specific DB for shard {args.shard_id}")
-        conn = db_init_shard_db(db_shard_db_path(SQLITE_DIR, args.shard_id), args.shard_id, args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
+        conn = _deps.db_init_shard_db(_deps.db_shard_db_path(SQLITE_DIR, args.shard_id), args.shard_id, args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
     else:
         _eprint(f"[build] using DB at {DB_PATH}")
-        conn = db_init_db(DB_PATH, args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
+        conn = _deps.db_init_db(DB_PATH, args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
     cur = conn.cursor()
 
     if args.init_indices_only:
@@ -950,8 +977,8 @@ def build_or_update_indices(args):
         return  # Success - end consume-only mode
 
     # Embedders
-    paper_embedder, _paper_cfg = make_paper_embedder()
-    chunk_embedder, _chunk_cfg = make_chunk_embedder(
+    paper_embedder, _paper_cfg = _deps.make_paper_embedder()
+    chunk_embedder, _chunk_cfg = _deps.make_chunk_embedder(
         devices=args.embed_devices,
         workers=args.embed_workers,
         force_devices=args.force_embed_devices,
@@ -1056,8 +1083,8 @@ def build_or_update_indices(args):
 
     # ----- TAR SHARD PATH (NO EXTRACTION) -----
     tar_paths = list(
-        shard_filter(
-            iter_tar_paths(args.tar_dir, args.tar_manifest), args.shard_id, args.num_shards
+        _deps.shard_filter(
+            _deps.iter_tar_paths(args.tar_dir, args.tar_manifest), args.shard_id, args.num_shards
         )
     )
 
@@ -1110,7 +1137,7 @@ def build_or_update_indices(args):
     # Write completion marker for producer
     if args.embed_producer:
         seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
-        producer_coordinator = SegProducerCoordinator(seg_dir, args.shard_id, args.num_shards)
+        producer_coordinator = _deps.SegProducerCoordinator(seg_dir, args.shard_id, args.num_shards)
         producer_coordinator.mark_complete()
         _eprint(f"[producer] Shard {args.shard_id}/{args.num_shards} marked complete")
 
@@ -1119,11 +1146,11 @@ def build_or_update_indices(args):
 
         if args.consume_segments and seg_dir and Path(seg_dir).exists():
             # Ingest segments - functions handle IDMap2 wrapping and return the (possibly wrapped) index
-            paper_index, p_added = seg_ingest_paper_segments(
+            paper_index, p_added = _deps.seg_ingest_paper_segments(
                 conn, paper_index, seg_dir, FAISS_LOCK, PAPER_INDEX_PATH, DB_LOCK,
                 FileLock=FileLock
             )
-            chunk_index, c_added = seg_ingest_chunk_segments(
+            chunk_index, c_added = _deps.seg_ingest_chunk_segments(
                 conn, chunk_index, seg_dir, FAISS_LOCK, CHUNK_INDEX_PATH, DB_LOCK,
                 FileLock=FileLock
             )
@@ -1154,7 +1181,7 @@ def build_or_update_indices(args):
             faiss_save_force(paper_index, PAPER_INDEX_PATH)
             faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
         with FileLock(DB_LOCK):
-            db_flush_pending_marks(conn.cursor())
+            _deps.db_flush_pending_marks(conn.cursor())
             conn.commit()
 
         try:
@@ -1208,7 +1235,7 @@ def shortlist_papers(
     _load_heavy_deps()  # ensure make_paper_embedder is available
     from litkit.retrieval import shortlist_papers as retrieval_shortlist_papers
     get_runtime()
-    enc = embedder or make_paper_embedder()[0]
+    enc = embedder or _deps.make_paper_embedder()[0]
     return retrieval_shortlist_papers(
         question, k,
         paper_index_path=PAPER_INDEX_PATH,
@@ -1234,7 +1261,7 @@ def search_chunks_constrained(
     _load_heavy_deps()  # ensure db_*, make_chunk_embedder are available
     from litkit.retrieval import search_chunks_constrained as retrieval_search_chunks_constrained
     get_runtime()
-    enc = embedder or make_chunk_embedder()[0]
+    enc = embedder or _deps.make_chunk_embedder()[0]
     return retrieval_search_chunks_constrained(
         question=question,
         candidate_papers=candidate_papers,
@@ -1242,9 +1269,9 @@ def search_chunks_constrained(
         chunk_index_path=CHUNK_INDEX_PATH,
         db_path=DB_PATH,
         embedder=enc,
-        connect_db=db_connect_db,
-        load_temp_candidates=db_load_temp_candidates,
-        chunk_ids_to_paper_ids=db_chunk_ids_to_paper_ids,
+        connect_db=_deps.db_connect_db,
+        load_temp_candidates=_deps.db_load_temp_candidates,
+        chunk_ids_to_paper_ids=_deps.db_chunk_ids_to_paper_ids,
         overshoot=overshoot,
         nprobe=nprobe,
         min_chunks_per_paper=min_chunks_per_paper,
@@ -1972,8 +1999,8 @@ def main():
         format="%(levelname)s %(name)s: %(message)s",
         force=True,
     )
-    configure_threads()
-    device = detect_device()
+    _deps.configure_threads()
+    device = _deps.detect_device()
     if not (args.quiet or _SUPPRESS_EARLY):
         _eprint(f"[version] {_version_banner()}")
         _eprint(f"[device] using {device}")
@@ -2189,17 +2216,17 @@ def main():
         conflict_reasons = []
         
         # Check for unconsumed segment files
-        if seg_has_segment_files(seg_dir):
+        if _deps.seg_has_segment_files(seg_dir):
             conflict_reasons.append(f"Segment directory {seg_dir} contains unconsumed segment files")
         
         # Check for producer completion markers (indicates multi-node run)
         # Use shard count from build_meta.json (if exists) to correctly interpret markers.
         # Without this, CLI --num-shards can mismatch the actual build config and cause
         # misdiagnosis (e.g., "3/4 incomplete" when the build was actually 3-shard and complete).
-        meta = seg_read_build_meta(seg_dir)
+        meta = _deps.seg_read_build_meta(seg_dir)
         effective_num_shards = meta.get("num_shards", args.num_shards) if meta else args.num_shards
         
-        coordinator = SegConsumerCoordinator(seg_dir, effective_num_shards)
+        coordinator = _deps.SegConsumerCoordinator(seg_dir, effective_num_shards)
         completed = coordinator.completed_shards()
         if completed:
             if len(completed) < effective_num_shards:
@@ -2233,7 +2260,7 @@ def main():
         # Lazy import for reconcile-only path
         from litkit.index import faiss_load, faiss_save_force
         
-        conn = db_connect_db(DB_PATH)
+        conn = _deps.db_connect_db(DB_PATH)
         try:
             try:
                 paper_index = faiss_load(PAPER_INDEX_PATH)
@@ -2247,8 +2274,8 @@ def main():
             if p_reset or c_reset:
                 _eprint(f"[reconcile] reset flags — papers={p_reset} chunks={c_reset}")
             # backfill (uses current embedders)
-            paper_embedder, _ = make_paper_embedder()
-            chunk_embedder, _ = make_chunk_embedder(
+            paper_embedder, _ = _deps.make_paper_embedder()
+            chunk_embedder, _ = _deps.make_chunk_embedder(
                 devices=args.embed_devices,
                 workers=args.embed_workers,
                 force_devices=args.force_embed_devices,
@@ -2273,14 +2300,14 @@ def main():
         outdir = args.embed_outdir or EMBED_SEGMENTS_DIR
         # producer_id = f"{socket.gethostname()}-{os.getpid()}"
 
-        paper_seg_writer = SegmentWriter(
+        paper_seg_writer = _deps.SegmentWriter(
             outdir=outdir,
             segment_size=DEFAULT_EMBED_SEGMENT_SIZE,
             dtype=DEFAULT_EMBED_SEGMENT_DTYPE,
             shard_id=args.shard_id,
             kind="papers",
         )
-        chunk_seg_writer = ChunkSegmentWriter(
+        chunk_seg_writer = _deps.ChunkSegmentWriter(
             outdir=outdir,
             segment_size=DEFAULT_EMBED_SEGMENT_SIZE,
             dtype=DEFAULT_EMBED_SEGMENT_DTYPE,
@@ -2340,7 +2367,7 @@ def main():
         )
         return
 
-    conn = db_connect_db(DB_PATH)
+    conn = _deps.db_connect_db(DB_PATH)
     try:
         chunks = get_chunks(conn, chunk_ids)
     finally:
@@ -2394,10 +2421,10 @@ def main():
         # Normalize oddball citation shapes the model may emit
         answer = _strip_citation_linelocs(answer)
         # Collapse chunk-level citations to doc-level and render a clean bibliography
-        answer, doc_refs = normalize_answer_and_build_refs(answer, selected_chunks)
+        answer, doc_refs = _deps.normalize_answer_and_build_refs(answer, selected_chunks)
         print(answer)
         print()
-        print(render_references(doc_refs))
+        print(_deps.render_references(doc_refs))
         print()
     else:
         # No model output -> print the context
