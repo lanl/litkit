@@ -160,6 +160,14 @@ def _load_heavy_deps() -> None:
             ingest_chunk_segments as seg_ingest_chunk_segments,
         )
         
+        # Set deterministic FAISS seed (moved from _init_runtime for conceptual purity)
+        # _init_runtime() is now purely filesystem/env; faiss belongs with heavy deps
+        try:
+            import faiss
+            faiss.cvar.seed = int(os.environ.get("LITKIT_FAISS_SEED", "123456"))
+        except Exception:
+            pass
+        
         _heavy_loaded = True
 
 
@@ -355,7 +363,7 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
 # - Path constant resolution (via __getattr__/get_runtime())
 # - Directory creation (sqlite_dir, indices_dir)
 # - Environment variable setup (HF_HOME, HF_HUB_OFFLINE, etc.)
-# - faiss.cvar.seed configuration
+# (Note: faiss.cvar.seed is now set in _load_heavy_deps(), not here)
 #
 # What is NOT deferred (import-time):
 # - Third-party imports: faiss, numpy (heavyweight but necessary for type hints)
@@ -402,13 +410,6 @@ def _init_runtime() -> "WorkspacePaths":
     
     # Create required directories
     paths.ensure_directories()
-    
-    # Set deterministic FAISS seed (deferred from import-time for import purity)
-    try:
-        import faiss
-        faiss.cvar.seed = int(os.environ.get("LITKIT_FAISS_SEED", "123456"))
-    except Exception:
-        pass
     
     return paths
 
@@ -675,7 +676,8 @@ def _resolve_question(args) -> str | None:
 
 # -------------------- Embedders --------------------
 
-# Note: faiss.cvar.seed is set inside _init_runtime() to avoid import-time side effects
+# Note: faiss.cvar.seed is set inside _load_heavy_deps() for conceptual purity
+# (_init_runtime() is now purely filesystem/env; faiss belongs with heavy deps)
 
 
 # -------------------- FAISS index helpers --------------------
