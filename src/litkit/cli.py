@@ -2636,13 +2636,11 @@ def main():
         This is intentional: a partial store (e.g., DB exists but one index missing)
         requires a fresh build or --init-indices-only to bootstrap.
         
-        FileNotFoundError → return False (no store yet, expected case).
-        Other OSError → fatal exit (permissions, path misconfiguration).
+        Note: Path.exists() returns False for missing files (doesn't raise).
+        OSError can occur for permission denied, path too long, etc.
         """
         try:
             return PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists() and DB_PATH.exists()
-        except FileNotFoundError:
-            return False
         except OSError as e:
             # Permission denied, path too long, etc. - fail fast with clear message
             _eprint(f"[error] cannot access vector store paths: {e.__class__.__name__}: {e}")
