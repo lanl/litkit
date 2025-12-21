@@ -1113,14 +1113,79 @@ Key changes:
 
 cli.py: 3441 → 3398 lines (-43 lines)
 
+### Phase 6.2d Steps C-D: IVF-PQ Training Extraction (COMPLETE)
+
+**Commit `41c5652`:** `refactor(build): create training.py with train_ivfpq_index function`
+
+Created `litkit/build/training.py` (~370 lines) with:
+- `_effective_nlist()` - Data-aware nlist calculation  
+- `_clear_trained_flag()` - Remove trained flag file
+- `train_ivfpq_index()` - Complete IVF-PQ training function that handles:
+  - Sample collection from tar files
+  - Training decision tree (FLAT fallback on insufficient data)
+  - IVF-PQ training with data-aware nlist selection
+  - Trained flag persistence
+
+**Commit `6b5dba6`:** `refactor(cli): wire IVF-PQ training to module function (Phase 6.2d Step D)`
+
+Replaced ~200 lines of inline IVF-PQ training code with a single call to the module function:
+
+```python
+# Before: ~200 lines of sample collection, training logic, fallback handling
+
+# After:
+chunk_index = build_train_ivfpq_index(
+    chunk_dim=chunk_dim,
+    chunk_embedder=chunk_embedder,
+    tar_dir=args.tar_dir,
+    tar_manifest=args.tar_manifest,
+    ivf_nlist=args.ivf_nlist,
+    pq_m=args.pq_m,
+    nprobe=args.nprobe,
+    # ... other params
+    chunk_index_path=CHUNK_INDEX_PATH,
+    chunk_trained_flag=CHUNK_TRAINED_FLAG,
+    faiss_lock_path=FAISS_LOCK,
+    db_lock_path=DB_LOCK,
+    FileLock=FileLock,
+    is_faiss_writer=args.faiss_writer,
+)
+```
+
+cli.py: 3398 → 3194 lines (-204 lines)
+
+### Updated Module Structure
+
+```
+src/litkit/build/
+├── __init__.py       # Package exports (16 items)
+├── helpers.py        # Text chunking & deduplication (~148 lines)
+├── backfill.py       # FAISS/SQLite reconciliation (~268 lines)
+├── config.py         # BuildConfig dataclass (~270 lines)
+├── indices.py        # Index creation utilities (~305 lines)
+├── consume.py        # Consumer-only mode (~120 lines)
+└── training.py       # IVF-PQ training (~370 lines) ← NEW
+```
+
+### Phase 6.2d Progress Summary
+
+| Step | Commit | Description | Lines Changed |
+|------|--------|-------------|---------------|
+| A | `dce49c6` | Wire paper index load to module | -39 |
+| B | `04f9e68` | Wire chunk index load/create to module | -43 |
+| C | `41c5652` | Create training.py module | +378 (module) |
+| D | `6b5dba6` | Wire training call in cli.py | -205 |
+
+**Phase 6.2d Total:** -287 lines from cli.py
+
 ### Next Steps (Resume Point)
 
-Continue with Phase 6.2d Step C:
-- Extract IVF-PQ training (~200 lines) to a module function in `litkit/build/training.py`
-- Create `train_chunks_ivfpq()` function that returns the trained index
+Continue with Phase 6.2e:
+- Extract retrieval helpers (`shortlist_papers`, `search_chunks_constrained`, `get_chunks`)
+- Target: `litkit/retrieval.py` or `litkit/retrieval/` package
 
 ---
 
 ## Current Status
 
-**cli.py is now 3398 lines** (down from ~4723 at start of 2024-12-18 session, **~1325 lines / 28% reduction**)
+**cli.py is now 3194 lines** (down from ~4723 at start of 2024-12-18 session, **~1529 lines / 32% reduction**)
