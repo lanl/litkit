@@ -389,8 +389,18 @@ from litkit.config.paths import WorkspacePaths
 # ═══════════════════════════════════════════════════════════════════════════════
 # LAZY RUNTIME INITIALIZATION (Phase 2 refactor)
 # ═══════════════════════════════════════════════════════════════════════════════
-# All path constants and side effects (mkdir, env vars) are deferred until first
-# access. This ensures `import litkit.cli` is pure (no I/O, no side effects).
+# Path discovery and filesystem I/O are deferred until first access.
+# 
+# What IS deferred (lazy):
+# - Path constant resolution (via __getattr__/get_runtime())
+# - Directory creation (sqlite_dir, indices_dir)
+# - Environment variable setup (HF_HOME, HF_HUB_OFFLINE, etc.)
+# - faiss.cvar.seed configuration
+#
+# What is NOT deferred (import-time):
+# - Third-party imports: faiss, numpy (heavyweight but necessary for type hints)
+# - Internal module imports: litkit.build, litkit.retrieval, etc.
+#
 # Access any path constant (e.g., SQLITE_DIR) to trigger initialization.
 # ═══════════════════════════════════════════════════════════════════════════════
 
