@@ -1715,11 +1715,92 @@ guard cleanup after crashes).
 **Note:** This requires careful design and testing. The heartbeat approach is the
 most robust but adds complexity. Recommend prototyping before committing.
 
+---
+
+## Work Completed 2024-12-20 (Code Review Session 3)
+
+### Critical Bug Fixes (2 commits)
+
+| Commit | Issue | Description |
+|--------|-------|-------------|
+| `5d58a8d` | **INGEST STALL** | `--strict-ingest` flag with mark-and-skip default. Previously, a single pathological XML could brick an entire tar shard forever (handled_ok=False → checkpoint stuck, retry same broken member forever). Now: logs to `ingest_failures.jsonl`, advances checkpoint, continues. Use `--strict-ingest` to opt into fail-fast behavior. |
+| `f5e1d5c` | **PERFORMANCE** | Skip savepoint overhead on no-write fast paths. Before: every tar member paid SAVEPOINT/RELEASE overhead even for `db_already_processed()` checks. After: check fast paths before entering savepoint region. ~2x throughput for `--update` and resume runs. |
+
+### P2 Architectural Issues Documented (3 commits)
+
+These require completing the refactor per SCOPE CONTRACT at top of cli.py:
+
+| Commit | Issue | Summary |
+|--------|-------|---------|
+| `4a0920f` | **Import-time side effects** | `from litkit.cli import SQLITE_DIR` triggers heavy imports + `__getattr__` mutations. Breaks import purity. Fix: move all business logic out of cli.py. |
+| `01c9b8f` | **Global mutable state** | `paper_seg_writer`, `chunk_seg_writer`, `_last_save_ts`, batching constants mutated from args. Causes hidden coupling. Fix: pass all context explicitly. |
+| `2991fba` | **Concurrency safety gaps** | `--rebuild` doesn't verify exclusive access. Cross-host TTL eviction can evict legitimate long builds. Potential fixes: heartbeat guard, default TTL off, exclusive maintenance lock. |
+
+### Session Summary
+
+| Metric | Value |
+|--------|-------|
+| Critical fixes | 2 |
+| P2 docs added | 3 |
+| Total commits (review sessions) | ~27 |
+
+---
+
+## Current Status
+
+**cli.py is now ~2770 lines** (down from ~4723 at start of 2024-12-18 session, **~1953 lines / 41% reduction**)
+
+### Summary of All Reductions
+
+| Phase | Description | Lines Removed |
+|-------|-------------|---------------|
+| 2024-12-18 | FAISS, Progress, FileLock, Runtime extraction | ~664 |
+| 2024-12-18 | Dead code removal (_ingest_*, _add_ids_union_compat) | ~374 |
+| 2024-12-19 | Bug fixes + minor cleanup | ~23 |
+| 2024-12-19 | Phase 6.1 helpers + backfill extraction | ~127 |
+| 2024-12-19 | Phase 6.2a-b (BuildConfig, init_empty_indices) | ~43 |
+| 2024-12-19 | Phase 6.2c (run_consume_only_mode) | ~42 |
+| 2024-12-19 | Phase 6.2d (index load + IVF-PQ training) | ~287 |
+| 2024-12-20 | Phase 6.2e (retrieval module + lexical) | ~170 |
+| 2024-12-20 | Phase 6.2g (dead helper removal) | ~457 |
+| **2024-12-20** | **Code review fixes** | **+30 (net)** |
+
+### Next Steps (Resume Point)
+
+**Phase 6.2f: Extract tar processing loop**
+
+The main `build_or_update_indices()` tar loop is ~500 lines of complex tar scanning/ingestion:
+
+```
+for tpath in tar_paths:
+    # Checkpoint loading
+    # Progress rendering setup
+    for m, meta in iter_tar_articles(...):
+        # Fast path checks
+        # Savepoint-protected DB writes
+        # Paper/chunk buffer flush
+        # Checkpoint updates
+    # Tar-boundary flush (producer mode)
+```
+
+**Extraction strategy:**
+1. Create `litkit/build/ingest_loop.py` with `process_tar_files()` function
+2. Extract buffer management into dedicated class (optional)
+3. Pass all dependencies explicitly (conn, writers, embedders, config)
+
+**Estimated lines:** -400 to -500 from cli.py after extraction
+
+### Deferred Work
+
+1. **Phase 6.2h: get_chunks wiring** - Low priority (~20 lines)
+2. **LLM code extraction** - Diminishing returns (~200 lines)
+3. **P2 architectural issues** - Require completing refactor
+
 ### Refactor Architecture (Complete)
 
 ```
 src/litkit/
-├── cli.py              # 2743 lines (down from 4723, -42%)
+├── cli.py              # ~2770 lines (down from 4723, -41%)
 ├── concurrent/         # Locking primitives
 ├── config/             # WorkspacePaths
 ├── db/                 # All SQLite operations
