@@ -1034,18 +1034,31 @@ def build_or_update_indices(args):
     populate SQLite rows and commit; they do not mutate FAISS indices.
     """
     # ═══════════════════════════════════════════════════════════════════════════
-    # FAST EARLY EXIT: compute "need" BEFORE loading heavy deps
+    # FAST EARLY EXIT: explicit build-mode enumeration (maintainability fix)
     # ═══════════════════════════════════════════════════════════════════════════
+    # Instead of checking "NOT need AND NOT flag1 AND NOT flag2 AND ..." (fragile),
+    # we explicitly enumerate all build-related flags. Adding a new maintenance mode
+    # means adding it to BUILD_FLAGS - one place, hard to forget.
+    #
     # This ensures pure query runs don't pay the 2-5s import penalty for torch,
     # transformers, lxml, etc. Only Path.exists() and args flags are used here.
     # ═══════════════════════════════════════════════════════════════════════════
     get_runtime()  # pure filesystem/env - no torch/numpy
-    need = args.rebuild or not (
-        DB_PATH.exists() and PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists()
-    )
-    if not need and not args.update and not args.build_only and not args.consume_only and not args.init_indices_only and not args.embed_producer:
-        # nothing to do - fast exit without loading heavy deps
-        return
+    
+    # Explicit list of all flags that indicate build-related work
+    # When adding new maintenance modes, ADD THEM HERE
+    BUILD_FLAGS = ("rebuild", "update", "build_only", "consume_only", "init_indices_only", "embed_producer")
+    
+    # Check if ANY build mode explicitly requested
+    explicit_build_requested = any(getattr(args, flag, False) for flag in BUILD_FLAGS)
+    
+    if not explicit_build_requested:
+        # Query-only run: skip heavy deps if store is already complete
+        store_complete = DB_PATH.exists() and PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists()
+        if store_complete:
+            return  # fast path for queries - no heavy deps needed
+        # Store incomplete but no explicit build mode → fall through to load deps
+        # and attempt to detect if we need to build (backward compat for bare runs)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # HEAVY DEPS: only loaded if we actually have build work to do
