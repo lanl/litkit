@@ -1874,6 +1874,9 @@ def main():
         help="Force --rebuild even if unconsumed segments or active producers exist. "
         "WARNING: This can cause data corruption if producers are still active.",
     )
+    # NOTE: --yes only takes effect AFTER parse_args() returns. If you ever add
+    # pre-parse prompts (before argparse runs), check "-y" in sys.argv directly
+    # instead of relying on os.environ["LITKIT_ASSUME_YES"].
     ap.add_argument(
         "-y",
         "--yes",
