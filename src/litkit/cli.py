@@ -1079,65 +1079,22 @@ def build_or_update_indices(args):
         is_faiss_writer=args.faiss_writer,
     )
 
-    # CHUNK index
-    if CHUNK_INDEX_PATH.exists():
-        chunk_index = faiss_load(CHUNK_INDEX_PATH)
-        _, core = kind_and_core(chunk_index)
-        mt = getattr(core, "metric_type", faiss.METRIC_INNER_PRODUCT)
-        if mt != faiss.METRIC_INNER_PRODUCT:
-            raise RuntimeError(
-                "Chunks index metric is not IP; cosine/IP required for normalized SBERT."
-            )
+    # CHUNK index - load existing or create new
+    chunk_index, needs_training = build_load_or_create_chunk_index(
+        chunk_index_path=CHUNK_INDEX_PATH,
+        chunk_trained_flag=CHUNK_TRAINED_FLAG,
+        faiss_lock_path=FAISS_LOCK,
+        db_lock_path=DB_LOCK,
+        FileLock=FileLock,
+        chunk_dim=chunk_dim,
+        chunks_index=args.chunks_index,
+        ivf_nlist=args.ivf_nlist,
+        pq_m=args.pq_m,
+        is_faiss_writer=args.faiss_writer,
+    )
 
-        if not isinstance(chunk_index, faiss.IndexIDMap2):
-            chunk_index = faiss.IndexIDMap2(chunk_index)
-            if args.faiss_writer:
-                with FileLock(FAISS_LOCK):
-                    faiss_save(chunk_index, CHUNK_INDEX_PATH)
-
-        ivf = extract_ivf(chunk_index)
-        if isinstance(ivf, faiss.IndexIVFPQ) and not getattr(ivf, "is_trained", False):
-            _eprint(
-                "[train] WARNING: chunks index is IVFPQ but untrained; ignoring stale trained flag and retraining."
-            )
-            _clear_chunk_trained_flag()
-    else:
-        if args.chunks_index == "flat":
-            base = flat_ip_index(chunk_dim)
-            chunk_index = faiss.IndexIDMap2(base)
-            _clear_chunk_trained_flag()
-            ensure_parent(CHUNK_INDEX_PATH)
-            if args.faiss_writer:
-                with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                    faiss_save(chunk_index, CHUNK_INDEX_PATH)
-            else:
-                raise RuntimeError(
-                    "CHUNK index does not exist. Start a writer with --faiss-writer or precreate the index."
-                )
-        else:
-            m_safe = safe_pq_m(chunk_dim, args.pq_m)
-            if m_safe != args.pq_m:
-                _eprint(
-                    f"[train] note: adjusted pq_m {args.pq_m} -> {m_safe} to divide dim={chunk_dim}"
-                )
-
-            # Placeholder IVFPQ (will be replaced after training)
-            eff_nlist = 16
-            chunk_index = ivfpq_index(chunk_dim, nlist=eff_nlist, m=m_safe)
-
-            ensure_parent(CHUNK_INDEX_PATH)
-            if not args.faiss_writer:
-                raise RuntimeError(
-                    "CHUNK index does not exist. Start a writer with --faiss-writer or precreate the index."
-                )
-
-    # If IVF-PQ and not trained, run training pass (one-time)
-    ivf_core = extract_ivf(chunk_index)  # unwrap common wrappers (e.g., IndexIDMap2)
-    if (
-        isinstance(ivf_core, faiss.IndexIVFPQ)
-        and getattr(ivf_core, "ntotal", 0) == 0
-        and not getattr(ivf_core, "is_trained", False)
-    ):
+    # If IVF-PQ needs training, run training pass (one-time)
+    if needs_training:
         if not args.faiss_writer:
             _eprint("[train] ERROR: chunks index requires training; start a writer with --faiss-writer.")
             sys.exit(2)
