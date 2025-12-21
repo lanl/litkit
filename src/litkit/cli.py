@@ -155,7 +155,10 @@ def _load_heavy_deps() -> None:
         try:
             import faiss
             has_faiss = True
-            faiss.cvar.seed = int(os.environ.get("LITKIT_FAISS_SEED", "123456"))
+            try:
+                faiss.cvar.seed = int(os.environ.get("LITKIT_FAISS_SEED", "123456"))
+            except AttributeError:
+                pass  # faiss.cvar.seed not available in this build (e.g., macOS faiss-cpu)
         except ImportError:
             pass  # faiss is optional for query-only flows with --no-llm
         
