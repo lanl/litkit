@@ -90,8 +90,72 @@ if TYPE_CHECKING:
     from litkit.embeddings.base import Embedder
     from litkit.ingest.ingest import ArticleMeta, TarMemberMeta
 # Heavy imports (litkit.db, litkit.segments, litkit.embeddings.*, litkit.ingest.*)
-# are deferred to main() and function scope. See _load_heavy_deps() and individual
-# functions for the actual imports.
+# are deferred via _load_heavy_deps(). This function is idempotent and must be
+# called at the top of any function that uses these dependencies.
+
+_heavy_loaded = False
+
+def _load_heavy_deps() -> None:
+    """Idempotent loader for heavy dependencies.
+    
+    Must be called at the top of any function that uses:
+    - litkit.embeddings.* (torch, transformers)
+    - litkit.db.* (sqlite3 wrappers)
+    - litkit.segments.* (numpy)
+    - litkit.ingest.* (lxml)
+    - litkit.formatting.* (answer rendering)
+    
+    Safe to call multiple times; only loads once.
+    """
+    global _heavy_loaded
+    if _heavy_loaded:
+        return
+    
+    # Declare all globals we're about to bind
+    global configure_threads, detect_device, make_paper_embedder, make_chunk_embedder
+    global normalize_answer_and_build_refs, render_references
+    global iter_tar_paths, iter_tar_xml_streams, parallel_iter_tar_articles, parse_xml_fileobj
+    global is_uncompressed_tar, shard_filter
+    global db_init_db, db_init_shard_db, db_connect_db, db_shard_db_path
+    global db_chunk_ids_to_paper_ids, db_flush_pending_marks, db_load_temp_candidates
+    global seg_validate_shard_consistency, seg_write_build_meta, seg_read_build_meta
+    global seg_has_segment_files, SegmentWriter, ChunkSegmentWriter
+    global SegProducerCoordinator, SegConsumerCoordinator
+    global seg_ingest_paper_segments, seg_ingest_chunk_segments
+    
+    from litkit.embeddings.devices import configure_threads, detect_device
+    from litkit.embeddings.factory import make_chunk_embedder, make_paper_embedder
+    from litkit.formatting.answers import normalize_answer_and_build_refs, render_references
+    from litkit.ingest.ingest import (
+        iter_tar_paths,
+        iter_tar_xml_streams,
+        parallel_iter_tar_articles,
+        parse_xml_fileobj,
+    )
+    from litkit.ingest import is_uncompressed_tar, shard_filter
+    from litkit.db import (
+        init_db as db_init_db,
+        init_shard_db as db_init_shard_db,
+        connect_db as db_connect_db,
+        shard_db_path as db_shard_db_path,
+        chunk_ids_to_paper_ids as db_chunk_ids_to_paper_ids,
+        flush_pending_marks as db_flush_pending_marks,
+        load_temp_candidates as db_load_temp_candidates,
+    )
+    from litkit.segments import (
+        validate_shard_consistency as seg_validate_shard_consistency,
+        write_build_meta as seg_write_build_meta,
+        read_build_meta as seg_read_build_meta,
+        has_segment_files as seg_has_segment_files,
+        SegmentWriter,
+        ChunkSegmentWriter,
+        ProducerCoordinator as SegProducerCoordinator,
+        ConsumerCoordinator as SegConsumerCoordinator,
+        ingest_paper_segments as seg_ingest_paper_segments,
+        ingest_chunk_segments as seg_ingest_chunk_segments,
+    )
+    
+    _heavy_loaded = True
 
 
 
@@ -669,6 +733,7 @@ def _post_build_sanity_check(conn, args):
 
 def _auto_top_papers() -> int:
     """Heuristic for Stage-1 shortlist size based on corpus size."""
+    _load_heavy_deps()  # ensure db_connect_db is available
     get_runtime()  # ensure path globals are initialized for library use
     
     def _piecewise_heuristic(n: int) -> int:
@@ -710,6 +775,7 @@ def iter_tar_articles(
         - member_meta has .name, .size, .mtime attributes
         - article_meta is the parsed ArticleMeta dict
     """
+    _load_heavy_deps()  # ensure iter_tar_xml_streams, etc. are available
     use_parallel = parse_workers > 1 and is_uncompressed_tar(tar_path)
     
     if use_parallel:
@@ -755,6 +821,7 @@ def build_or_update_indices(args):
     save indices. Other processes (possibly using --shard-id/--num-shards) only
     populate SQLite rows and commit; they do not mutate FAISS indices.
     """
+    _load_heavy_deps()  # ensure db_*, seg_*, make_* etc. are available
     # Lazy imports to defer faiss/numpy loading until actually needed
     from litkit.build import (
         BuildConfig,
@@ -1126,6 +1193,7 @@ def shortlist_papers(
     embedder: "Embedder | None" = None,
 ) -> list[int]:
     """Thin wrapper: delegates to litkit.retrieval.shortlist_papers."""
+    _load_heavy_deps()  # ensure make_paper_embedder is available
     from litkit.retrieval import shortlist_papers as retrieval_shortlist_papers
     get_runtime()
     enc = embedder or make_paper_embedder()[0]
@@ -1151,6 +1219,7 @@ def search_chunks_constrained(
     per_paper_cap: int = 0,
 ) -> tuple[list[int], dict[str, int]]:
     """Thin wrapper: delegates to litkit.retrieval.search_chunks_constrained."""
+    _load_heavy_deps()  # ensure db_*, make_chunk_embedder are available
     from litkit.retrieval import search_chunks_constrained as retrieval_search_chunks_constrained
     get_runtime()
     enc = embedder or make_chunk_embedder()[0]
