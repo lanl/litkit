@@ -710,6 +710,7 @@ def backfill_unindexed_vectors(
     chunk_bs=None,
 ):
     """Thin wrapper: delegates to litkit.build.backfill with runtime paths."""
+    _load_heavy_deps()  # litkit.build pulls in faiss/numpy
     from litkit.build import backfill_unindexed_vectors as build_backfill_unindexed_vectors
     get_runtime()
     return build_backfill_unindexed_vectors(
@@ -729,6 +730,7 @@ def backfill_unindexed_vectors(
 
 def _post_build_sanity_check(conn, args):
     """Thin wrapper: delegates to litkit.build.post_build_sanity_check with runtime paths."""
+    _load_heavy_deps()  # litkit.build pulls in faiss/numpy
     from litkit.build import post_build_sanity_check as build_post_build_sanity_check
     get_runtime()
     return build_post_build_sanity_check(
@@ -1186,6 +1188,7 @@ def build_or_update_indices(args):
 
 def reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index) -> tuple[int, int]:
     """Thin wrapper: delegates to litkit.build.backfill."""
+    _load_heavy_deps()  # litkit.build pulls in faiss/numpy
     from litkit.build import reconcile_sqlite_flags_with_faiss as build_reconcile_sqlite_flags
     return build_reconcile_sqlite_flags(conn, paper_index, chunk_index)
 
@@ -1252,6 +1255,7 @@ def search_chunks_constrained(
 
 def get_chunks(conn, ids: list[int]) -> list[dict[str, str]]:
     """Thin wrapper: delegates to litkit.retrieval.get_chunks."""
+    _load_heavy_deps()  # litkit.retrieval pulls in faiss/numpy
     from litkit.retrieval import get_chunks as retrieval_get_chunks
     return retrieval_get_chunks(conn, ids)
 
