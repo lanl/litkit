@@ -1606,6 +1606,29 @@ cli.py: 2966 → 2743 lines (-223 lines)
 
 4. **Git tag** - Consider tagging "retrieval-modularized" milestone
 
+### Deferred Architectural Issues
+
+#### Import-Time Side Effects (P2)
+
+**Problem:** `from litkit.cli import SQLITE_DIR` triggers:
+1. Heavy imports (faiss, numpy, litkit.build, litkit.retrieval, etc.) at module load
+2. Directory creation and env var mutation via `__getattr__` → `get_runtime()`
+
+**Impact:** Breaks import purity for unit tests, tooling, and indirect imports.
+
+**Current state:** cli.py has a "LAZY RUNTIME INITIALIZATION" comment block that
+documents what IS vs IS NOT deferred. However, it's a half-measure - only path I/O
+is deferred, not the heavy imports or side effects on attribute access.
+
+**Proper fix (requires completing refactor):**
+1. Move all business logic out of cli.py (per SCOPE CONTRACT at top of file)
+2. Make `__getattr__` read-only - return `None` or raise if uninitialized
+3. Require explicit `get_runtime()` call in `main()` only
+4. Defer all module imports to inside `main()` or guard with `if TYPE_CHECKING`
+
+This is orthogonal to line count reduction - it's about achieving true import purity
+so `from litkit.cli import X` doesn't have side effects.
+
 ### Refactor Architecture (Complete)
 
 ```
