@@ -151,10 +151,10 @@ def _load_heavy_deps() -> None:
         # IMPORTANT: Only catch ImportError (missing faiss), NOT other exceptions.
         # A broken faiss install should fail fast, not be silently ignored.
         #
-        # NOTE: FAISS is required for ALL litkit operations except --help/--version.
-        # Both build AND query paths use FAISS indices. The faiss_available flag
-        # enables early fail-fast with a clear error message rather than a cryptic
-        # ImportError deep in the call stack.
+        # NOTE: FAISS is required for build and retrieval operations, not all ops.
+        # Early validation, --help/--version, and future metadata queries may skip FAISS.
+        # The faiss_available flag enables early fail-fast with a clear error message
+        # rather than a cryptic ImportError deep in the call stack.
         faiss_available = False
         try:
             import faiss
@@ -228,10 +228,12 @@ def deps() -> SimpleNamespace:
 def _require_faiss(context: str = "this operation") -> None:
     """Fail fast if FAISS is not available.
     
-    FAISS is required for ALL litkit operations except --help/--version:
-    - Build paths: creating/updating indices
+    FAISS is required for build and retrieval operations:
+    - Build paths: creating/updating indices (--rebuild, --update, --build-only, etc.)
     - Query paths: shortlist_papers(), search_chunks_constrained()
     - Maintenance: --reconcile-only, --consume-only
+    
+    NOT required for: --help, --version, early validation errors, pure-SQLite queries.
     
     Call this early in any code path that touches FAISS indices.
     """
