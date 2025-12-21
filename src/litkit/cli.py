@@ -1983,6 +1983,15 @@ def main():
         help="Run retrieval only and print selected context; do not call an LLM.",
     )
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # INVARIANT: parse_args() MUST come before _load_heavy_deps()
+    # ═══════════════════════════════════════════════════════════════════════════
+    # argparse automatically exits on --version, -h, --help BEFORE returning.
+    # This guarantees fast --help/--version even if heavy dependencies (faiss,
+    # torch, transformers) are missing or broken.
+    #
+    # DO NOT move _load_heavy_deps() or any heavy import above this line.
+    # ═══════════════════════════════════════════════════════════════════════════
     args = ap.parse_args()
 
     # ivf_nlist_forced = "--ivf-nlist" in sys.argv
