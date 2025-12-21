@@ -1215,11 +1215,23 @@ def approx_tokens(s: str) -> int:
 
 
 def pack_context(
-    chunks: list[dict[str, str]], question: str, model_name: str, *, sys_prompt: str = SYS_PROMPT
+    chunks: list[dict[str, str]],
+    question: str,
+    model_name: str,
+    *,
+    sys_prompt: str = SYS_PROMPT,
+    max_out_tokens: int = 3000,
 ) -> tuple[str, list[int]]:
     """Assemble a model-aware context window from ranked chunks, respecting an approximate
     token budget determined by the target model. Uses the *actual* system prompt for
     budgeting to avoid drift.
+
+    Args:
+        chunks: Ranked list of chunk dicts with 'text', 'paper_title', etc.
+        question: User question text.
+        model_name: Model identifier for budget selection (e.g., "o3-mini", "gpt-oss:20b").
+        sys_prompt: System prompt to budget for.
+        max_out_tokens: Output token allowance to reserve (deducted from input budget).
 
     Returns:
     -------
@@ -1232,15 +1244,19 @@ def pack_context(
     # Choose token budget per model family
     budget = BUDGET_TOKENS_O3 if model_name.lower().startswith("o3") else BUDGET_TOKENS_OSS20B
 
+    # Reserve output allowance from the total budget first
+    # This prevents overflow exceptions by ensuring we have room for the response
+    input_budget = max(0, budget - max_out_tokens)
+
     # Budget against exactly what you'll send (prompt + "QUESTION:/CONTEXT:" wrappers)
     base_cost = (
         approx_tokens(sys_prompt)
         + approx_tokens("QUESTION:\n")
         + approx_tokens(question)
         + approx_tokens("\n\nCONTEXT:\n")
-        + PROMPT_HEADROOM_TOKENS  # safety buffer for tool/SDK scaffolding and response headroom
+        + PROMPT_HEADROOM_TOKENS  # safety buffer for tool/SDK scaffolding
     )
-    remain = max(0, budget - base_cost)
+    remain = max(0, input_budget - base_cost)
 
     blocks: list[str] = []
     used: list[int] = []
