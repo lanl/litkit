@@ -1,35 +1,19 @@
 # src/litkit/cli.py
-#
-# ═══════════════════════════════════════════════════════════════════════════════
-# SCOPE CONTRACT (Temporary — remove after refactor)
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-# cli.py is the CLI entrypoint ONLY. It should:
-#   ✓ Parse arguments (argparse)
-#   ✓ Construct config objects from args/env
-#   ✓ Call high-level orchestration functions
-#   ✓ Handle exit codes and user-facing error messages
-#
-# cli.py should NOT contain (these are extraction candidates):
-#   ✗ SQLite queries or schema logic         → move to litkit.db
-#   ✗ FAISS index operations                 → move to litkit.faiss_ops
-#   ✗ Tar scanning / file iteration          → already in litkit.ingest
-#   ✗ Embedding segment I/O                  → move to litkit.build.segments
-#   ✗ Producer/consumer coordination         → move to litkit.build.coordination
-#   ✗ Shard assignment / build metadata      → move to litkit.build.sharding
-#   ✗ Retrieval logic (search, lexical)      → move to litkit.retrieval
-#   ✗ LLM client / prompt packing            → move to litkit.llm
-#   ✗ Progress/logging utilities             → move to litkit.progress
-#
-# See docs/REFACTOR_ROADMAP.md for the full extraction plan.
-# ═══════════════════════════════════════════════════════════════════════════════
+"""Litkit CLI entrypoint.
 
-# --- Job 2 modules (available for incremental migration) ---
-# These modules now contain the canonical implementations of path discovery
-# and progress utilities. cli.py still has local copies for safety during
-# the migration. See docs/REFACTOR_ROADMAP.md for the extraction plan.
-# from litkit.config.paths import WorkspacePaths, get_default_paths
-# from litkit.progress import eprint, Progress, Pulse, phase, set_quiet
+This module provides the command-line interface for litkit, including:
+- Build/index management (--rebuild, --update, --build-only)
+- Two-stage RAG retrieval (paper shortlisting + chunk search)
+- LLM-powered question answering
+
+Business logic is delegated to well-organized submodules:
+- litkit.db: SQLite operations
+- litkit.index: FAISS index operations  
+- litkit.build: Build pipeline orchestration
+- litkit.retrieval: RAG retrieval pipeline
+- litkit.segments: Embedding segment I/O
+- litkit.ingest: Tar/XML parsing
+"""
 
 import os
 import sys
@@ -1277,40 +1261,8 @@ def search_chunks_constrained(
 
 
 def get_chunks(conn, ids: list[int]) -> list[dict[str, str]]:
-    """Retrieve chunk rows joined with paper metadata, preserving input `ids` order.
-
-    Returns a list of dicts containing:
-      id, paper_id, ord, text, paper_title, pmid, pmcid
-    """
-    if not ids:
-        return []
-    marks = ",".join("?" for _ in ids)
-    cur = conn.cursor()
-    cur.execute(
-        f"""SELECT c.id, c.paper_id, c.ord, c.text, p.title, p.pmid, p.pmcid
-                    FROM chunks c JOIN papers p ON p.id=c.paper_id
-                    WHERE c.id IN ({marks})""",
-        ids,
-    )
-    rows = cur.fetchall()
-    rowmap = {row[0]: row for row in rows}
-    out = []
-    for cid in ids:  # preserve ranking order
-        row = rowmap.get(cid)
-        if not row:
-            continue
-        out.append(
-            {
-                "id": row[0],
-                "paper_id": row[1],
-                "ord": row[2],
-                "text": row[3],
-                "paper_title": row[4] or "",
-                "pmid": row[5] or "",
-                "pmcid": row[6] or "",
-            }
-        )
-    return out
+    """Thin wrapper: delegates to litkit.retrieval.get_chunks."""
+    return retrieval_get_chunks(conn, ids)
 
 
 # -------------------- LLM + token-budgeting --------------------
