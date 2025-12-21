@@ -38,7 +38,8 @@ from . import __version__ as LITKIT_VERSION
 
 # -------- simple early quieting (env), used before argparse exists ----------
 # Set LITKIT_QUIET=1 to squelch startup banners that print before args are parsed.
-QUIET = os.environ.get("LITKIT_QUIET", "0") == "1"
+# NOTE: Do not use a frozen QUIET variable here - use is_quiet() from progress.py
+# which checks os.environ on each call for consistent behavior after --quiet is parsed.
 # Suppress early banners for --version/--help
 _SUPPRESS_EARLY = any(x in sys.argv for x in ("--version", "-h", "--help"))
 
@@ -496,7 +497,9 @@ def _report_paths(
     tar_dir_origin: str | None = None,  # "(from LITKIT_TAR_DIR)" or "(default)"
 ):
     """Print paths once args are parsed, so banners reflect reality."""
-    if QUIET:
+    # Use is_quiet() to check env var at runtime (not frozen at import time)
+    from litkit.progress import is_quiet
+    if is_quiet():
         return
     if tar_manifest:
         _eprint(f"[paths] using manifest -> " f"{tar_manifest} for paths to tar shards")

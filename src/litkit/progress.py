@@ -28,29 +28,50 @@ __all__ = [
     "phase",
     "QUIET",
     "set_quiet",
+    "is_quiet",
 ]
 
 
 # -------- Global quiet mode --------
 # Set LITKIT_QUIET=1 to squelch startup banners that print before args are parsed.
 import os
-QUIET = os.environ.get("LITKIT_QUIET", "0") == "1"
+
+
+def is_quiet() -> bool:
+    """Check if quiet mode is enabled (reads env var on each call).
+    
+    This function checks os.environ each time to ensure changes to
+    LITKIT_QUIET (e.g., from --quiet flag) take effect immediately.
+    """
+    return os.environ.get("LITKIT_QUIET", "0") == "1"
+
+
+# Legacy alias for backward compatibility (deprecated - use is_quiet())
+# NOTE: This is frozen at import time. For runtime checks, use is_quiet().
+QUIET = is_quiet()
 
 
 def set_quiet(value: bool) -> None:
-    """Set the global quiet mode flag."""
+    """Set quiet mode via environment variable.
+    
+    This sets LITKIT_QUIET in os.environ so all modules see the change.
+    """
     global QUIET
-    QUIET = value
     if value:
         os.environ["LITKIT_QUIET"] = "1"
+    else:
+        os.environ.pop("LITKIT_QUIET", None)
+    # Update frozen QUIET for legacy code that uses it
+    QUIET = value
 
 
 def eprint(msg: str = "", *, end: str = "\n") -> None:
     """Print to stderr with flush, respecting quiet mode for empty messages.
     
     This is the standard way to emit operator-facing messages in litkit.
+    Checks env var on each call so changes to LITKIT_QUIET take effect immediately.
     """
-    if QUIET and not msg:
+    if is_quiet() and not msg:
         return
     sys.stderr.write(msg + end)
     try:
