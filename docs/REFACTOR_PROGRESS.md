@@ -264,13 +264,13 @@ litkit/
 
 ### External Code Review Assessment
 
-Received external code review critique. After careful analysis against actual implementation:
+Received external code review critique. Initial analysis was partially incorrect.
 
-#### Issues Reviewed
+#### Issues Reviewed (Corrected Assessment)
 
 | Claim | Verdict | Details |
 |-------|---------|---------|
-| **SAVEPOINT + COMMIT bug** | ❌ INVALID | Reviewer misunderstood SQLite semantics. `RELEASE SAVEPOINT` doesn't implicitly commit - it removes the savepoint marker. The `conn.commit()` calls in batch flushes are intentional and correct. |
+| **SAVEPOINT + COMMIT bug** | ✅ **VALID BUG** | Reviewer was correct. `conn.commit()` inside a SAVEPOINT region invalidates all savepoints. Fixed below. |
 | **Checkpoint skip-by-count with parallel parsing** | ✅ VALID BUG | `parallel_iter_tar_articles()` was yielding in completion order but checkpoint assumes tar file order. Fixed below. |
 | **Producer DB merge path missing** | ❌ INVALID | Reviewer missed `run_consume_only_mode()` in `litkit/build/consume.py` which calls `db_merge_shard_databases()`. |
 | **FAISS IDMap consistency** | ❌ INVALID | Already handled - `load_or_create_*_index` returns IDMap2-wrapped indices. |
@@ -279,7 +279,52 @@ Received external code review critique. After careful analysis against actual im
 | **executemany batching** | ⚠️ DEFERRED | Valid efficiency suggestion for Phase 8 (Robustness). |
 | **Lustre stripe detection** | ⚠️ DEFERRED | Nice-to-have. Added developer docs. |
 
-### Bug Fix: Parallel Parsing Order for Checkpoint Safety
+### Bug Fix 1: SAVEPOINT + COMMIT Interaction
+
+**Commit `b5c1ad6`:** `fix(cli): move batch flush outside savepoint region to prevent 'no such savepoint' error`
+
+**The Bug:**
+The reviewer correctly identified that `conn.commit()` inside a SAVEPOINT region invalidates
+all active savepoints. The code had:
+
+```python
+conn.execute("SAVEPOINT member_sp")
+try:
+    # ... insert rows ...
+    if buffer_full:
+        conn.commit()  # ← INVALIDATES SAVEPOINT
+    conn.execute("RELEASE SAVEPOINT member_sp")  # ← FAILS: "no such savepoint"
+except:
+    conn.execute("ROLLBACK TO SAVEPOINT member_sp")  # ← Also fails
+```
+
+**Failure mode:**
+1. Member N starts processing
+2. SAVEPOINT member_sp created
+3. Rows inserted for member N
+4. Buffer threshold hit → batch flush → `conn.commit()` → savepoint invalidated
+5. More work for member N continues
+6. Something throws an exception
+7. **except block** tries `ROLLBACK TO SAVEPOINT member_sp` → **fails** (no such savepoint)
+8. Member N is marked as failed (`handled_ok = False`)
+9. But: the rows from step 3 **were already committed** in step 4
+10. Next run: member N is re-processed → **duplicate data** or **silent data corruption**
+
+**The Fix:**
+Move batch flush logic (which contains `conn.commit()`) OUTSIDE the savepoint region:
+
+1. `SAVEPOINT member_sp` - start per-member transaction
+2. Insert rows for this member
+3. `RELEASE SAVEPOINT member_sp` - on success
+4. (or `ROLLBACK TO SAVEPOINT` on error + truncate buffers)
+5. **THEN** check if batch flush is needed (`conn.commit()` happens here)
+
+This ensures:
+- Savepoint protects per-member DB inserts
+- `conn.commit()` only runs after savepoint is already released
+- Rollback actually works if member processing fails
+
+### Bug Fix 2: Parallel Parsing Order for Checkpoint Safety
 
 **Commit `ba70219`:** `fix(ingest): add in-order yielding to parallel_iter_tar_articles for checkpoint safety`
 
@@ -326,13 +371,14 @@ def parallel_iter_tar_articles(
 
 ### Session Summary
 
-| Change | Description |
+| Commit | Description |
 |--------|-------------|
-| `parallel_iter_tar_articles()` | Added in-order yielding mode (default) |
-| README.md | Added tar efficiency + Lustre stripe developer guides |
+| `ba70219` | Fix parallel parsing order (in-order yielding) |
+| `ba70219` | Add tar efficiency + Lustre stripe developer guides |
+| `b5c1ad6` | Fix SAVEPOINT/COMMIT interaction |
 
-**One real correctness bug fixed.** Other critique points were either invalid (misunderstood
-architecture) or deferred efficiency improvements.
+**Two real correctness bugs fixed.** I initially incorrectly dismissed the SAVEPOINT bug;
+the reviewer was correct.
 
 ---
 
