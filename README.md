@@ -141,6 +141,93 @@ pandoc README.md LITKIT_MAC_GUIDE.md LITKIT_CLUSTER_GUIDE.md \
   -o litkit_documentation.pdf
 ```
 
+## Developer Guide: Improving Lexical Search
+
+The lexical front-loading module (`litkit/retrieval/lexical.py`) is designed for easy improvement:
+
+### Architecture
+
+```
+litkit/retrieval/lexical.py
+├── LexicalConfig      # Configuration dataclass (enable, cap, limit, etc.)
+├── LexicalResult      # Results with scores dict for future BM25
+├── LexicalBackend     # Protocol for swappable backend implementations
+├── SqliteLexicalBackend # Default LIKE-based SQLite backend
+├── find_rare_terms()  # Pure function for term extraction (no DB deps)
+└── merge_lexical_and_ann() # Interleave lexical + ANN results
+```
+
+### Improvement Areas
+
+**1. Better Term Extraction** (`find_rare_terms`)
+- Current: triggers on digits, hyphens, long terms (9+ chars)
+- Ideas: domain-specific vocabularies, stemming, abbreviation expansion, UMLS lookup
+
+**2. Scoring** (`LexicalResult.scores`)
+- Current: flat 1.0 for all matches (placeholder)
+- Ideas: BM25, TF-IDF, term frequency weighting, title vs body position
+
+**3. Backend Swap** (`LexicalBackend` protocol)
+- Default: SQLite LIKE patterns (works everywhere)
+- Future: FTS5, Tantivy, Vespa, or external search indices
+
+**4. Configuration** (`LexicalConfig`)
+```python
+@dataclass
+class LexicalConfig:
+    enabled: bool = True
+    cap: int | None = None      # None => caller computes from k
+    limit: int = 200            # SQL LIMIT for lexical scan
+    allow_global: bool = False  # Force global scope
+    min_term_length: int = 9    # Long-term fallback threshold
+    max_terms: int = 8          # Cap # of rare terms
+    require_rare_terms: bool = True
+```
+
+### Testing Lexical in Isolation
+
+```python
+from litkit.retrieval.lexical import find_rare_terms, LexicalConfig
+
+config = LexicalConfig(min_term_length=7, max_terms=5)
+terms = find_rare_terms("What causes SARS-CoV-2 infection?", config)
+# ['sars-cov-2', 'infection']
+```
+
+### Adding a New Backend
+
+Implement the `LexicalBackend` protocol:
+
+```python
+from litkit.retrieval.lexical import LexicalBackend, LexicalConfig, LexicalResult
+
+class MyFTS5Backend:
+    def __init__(self, db_conn):
+        self.db_conn = db_conn
+    
+    def search(
+        self,
+        terms: list[str],
+        candidate_papers: set[int] | None,
+        config: LexicalConfig,
+    ) -> LexicalResult:
+        # Implement FTS5 search
+        chunk_ids = [...]  # Your FTS5 query
+        scores = {cid: fts5_score for cid in chunk_ids}
+        return LexicalResult(
+            chunk_ids=chunk_ids,
+            scores=scores,
+            terms_used=terms,
+            scope="candidates" if candidate_papers else "global",
+        )
+```
+
+Then use it in `search_chunks_constrained`:
+```python
+backend = MyFTS5Backend(db_conn)
+lexical_result = backend.search(rare_terms, candidate_scope, lexical_config)
+```
+
 ## License
 
 Proprietary — LANL
