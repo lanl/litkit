@@ -707,6 +707,125 @@ def process_tar_files(
         ckpt["build_stream"] = ckpt_stream
         seg_save_checkpoint(ckpt, ckpt_path, ckpt_lock, shard_id=ckpt_shard_id)
     
+    # ═══════════════════════════════════════════════════════════════════════
+    # FINAL BUFFER FLUSH - After all tars processed
+    # ═══════════════════════════════════════════════════════════════════════
+    # Writer mode may have remaining items in buffers; producer mode
+    # should be empty after tar-boundary flush but handle for safety.
+    
+    if faiss_writer:
+        if paper_ids_buf:
+            u_ids, u_texts, _ = dedupe_papers_with_doc_ids(
+                paper_ids_buf, paper_texts_buf, paper_doc_ids_buf
+            )
+            Xp = paper_embedder.encode(
+                u_texts,
+                progress_label=f"Embedding papers (batch of {len(u_texts)})",
+                batch_size=paper_embed_bs,
+                progress_done_summary=False,
+            )
+            if not isinstance(paper_index, faiss.IndexIDMap2):
+                paper_index = faiss.IndexIDMap2(paper_index)
+            
+            with FileLock(db_lock), FileLock(faiss_lock):
+                prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
+                sel = make_id_selector(u_ids)
+                safe_remove_ids(paper_index, sel)
+                added, ids_added = add_with_ids_dedup(paper_index, u_ids, Xp)
+                if added:
+                    if prior_ntotal == 0:
+                        faiss_save_force(paper_index, paper_index_path)
+                        db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
+                    else:
+                        if faiss_save(paper_index, paper_index_path):
+                            db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
+                            db_flush_pending_marks(cur)
+                conn.commit()
+            papers_added_total += int(added)
+        
+        paper_ids_buf.clear()
+        paper_texts_buf.clear()
+        
+        if chunk_ids_buf:
+            u_ids, u_texts, _, _ = dedupe_chunks_with_doc_ids(
+                chunk_ids_buf, chunk_texts_buf, chunk_paper_doc_ids_buf, chunk_ords_buf
+            )
+            Xc = chunk_embedder.encode(
+                u_texts,
+                progress_label=f"Embedding chunks (batch of {len(u_texts)})",
+                batch_size=chunk_embed_bs,
+                progress_done_summary=False,
+            )
+            if not isinstance(chunk_index, faiss.IndexIDMap2):
+                chunk_index = faiss.IndexIDMap2(chunk_index)
+            
+            with FileLock(db_lock), FileLock(faiss_lock):
+                prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
+                sel = make_id_selector(u_ids)
+                safe_remove_ids(chunk_index, sel)
+                added, ids_added = add_with_ids_dedup(chunk_index, u_ids, Xc)
+                if added:
+                    if prior_ntotal == 0:
+                        faiss_save_force(chunk_index, chunk_index_path)
+                        db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
+                    else:
+                        if faiss_save(chunk_index, chunk_index_path):
+                            db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
+                            db_flush_pending_marks(cur)
+                conn.commit()
+            chunks_added_total += int(added)
+        
+        chunk_ids_buf.clear()
+        chunk_texts_buf.clear()
+    
+    elif embed_producer:
+        # Producer: final embed and write segment files (should be empty after tar-boundary)
+        if paper_ids_buf:
+            u_ids, u_texts, u_doc_ids = dedupe_papers_with_doc_ids(
+                paper_ids_buf, paper_texts_buf, paper_doc_ids_buf
+            )
+            Xp = paper_embedder.encode(
+                u_texts,
+                progress_label=f"Embedding papers (producer, {len(u_texts)})",
+                batch_size=paper_embed_bs,
+            )
+            paper_seg_writer.write(doc_ids=u_doc_ids, vecs=Xp)
+            conn.commit()
+            papers_added_total += len(u_ids)
+        paper_ids_buf.clear()
+        paper_texts_buf.clear()
+        paper_doc_ids_buf.clear()
+        
+        if chunk_ids_buf:
+            u_ids, u_texts, u_paper_doc_ids, u_ords = dedupe_chunks_with_doc_ids(
+                chunk_ids_buf, chunk_texts_buf, chunk_paper_doc_ids_buf, chunk_ords_buf
+            )
+            Xc = chunk_embedder.encode(
+                u_texts,
+                progress_label=f"Embedding chunks (producer, {len(u_texts)})",
+                batch_size=chunk_embed_bs,
+            )
+            chunk_seg_writer.write(paper_doc_ids=u_paper_doc_ids, ords=u_ords, vecs=Xc)
+            conn.commit()
+            chunks_added_total += len(u_ids)
+        chunk_ids_buf.clear()
+        chunk_texts_buf.clear()
+        chunk_paper_doc_ids_buf.clear()
+        chunk_ords_buf.clear()
+    
+    else:
+        # Plain reader: DB only
+        conn.commit()
+        papers_added_total += len(paper_ids_buf)
+        paper_ids_buf.clear()
+        paper_texts_buf.clear()
+        chunks_added_total += len(chunk_ids_buf)
+        chunk_ids_buf.clear()
+        chunk_texts_buf.clear()
+    
+    # Final commit
+    conn.commit()
+    
     # Return indices and counts (indices may have been wrapped)
     return paper_index, chunk_index, papers_added_total, chunks_added_total
 
