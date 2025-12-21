@@ -1527,13 +1527,25 @@ def build_or_update_indices(args):
         _render(force=True)
         _progress_newline(sys.stderr)
         
-        # PRODUCER MODE: Force segment flush at tar boundary BEFORE commit/checkpoint.
-        # Without this, we could commit DB rows (files table) for members whose segments
-        # were never written, then checkpoint to persisted_count < processed_count.
-        # On restart, db_already_processed() returns True for those members → skip → data loss.
+        # ═══════════════════════════════════════════════════════════════════════
+        # PRODUCER MODE: Two-phase durability for tar-boundary flush.
+        #
+        # Problem: If chunk segment write fails after paper segment succeeded,
+        # we'd leave orphan paper segments on disk (no corresponding DB rows).
+        #
+        # Solution: Two-phase commit pattern:
+        # 1. Write paper segments to .pending files
+        # 2. Write chunk segments to .pending files
+        # 3. If chunk write fails → cleanup_pending() removes paper .pending files
+        # 4. On success → conn.commit() (DB rows durable)
+        # 5. finalize() both writers (atomic rename .pending → .npz)
+        #
+        # Consumer only sees finalized .npz files, never orphan .pending files.
+        # ═══════════════════════════════════════════════════════════════════════
         if args.embed_producer:
-            if paper_ids_buf:
-                try:
+            try:
+                # Phase 1: Write all segments to .pending files
+                if paper_ids_buf:
                     u_ids, u_texts, u_doc_ids = dedupe_papers_with_doc_ids(
                         paper_ids_buf, paper_texts_buf, paper_doc_ids_buf
                     )
@@ -1548,13 +1560,8 @@ def build_or_update_indices(args):
                     paper_ids_buf.clear()
                     paper_texts_buf.clear()
                     paper_doc_ids_buf.clear()
-                except Exception as e:
-                    conn.rollback()
-                    _eprint(f"[flush] FATAL: paper segment tar-boundary flush failed: {e.__class__.__name__}: {e}")
-                    raise
-            
-            if chunk_ids_buf:
-                try:
+
+                if chunk_ids_buf:
                     u_ids, u_texts, u_paper_doc_ids, u_ords = dedupe_chunks_with_doc_ids(
                         chunk_ids_buf, chunk_texts_buf, chunk_paper_doc_ids_buf, chunk_ords_buf
                     )
@@ -1572,15 +1579,27 @@ def build_or_update_indices(args):
                     chunk_texts_buf.clear()
                     chunk_paper_doc_ids_buf.clear()
                     chunk_ords_buf.clear()
-                except Exception as e:
-                    conn.rollback()
-                    _eprint(f"[flush] FATAL: chunk segment tar-boundary flush failed: {e.__class__.__name__}: {e}")
-                    raise
-            
-            # After successful tar-boundary flush, persisted_count can advance to processed_count
-            persisted_count = processed_count
-        
-        conn.commit()
+
+                # Phase 2: Commit DB (rows now durable)
+                conn.commit()
+
+                # Phase 3: Finalize segments (atomic rename .pending → .npz)
+                # After this, consumer can see the segment files.
+                paper_seg_writer.finalize()
+                chunk_seg_writer.finalize()
+
+                # After successful two-phase commit, persisted_count can advance
+                persisted_count = processed_count
+
+            except Exception as e:
+                # Compensating transaction: clean up any .pending files we created
+                paper_seg_writer.cleanup_pending()
+                chunk_seg_writer.cleanup_pending()
+                conn.rollback()
+                _eprint(f"[flush] FATAL: producer tar-boundary flush failed: {e.__class__.__name__}: {e}")
+                raise
+        else:
+            conn.commit()
         
         # Checkpoint: now safe for both modes
         # Producer: persisted_count == processed_count (tar-boundary flush ensured durability)

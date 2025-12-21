@@ -16,6 +16,8 @@ from litkit.segments.writer import (
     SegmentWriter,
     ChunkSegmentWriter,
     SegmentWriterConfig,
+    cleanup_orphan_pending_files,
+    PENDING_SUFFIX,
 )
 from litkit.segments.metadata import (
     write_build_meta,
@@ -47,6 +49,8 @@ __all__ = [
     "SegmentWriter",
     "ChunkSegmentWriter",
     "SegmentWriterConfig",
+    "cleanup_orphan_pending_files",
+    "PENDING_SUFFIX",
     # Metadata
     "write_build_meta",
     "read_build_meta",
