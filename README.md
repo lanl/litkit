@@ -509,7 +509,49 @@ def record_skip(cur, path: str, reason: str, xml_hash: str):
     )
 ```
 
-### 2. Writer Guard Identity Verification
+### 2. Writer Guard Heartbeat for Long Builds (TODO)
+
+**Current behavior:** The writer guard file is written once at startup with `PID hostname timestamp`.
+Cross-host TTL eviction (when `LITKIT_WRITER_GUARD_TTL > 0`) cannot verify if the remote process
+is still alive, so it relies solely on timestamp staleness.
+
+**Risk:** A legitimate long-running build (>24h on HPC) will have its guard evicted when TTL
+expires, allowing a second writer to start and corrupt the index.
+
+**Future improvement:** Periodic heartbeat updates during long builds:
+```python
+# Proposed heartbeat mechanism (future work)
+import threading
+import time
+
+_heartbeat_stop = threading.Event()
+
+def _heartbeat_writer(guard_path: Path, interval_sec: int = 3600):
+    """Background thread to update guard timestamp every hour."""
+    while not _heartbeat_stop.wait(interval_sec):
+        try:
+            # Update timestamp while preserving PID/host
+            parts = guard_path.read_text().split()
+            if len(parts) >= 2:
+                guard_path.write_text(f"{parts[0]} {parts[1]} {int(time.time())}\n")
+        except Exception:
+            pass  # Guard may have been cleaned up - exit gracefully
+
+# Start heartbeat after guard creation:
+heartbeat_thread = threading.Thread(target=_heartbeat_writer, args=(WRITER_GUARD,), daemon=True)
+heartbeat_thread.start()
+
+# On shutdown:
+_heartbeat_stop.set()
+```
+
+**Workaround (current):**
+- Default TTL is 0 (disabled) - no auto-eviction
+- Same-host PID liveness check via `os.kill(pid, 0)` still works
+- Set `LITKIT_WRITER_GUARD_TTL=172800` (48h) for very long builds
+- Manually remove stale guards: `rm workspace/.writer_guard`
+
+### 3. Writer Guard Identity Verification
 
 **Current behavior:** The writer guard file contains `PID hostname timestamp`. On stale
 detection, we check if the PID is alive on the same host via `os.kill(pid, 0)`.
