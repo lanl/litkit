@@ -90,8 +90,125 @@ if TYPE_CHECKING:
 _heavy_lock = threading.Lock()
 _deps: SimpleNamespace | None = None  # Populated by _load_heavy_deps()
 
+
+def _load_internal_modules() -> SimpleNamespace:
+    """Load heavy litkit internal modules (db, segments, embeddings, etc).
+    
+    This imports modules that are part of litkit itself and always succeed
+    if litkit is installed correctly. These pull in torch, transformers,
+    lxml, numpy etc. which is why they're deferred.
+    
+    Separate from _probe_faiss() to make failure modes clear:
+    - Internal module import failure = broken litkit install
+    - FAISS probe failure = optional dependency missing
+    
+    Returns:
+        SimpleNamespace with all imported functions/classes.
+    """
+    from litkit.embeddings.devices import configure_threads, detect_device
+    from litkit.embeddings.factory import make_chunk_embedder, make_paper_embedder
+    from litkit.formatting.answers import normalize_answer_and_build_refs, render_references
+    from litkit.ingest.ingest import (
+        iter_tar_paths,
+        iter_tar_xml_streams,
+        parallel_iter_tar_articles,
+        parse_xml_fileobj,
+    )
+    from litkit.ingest import is_uncompressed_tar, shard_filter
+    from litkit.db import (
+        init_db as db_init_db,
+        init_shard_db as db_init_shard_db,
+        connect_db as db_connect_db,
+        shard_db_path as db_shard_db_path,
+        chunk_ids_to_paper_ids as db_chunk_ids_to_paper_ids,
+        flush_pending_marks as db_flush_pending_marks,
+        load_temp_candidates as db_load_temp_candidates,
+    )
+    from litkit.segments import (
+        validate_shard_consistency as seg_validate_shard_consistency,
+        write_build_meta as seg_write_build_meta,
+        read_build_meta as seg_read_build_meta,
+        has_segment_files as seg_has_segment_files,
+        SegmentWriter,
+        ChunkSegmentWriter,
+        ProducerCoordinator as SegProducerCoordinator,
+        ConsumerCoordinator as SegConsumerCoordinator,
+        ingest_paper_segments as seg_ingest_paper_segments,
+        ingest_chunk_segments as seg_ingest_chunk_segments,
+    )
+    
+    return SimpleNamespace(
+        # Embeddings
+        configure_threads=configure_threads,
+        detect_device=detect_device,
+        make_paper_embedder=make_paper_embedder,
+        make_chunk_embedder=make_chunk_embedder,
+        # Formatting
+        normalize_answer_and_build_refs=normalize_answer_and_build_refs,
+        render_references=render_references,
+        # Ingest
+        iter_tar_paths=iter_tar_paths,
+        iter_tar_xml_streams=iter_tar_xml_streams,
+        parallel_iter_tar_articles=parallel_iter_tar_articles,
+        parse_xml_fileobj=parse_xml_fileobj,
+        is_uncompressed_tar=is_uncompressed_tar,
+        shard_filter=shard_filter,
+        # DB
+        db_init_db=db_init_db,
+        db_init_shard_db=db_init_shard_db,
+        db_connect_db=db_connect_db,
+        db_shard_db_path=db_shard_db_path,
+        db_chunk_ids_to_paper_ids=db_chunk_ids_to_paper_ids,
+        db_flush_pending_marks=db_flush_pending_marks,
+        db_load_temp_candidates=db_load_temp_candidates,
+        # Segments
+        seg_validate_shard_consistency=seg_validate_shard_consistency,
+        seg_write_build_meta=seg_write_build_meta,
+        seg_read_build_meta=seg_read_build_meta,
+        seg_has_segment_files=seg_has_segment_files,
+        SegmentWriter=SegmentWriter,
+        ChunkSegmentWriter=ChunkSegmentWriter,
+        SegProducerCoordinator=SegProducerCoordinator,
+        SegConsumerCoordinator=SegConsumerCoordinator,
+        seg_ingest_paper_segments=seg_ingest_paper_segments,
+        seg_ingest_chunk_segments=seg_ingest_chunk_segments,
+    )
+
+
+def _probe_faiss() -> bool:
+    """Probe FAISS availability and configure if present.
+    
+    Returns True if faiss is importable and usable, False otherwise.
+    
+    Side effects (if available):
+    - Sets faiss.cvar.seed for reproducible IVF training
+    
+    This is separate from _load_internal_modules() because:
+    1. FAISS is optional for some operations (--help, early validation)
+    2. Failure here != broken install, just missing optional dep
+    3. Makes it easy to add more optional probes (torch version, cuda, etc.)
+    
+    Does NOT raise on missing faiss - caller uses _require_faiss() for that.
+    """
+    # IMPORTANT: Only catch ImportError (missing faiss), NOT other exceptions.
+    # A broken faiss install should fail fast, not be silently ignored.
+    try:
+        import faiss
+        try:
+            faiss.cvar.seed = int(os.environ.get("LITKIT_FAISS_SEED", "123456"))
+        except AttributeError:
+            pass  # faiss.cvar.seed not available in this build (e.g., macOS faiss-cpu)
+        return True
+    except ImportError:
+        return False  # Will fail fast via _require_faiss() when actually needed
+
+
 def _load_heavy_deps() -> None:
     """Idempotent, thread-safe loader for heavy dependencies.
+    
+    Orchestrates loading of:
+    1. Internal litkit modules (db, segments, embeddings, etc.) via _load_internal_modules()
+    2. Optional third-party deps probe (FAISS) via _probe_faiss()
     
     Must be called at the top of any function that uses:
     - litkit.embeddings.* (torch, transformers)
@@ -104,7 +221,6 @@ def _load_heavy_deps() -> None:
     Uses double-checked locking to avoid races while minimizing lock contention.
     
     After loading, access dependencies via `_deps.name` (e.g., `_deps.db_connect_db`).
-    This consolidates all deferred imports into a single namespace for maintainability.
     """
     global _deps
     if _deps is not None:
@@ -113,96 +229,16 @@ def _load_heavy_deps() -> None:
         if _deps is not None:  # Double-check inside lock
             return
         
-        from litkit.embeddings.devices import configure_threads, detect_device
-        from litkit.embeddings.factory import make_chunk_embedder, make_paper_embedder
-        from litkit.formatting.answers import normalize_answer_and_build_refs, render_references
-        from litkit.ingest.ingest import (
-            iter_tar_paths,
-            iter_tar_xml_streams,
-            parallel_iter_tar_articles,
-            parse_xml_fileobj,
-        )
-        from litkit.ingest import is_uncompressed_tar, shard_filter
-        from litkit.db import (
-            init_db as db_init_db,
-            init_shard_db as db_init_shard_db,
-            connect_db as db_connect_db,
-            shard_db_path as db_shard_db_path,
-            chunk_ids_to_paper_ids as db_chunk_ids_to_paper_ids,
-            flush_pending_marks as db_flush_pending_marks,
-            load_temp_candidates as db_load_temp_candidates,
-        )
-        from litkit.segments import (
-            validate_shard_consistency as seg_validate_shard_consistency,
-            write_build_meta as seg_write_build_meta,
-            read_build_meta as seg_read_build_meta,
-            has_segment_files as seg_has_segment_files,
-            SegmentWriter,
-            ChunkSegmentWriter,
-            ProducerCoordinator as SegProducerCoordinator,
-            ConsumerCoordinator as SegConsumerCoordinator,
-            ingest_paper_segments as seg_ingest_paper_segments,
-            ingest_chunk_segments as seg_ingest_chunk_segments,
-        )
+        # Load internal litkit modules (always required for most operations)
+        modules = _load_internal_modules()
         
-        # Set deterministic FAISS seed (moved from _init_runtime for conceptual purity)
-        # _init_runtime() is now purely filesystem/env; faiss belongs with heavy deps
-        #
-        # IMPORTANT: Only catch ImportError (missing faiss), NOT other exceptions.
-        # A broken faiss install should fail fast, not be silently ignored.
-        #
-        # NOTE: FAISS is required for build and retrieval operations, not all ops.
-        # Early validation, --help/--version, and future metadata queries may skip FAISS.
-        # The faiss_available flag enables early fail-fast with a clear error message
-        # rather than a cryptic ImportError deep in the call stack.
-        faiss_available = False
-        try:
-            import faiss
-            faiss_available = True
-            try:
-                faiss.cvar.seed = int(os.environ.get("LITKIT_FAISS_SEED", "123456"))
-            except AttributeError:
-                pass  # faiss.cvar.seed not available in this build (e.g., macOS faiss-cpu)
-        except ImportError:
-            pass  # Will fail fast via _require_faiss() when actually needed
+        # Probe optional third-party dependencies
+        faiss_available = _probe_faiss()
         
-        # Consolidate all imports into a single namespace
+        # Consolidate into deps namespace
         _deps = SimpleNamespace(
             faiss_available=faiss_available,
-            # Embeddings
-            configure_threads=configure_threads,
-            detect_device=detect_device,
-            make_paper_embedder=make_paper_embedder,
-            make_chunk_embedder=make_chunk_embedder,
-            # Formatting
-            normalize_answer_and_build_refs=normalize_answer_and_build_refs,
-            render_references=render_references,
-            # Ingest
-            iter_tar_paths=iter_tar_paths,
-            iter_tar_xml_streams=iter_tar_xml_streams,
-            parallel_iter_tar_articles=parallel_iter_tar_articles,
-            parse_xml_fileobj=parse_xml_fileobj,
-            is_uncompressed_tar=is_uncompressed_tar,
-            shard_filter=shard_filter,
-            # DB
-            db_init_db=db_init_db,
-            db_init_shard_db=db_init_shard_db,
-            db_connect_db=db_connect_db,
-            db_shard_db_path=db_shard_db_path,
-            db_chunk_ids_to_paper_ids=db_chunk_ids_to_paper_ids,
-            db_flush_pending_marks=db_flush_pending_marks,
-            db_load_temp_candidates=db_load_temp_candidates,
-            # Segments
-            seg_validate_shard_consistency=seg_validate_shard_consistency,
-            seg_write_build_meta=seg_write_build_meta,
-            seg_read_build_meta=seg_read_build_meta,
-            seg_has_segment_files=seg_has_segment_files,
-            SegmentWriter=SegmentWriter,
-            ChunkSegmentWriter=ChunkSegmentWriter,
-            SegProducerCoordinator=SegProducerCoordinator,
-            SegConsumerCoordinator=SegConsumerCoordinator,
-            seg_ingest_paper_segments=seg_ingest_paper_segments,
-            seg_ingest_chunk_segments=seg_ingest_chunk_segments,
+            **vars(modules),  # Merge all module exports
         )
 
 
