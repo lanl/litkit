@@ -1028,3 +1028,64 @@ may require extracting training as part of the same refactoring step.
 | 2024-12-19 | Phase 6.2a-b (BuildConfig, init_empty_indices) | ~43 |
 | 2024-12-19 | Phase 6.2c (run_consume_only_mode) | ~42 |
 | 2024-12-19 | Phase 6.2d (load_or_create functions - module only) | ~12 |
+| 2024-12-20 | Phase 6.2d Step A (wire paper index load) | ~39 |
+
+---
+
+## Work Completed 2024-12-20
+
+### Phase 6.2d Step A: Wire Paper Index Load (COMPLETE)
+
+**Commit `dce49c6`:** `refactor(cli): wire paper index load to module function (Phase 6.2d Step A)`
+
+Replaced ~52 lines of inline paper index load/create code with a call to the module function:
+
+```python
+# Before: 52 lines of inline PAPER_INDEX_PATH.exists() / faiss_load / hnsw_index / etc.
+
+# After:
+paper_index = build_load_or_create_paper_index(
+    paper_index_path=PAPER_INDEX_PATH,
+    faiss_lock_path=FAISS_LOCK,
+    db_lock_path=DB_LOCK,
+    FileLock=FileLock,
+    paper_dim=paper_dim,
+    papers_index=args.papers_index,
+    hnsw_m=args.hnsw_m,
+    efconstruction=args.efconstruction,
+    efsearch=args.efsearch,
+    is_faiss_writer=args.faiss_writer,
+)
+```
+
+cli.py: 3480 → 3441 lines (-39 lines)
+
+### Progress Summary
+
+| Metric | Value |
+|--------|-------|
+| cli.py at session start | 3480 lines |
+| cli.py now | 3441 lines |
+| **Session reduction** | **-39 lines** |
+| **Total reduction (since 2024-12-18)** | **~1324 lines (28%)** |
+
+### Remaining Phase 6.2d Steps
+
+| Step | Description | Status | Est. Lines |
+|------|-------------|--------|------------|
+| Step A | Wire paper index load/create | ✅ COMPLETE | -39 |
+| Step B | Wire chunk index load/create | Not started | ~50 |
+| Step C | Extract IVF-PQ training to module | Not started | ~200 |
+| Step D | Wire training call in cli.py | Not started | ~5 |
+
+### Next Steps (Resume Point)
+
+Continue with Phase 6.2d Step B:
+- Replace inline chunk index load/create block (~55 lines) with `build_load_or_create_chunk_index()`
+- Then extract IVF-PQ training (~200 lines) to a module function
+
+---
+
+## Current Status
+
+**cli.py is now 3441 lines** (down from ~4723 at start of 2024-12-18 session, **~1324 lines / 28% reduction**)
