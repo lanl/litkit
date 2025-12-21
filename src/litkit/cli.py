@@ -938,9 +938,25 @@ def build_or_update_indices(args):
     save indices. Other processes (possibly using --shard-id/--num-shards) only
     populate SQLite rows and commit; they do not mutate FAISS indices.
     """
-    d = deps()  # ensures loaded + returns namespace (consistent pattern)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # FAST EARLY EXIT: compute "need" BEFORE loading heavy deps
+    # ═══════════════════════════════════════════════════════════════════════════
+    # This ensures pure query runs don't pay the 2-5s import penalty for torch,
+    # transformers, lxml, etc. Only Path.exists() and args flags are used here.
+    # ═══════════════════════════════════════════════════════════════════════════
+    get_runtime()  # pure filesystem/env - no torch/numpy
+    need = args.rebuild or not (
+        DB_PATH.exists() and PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists()
+    )
+    if not need and not args.update and not args.build_only and not args.consume_only and not args.init_indices_only and not args.embed_producer:
+        # nothing to do - fast exit without loading heavy deps
+        return
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # HEAVY DEPS: only loaded if we actually have build work to do
+    # ═══════════════════════════════════════════════════════════════════════════
+    d = deps()  # loads torch, transformers, lxml, etc.
     _require_faiss("building/updating indices")
-    # Lazy imports to defer faiss/numpy loading until actually needed
     from litkit.build import (
         BuildConfig,
         init_empty_indices as build_init_empty_indices,
@@ -951,14 +967,6 @@ def build_or_update_indices(args):
         process_tar_files as build_process_tar_files,
     )
     from litkit.index import faiss_save_force, kind_and_core
-
-    get_runtime()  # ensure all path globals are bound (required for library use)
-    need = args.rebuild or not (
-        DB_PATH.exists() and PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists()
-    )
-    if not need and not args.update and not args.build_only and not args.consume_only and not args.init_indices_only and not args.embed_producer:
-        # nothing to do
-        return
 
     # Validate build mode and shard count consistency BEFORE any work begins
     # Determine the build mode based on args
