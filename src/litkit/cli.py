@@ -1176,11 +1176,39 @@ def build_or_update_indices(args):
                     _render(force=True)  # render resume point
                 continue
 
-            handled_ok = False
             f = f"tar://{tpath}!/{m.name}"
             st = SimpleNamespace(
                 st_size=int(getattr(m, "size", 0)), st_mtime=float(getattr(m, "mtime", 0.0) or 0.0)
             )
+
+            # ═══════════════════════════════════════════════════════════════════════
+            # FAST PATH - No savepoint overhead for already-processed or unparsable
+            # ═══════════════════════════════════════════════════════════════════════
+            # Performance optimization: check "no-write" conditions BEFORE entering
+            # the savepoint region. This avoids SQLite savepoint overhead for the
+            # common case in --update runs where most members are already processed.
+            
+            # inline heartbeat/progress refresh
+            _render()
+            
+            # Fast path 1: already processed (vast majority in --update mode)
+            if not args.rebuild and db_already_processed(cur, str(f), st):
+                processed_count += 1
+                # No checkpoint logic needed here - this is a no-write fast path
+                continue
+
+            # Fast path 2: unparsable XML (meta is None)
+            # iter_tar_articles already parsed; meta is None if unparsable
+            if meta is None:
+                processed_count += 1
+                continue
+
+            # ═══════════════════════════════════════════════════════════════════════
+            # SLOW PATH - Savepoint-protected writes
+            # ═══════════════════════════════════════════════════════════════════════
+            # Only reach here if we actually need to write to the DB.
+            
+            handled_ok = False
 
             # Snapshot buffer lengths BEFORE processing so we can truncate on rollback.
             # This ensures in-memory buffers stay in sync with SQLite savepoint rollbacks.
@@ -1198,17 +1226,7 @@ def build_or_update_indices(args):
             # this member is rolled back; prior successful work is preserved.
             conn.execute("SAVEPOINT member_sp")
             try:
-                # inline heartbeat/progress refresh
-                _render()
-
-                # Fast path: unchanged (count as handled)
-                if not args.rebuild and db_already_processed(cur, str(f), st):
-                    handled_ok = True
-
-                # iter_tar_articles already parsed the XML; meta is None if unparsable
-                elif meta is None:
-                    handled_ok = True  # permanently skip bad member next time
-                else:
+                if True:  # Explicit scope for ingest body (was inside else branch)
                     # ---------- BEGIN INGEST BODY (same semantics; no member-based checkpointing here) ----------
                     pmcid = (meta["pmcid"] or "").strip()
                     pmid = (meta["pmid"] or "").strip()
