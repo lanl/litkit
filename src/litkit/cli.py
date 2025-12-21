@@ -1201,6 +1201,13 @@ def build_or_update_indices(args):
     )
 
     # ----- TAR SHARD PATH (NO EXTRACTION) -----
+    # NOTE: We materialize the tar_paths iterator into a list here for two reasons:
+    # 1. Progress reporting needs len(tar_paths) for "N of M tars processed"
+    # 2. Checkpoint resume logic benefits from knowing total shard count
+    #
+    # Memory impact is negligible: even 10,000 Path objects ≈ 2MB, compared to
+    # FAISS indices (1-10GB), embedding batches (100-500MB), SQLite (10-50MB).
+    # PMC-OA corpus has ~600-2000 shard files, so ~200-400KB total.
     tar_paths = list(
         _deps.shard_filter(
             _deps.iter_tar_paths(args.tar_dir, args.tar_manifest), args.shard_id, args.num_shards
