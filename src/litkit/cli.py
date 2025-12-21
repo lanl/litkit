@@ -151,20 +151,25 @@ def _load_heavy_deps() -> None:
         #
         # IMPORTANT: Only catch ImportError (missing faiss), NOT other exceptions.
         # A broken faiss install should fail fast, not be silently ignored.
-        has_faiss = False
+        #
+        # NOTE: FAISS is required for ALL litkit operations except --help/--version.
+        # Both build AND query paths use FAISS indices. The faiss_available flag
+        # enables early fail-fast with a clear error message rather than a cryptic
+        # ImportError deep in the call stack.
+        faiss_available = False
         try:
             import faiss
-            has_faiss = True
+            faiss_available = True
             try:
                 faiss.cvar.seed = int(os.environ.get("LITKIT_FAISS_SEED", "123456"))
             except AttributeError:
                 pass  # faiss.cvar.seed not available in this build (e.g., macOS faiss-cpu)
         except ImportError:
-            pass  # faiss is optional for query-only flows with --no-llm
+            pass  # Will fail fast via _require_faiss() when actually needed
         
         # Consolidate all imports into a single namespace
         _deps = SimpleNamespace(
-            has_faiss=has_faiss,
+            faiss_available=faiss_available,
             # Embeddings
             configure_threads=configure_threads,
             detect_device=detect_device,
@@ -224,11 +229,15 @@ def deps() -> SimpleNamespace:
 def _require_faiss(context: str = "this operation") -> None:
     """Fail fast if FAISS is not available.
     
-    Call this at the start of any code path that requires FAISS (build/write flows).
-    Query-only flows with --no-llm may work without FAISS.
+    FAISS is required for ALL litkit operations except --help/--version:
+    - Build paths: creating/updating indices
+    - Query paths: shortlist_papers(), search_chunks_constrained()
+    - Maintenance: --reconcile-only, --consume-only
+    
+    Call this early in any code path that touches FAISS indices.
     """
     d = deps()
-    if not d.has_faiss:
+    if not d.faiss_available:
         raise SystemExit(
             f"[error] FAISS is required for {context}.\n"
             "Install faiss-cpu or faiss-gpu:\n"
@@ -2355,6 +2364,7 @@ def main():
         args.efsearch = max(args.efsearch, 256)
 
     if args.reconcile_only:
+        _require_faiss("reconcile-only mode")
         # Lazy import for reconcile-only path
         from litkit.index import faiss_load, faiss_save_force
         
@@ -2431,6 +2441,7 @@ def main():
         return
 
     # -------- Retrieval pipeline --------
+    _require_faiss("retrieval")
     # Stage 1: shortlist candidate papers (HNSW on SPECTER2)
     k_papers = args.top_papers if args.top_papers is not None else _auto_top_papers()
     papers = shortlist_papers(
