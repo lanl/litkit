@@ -1236,119 +1236,13 @@ def build_or_update_indices(args):
                             chunk_paper_doc_ids_buf.append(canon_doc_id)
                             chunk_ords_buf.append(ord_i)
 
-                        if len(paper_ids_buf) >= PAPER_BATCH:
-                            u_ids, u_texts, u_doc_ids = dedupe_papers_with_doc_ids(
-                                paper_ids_buf, paper_texts_buf, paper_doc_ids_buf
-                            )
-
-                            if paper_seg_writer is not None:
-                                Xp = paper_embedder.encode(
-                                    u_texts,
-                                    progress_label=f"Embedding papers (producer, {len(u_texts)})",
-                                    batch_size=args.paper_embed_bs,
-                                    progress_done_summary=False,
-                                )
-                                paper_seg_writer.write(doc_ids=u_doc_ids, vecs=Xp)
-                                conn.commit()
-                                papers_added_total += len(u_ids)
-
-                            elif args.faiss_writer:
-                                Xp = paper_embedder.encode(
-                                    u_texts,
-                                    progress_label=f"Embedding papers (batch of {len(u_texts)})",
-                                    batch_size=args.paper_embed_bs,
-                                    progress_done_summary=False,
-                                )
-                                # mutate & save FAISS without holding DB_LOCK
-                                prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
-                                sel = make_id_selector(u_ids)
-                                with FileLock(FAISS_LOCK):
-                                    safe_remove_ids(paper_index, sel)
-                                    added, ids_added = add_with_ids_dedup(paper_index, u_ids, Xp)
-                                    saved = False
-                                    if added:
-                                        if prior_ntotal == 0:
-                                            saved = faiss_save_force(paper_index, PAPER_INDEX_PATH)
-                                        else:
-                                            saved = faiss_save(paper_index, PAPER_INDEX_PATH)
-                                if added:
-                                    if saved:
-                                        with FileLock(DB_LOCK):
-                                            db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
-                                            db_flush_pending_marks(cur)
-                                            conn.commit()
-                                    # else: save failed, reconcile_sqlite_flags_with_faiss() will fix
-                                papers_added_total += int(added) 
-
-                            else:
-                                conn.commit()
-                                papers_added_total += len(u_ids)
-
-                            paper_ids_buf.clear()
-                            paper_texts_buf.clear()
-                            paper_doc_ids_buf.clear()
-
-                        if len(chunk_ids_buf) >= CHUNK_BATCH:
-                            u_ids, u_texts, u_paper_doc_ids, u_ords = dedupe_chunks_with_doc_ids(
-                                chunk_ids_buf, chunk_texts_buf, chunk_paper_doc_ids_buf, chunk_ords_buf
-                            )
-
-                            if chunk_seg_writer is not None:
-                                Xc = chunk_embedder.encode(
-                                    u_texts,
-                                    progress_label=f"Embedding chunks (producer, {len(u_texts)})",
-                                    batch_size=args.chunk_embed_bs,
-                                    progress_done_summary=False,
-                                )
-                                chunk_seg_writer.write(
-                                    paper_doc_ids=u_paper_doc_ids, ords=u_ords, vecs=Xc
-                                )
-                                conn.commit()
-                                chunks_added_total += len(u_ids)
-
-                            elif args.faiss_writer:
-                                Xc = chunk_embedder.encode(
-                                    u_texts,
-                                    progress_label=f"Embedding chunks (batch of {len(u_texts)})",
-                                    batch_size=args.chunk_embed_bs,
-                                    progress_done_summary=False,
-                                )
-                                # mutate & save FAISS without holding DB_LOCK
-                                prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
-                                sel = make_id_selector(u_ids)
-                                with FileLock(FAISS_LOCK):
-                                    safe_remove_ids(chunk_index, sel)
-                                    added, ids_added = add_with_ids_dedup(chunk_index, u_ids, Xc)
-                                    saved = False
-                                    if added:
-                                        if prior_ntotal == 0:
-                                            saved = faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
-                                        else:
-                                            saved = faiss_save(chunk_index, CHUNK_INDEX_PATH)
-                                if added:
-                                    if saved:
-                                        with FileLock(DB_LOCK):
-                                            db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
-                                            db_flush_pending_marks(cur)
-                                            conn.commit()
-                                    # else: save failed, reconcile_sqlite_flags_with_faiss() will fix
-
-                                chunks_added_total += int(added)
-
-                            else:
-                                conn.commit()
-                                chunks_added_total += len(u_ids)
-
-                            chunk_ids_buf.clear()
-                            chunk_texts_buf.clear()
-                            chunk_paper_doc_ids_buf.clear()
-                            chunk_ords_buf.clear()
-
                         # ---------- END INGEST BODY ----------
 
                         handled_ok = True
 
                 # Release savepoint on success (keep changes in transaction)
+                # IMPORTANT: Release savepoint BEFORE any conn.commit() calls.
+                # conn.commit() ends the transaction and invalidates all savepoints.
                 conn.execute("RELEASE SAVEPOINT member_sp")
 
             except Exception as e:
@@ -1373,6 +1267,123 @@ def build_or_update_indices(args):
                 del chunk_ords_buf[co_len:]
                 
                 handled_ok = False  # do not advance processed_count; retry next run
+
+            # ═══════════════════════════════════════════════════════════════════════
+            # BATCH FLUSH - OUTSIDE SAVEPOINT REGION
+            # ═══════════════════════════════════════════════════════════════════════
+            # Batch flushes that call conn.commit() MUST happen after the savepoint
+            # is released. conn.commit() ends the transaction and invalidates all
+            # active savepoints, which would cause "no such savepoint" errors if we
+            # tried to RELEASE or ROLLBACK after the commit.
+            # ═══════════════════════════════════════════════════════════════════════
+            
+            if handled_ok and len(paper_ids_buf) >= PAPER_BATCH:
+                u_ids, u_texts, u_doc_ids = dedupe_papers_with_doc_ids(
+                    paper_ids_buf, paper_texts_buf, paper_doc_ids_buf
+                )
+
+                if paper_seg_writer is not None:
+                    Xp = paper_embedder.encode(
+                        u_texts,
+                        progress_label=f"Embedding papers (producer, {len(u_texts)})",
+                        batch_size=args.paper_embed_bs,
+                        progress_done_summary=False,
+                    )
+                    paper_seg_writer.write(doc_ids=u_doc_ids, vecs=Xp)
+                    conn.commit()
+                    papers_added_total += len(u_ids)
+
+                elif args.faiss_writer:
+                    Xp = paper_embedder.encode(
+                        u_texts,
+                        progress_label=f"Embedding papers (batch of {len(u_texts)})",
+                        batch_size=args.paper_embed_bs,
+                        progress_done_summary=False,
+                    )
+                    # mutate & save FAISS without holding DB_LOCK
+                    prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
+                    sel = make_id_selector(u_ids)
+                    with FileLock(FAISS_LOCK):
+                        safe_remove_ids(paper_index, sel)
+                        added, ids_added = add_with_ids_dedup(paper_index, u_ids, Xp)
+                        saved = False
+                        if added:
+                            if prior_ntotal == 0:
+                                saved = faiss_save_force(paper_index, PAPER_INDEX_PATH)
+                            else:
+                                saved = faiss_save(paper_index, PAPER_INDEX_PATH)
+                    if added:
+                        if saved:
+                            with FileLock(DB_LOCK):
+                                db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
+                                db_flush_pending_marks(cur)
+                                conn.commit()
+                        # else: save failed, reconcile_sqlite_flags_with_faiss() will fix
+                    papers_added_total += int(added) 
+
+                else:
+                    conn.commit()
+                    papers_added_total += len(u_ids)
+
+                paper_ids_buf.clear()
+                paper_texts_buf.clear()
+                paper_doc_ids_buf.clear()
+
+            if handled_ok and len(chunk_ids_buf) >= CHUNK_BATCH:
+                u_ids, u_texts, u_paper_doc_ids, u_ords = dedupe_chunks_with_doc_ids(
+                    chunk_ids_buf, chunk_texts_buf, chunk_paper_doc_ids_buf, chunk_ords_buf
+                )
+
+                if chunk_seg_writer is not None:
+                    Xc = chunk_embedder.encode(
+                        u_texts,
+                        progress_label=f"Embedding chunks (producer, {len(u_texts)})",
+                        batch_size=args.chunk_embed_bs,
+                        progress_done_summary=False,
+                    )
+                    chunk_seg_writer.write(
+                        paper_doc_ids=u_paper_doc_ids, ords=u_ords, vecs=Xc
+                    )
+                    conn.commit()
+                    chunks_added_total += len(u_ids)
+
+                elif args.faiss_writer:
+                    Xc = chunk_embedder.encode(
+                        u_texts,
+                        progress_label=f"Embedding chunks (batch of {len(u_texts)})",
+                        batch_size=args.chunk_embed_bs,
+                        progress_done_summary=False,
+                    )
+                    # mutate & save FAISS without holding DB_LOCK
+                    prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
+                    sel = make_id_selector(u_ids)
+                    with FileLock(FAISS_LOCK):
+                        safe_remove_ids(chunk_index, sel)
+                        added, ids_added = add_with_ids_dedup(chunk_index, u_ids, Xc)
+                        saved = False
+                        if added:
+                            if prior_ntotal == 0:
+                                saved = faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+                            else:
+                                saved = faiss_save(chunk_index, CHUNK_INDEX_PATH)
+                    if added:
+                        if saved:
+                            with FileLock(DB_LOCK):
+                                db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
+                                db_flush_pending_marks(cur)
+                                conn.commit()
+                        # else: save failed, reconcile_sqlite_flags_with_faiss() will fix
+
+                    chunks_added_total += int(added)
+
+                else:
+                    conn.commit()
+                    chunks_added_total += len(u_ids)
+
+                chunk_ids_buf.clear()
+                chunk_texts_buf.clear()
+                chunk_paper_doc_ids_buf.clear()
+                chunk_ords_buf.clear()
 
             # Update progress & checkpoint only after a successful handle
             if handled_ok:
