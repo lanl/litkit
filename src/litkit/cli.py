@@ -638,8 +638,11 @@ BATCH_TRAIN_FLUSH = int(
 )  # how many training chunks per embed flush
 
 # token budgets (approx; ~4 chars/token heuristic used)
-BUDGET_TOKENS_O3 = 32000
-BUDGET_TOKENS_OSS20B = 3000
+# Override via env for local models with different context sizes:
+#   LITKIT_BUDGET_O3=128000  (e.g., for 128k context models)
+#   LITKIT_BUDGET_OSS20B=8000  (e.g., for larger local models)
+BUDGET_TOKENS_O3 = int(os.environ.get("LITKIT_BUDGET_O3", "32000"))
+BUDGET_TOKENS_OSS20B = int(os.environ.get("LITKIT_BUDGET_OSS20B", "3000"))
 
 # -------------------- Destructive action confirmation --------------------
 def _fmt_bytes(n: int) -> str:
@@ -1358,7 +1361,7 @@ def pack_context(
     *,
     sys_prompt: str = SYS_PROMPT,
     max_out_tokens: int = 3000,
-) -> tuple[str, list[int]]:
+) -> tuple[str, list[int], dict]:
     """Assemble a model-aware context window from ranked chunks, respecting an approximate
     token budget determined by the target model. Uses the *actual* system prompt for
     budgeting to avoid drift.
@@ -1372,11 +1375,17 @@ def pack_context(
 
     Returns:
     -------
-    (context_text, used_indices)
+    (context_text, used_indices, token_meta)
       context_text : str
           Concatenated context blocks prefixed with [i] and paper metadata.
       used_indices : List[int]
           1-based indices of chunks that fit within the budget (in order).
+      token_meta : dict
+          Token budget metadata for logging:
+          - approx_tokens: approximate tokens used (heuristic: 4 chars/token)
+          - budget: total token budget for the model
+          - input_budget: budget minus max_out_tokens
+          - max_out_tokens: reserved output allowance
     """
     # Choose token budget per model family
     budget = BUDGET_TOKENS_O3 if model_name.lower().startswith("o3") else BUDGET_TOKENS_OSS20B
@@ -1417,7 +1426,14 @@ def pack_context(
             break
 
     ctx_text = "\n\n".join(blocks) if blocks else "(no context)"
-    return ctx_text, used
+    approx_used = input_budget - remain  # how many tokens we consumed
+    token_meta = {
+        "approx_tokens": approx_used,
+        "budget": budget,
+        "input_budget": input_budget,
+        "max_out_tokens": max_out_tokens,
+    }
+    return ctx_text, used, token_meta
 
 
 def answer_with_llm(
@@ -1513,7 +1529,7 @@ def answer_with_llm(
 
     # Up to 4 tries: progressively trim the number of chunks *and* reduce max_out
     for attempt in range(4):
-        ctx_text, _used_idxs = pack_context(working_chunks, question, model, sys_prompt=sys_prompt, max_out_tokens=max_out)
+        ctx_text, _used_idxs, _ = pack_context(working_chunks, question, model, sys_prompt=sys_prompt, max_out_tokens=max_out)
         sys_msg = sys_prompt
 
         try:
@@ -2441,11 +2457,13 @@ def main():
 
     # If the user asked for retrieval only, print the context and exit
     if args.no_llm:
-        ctx_text, used_idx = pack_context(chunks, question, args.llm_model, max_out_tokens=args.max_out_tokens)
+        ctx_text, used_idx, token_meta = pack_context(chunks, question, args.llm_model, max_out_tokens=args.max_out_tokens)
         print("CONTEXT")
         print("=" * 80)
         print(ctx_text)
         print("=" * 80)
+        if not args.quiet:
+            _eprint(f"[context] packed ~{token_meta['approx_tokens']} tokens (budget={token_meta['budget']}, input_budget={token_meta['input_budget']})")
         _eprint(f"[info] used {len(used_idx)} chunks; meta={meta}")
         return
 
@@ -2465,7 +2483,9 @@ def main():
     # base_url = args.openai_base_url or _default_base_url_for(args.llm_model)
     # api_key = args.openai_api_key or _default_api_key_for(args.llm_model)
 
-    ctx_text, used_idx = pack_context(chunks, question, args.llm_model, max_out_tokens=args.max_out_tokens)
+    ctx_text, used_idx, token_meta = pack_context(chunks, question, args.llm_model, max_out_tokens=args.max_out_tokens)
+    if not args.quiet:
+        _eprint(f"[context] packed ~{token_meta['approx_tokens']} tokens (budget={token_meta['budget']}, input_budget={token_meta['input_budget']})")
     selected_chunks = [chunks[i - 1] for i in used_idx]  # 0-based indexing
     try:
         answer = answer_with_llm(
