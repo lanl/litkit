@@ -286,23 +286,44 @@ def _require_faiss(context: str = "this operation") -> None:
 def _maybe_cleanup_own_stale_guard():
     """Best-effort cleanup of a guard file left by THIS process.
     
-    Only removes the guard if the recorded PID matches os.getpid().
+    Only removes the guard if ALL three conditions match:
+    1. PID matches os.getpid()
+    2. Host matches socket.gethostname()
+    3. Timestamp is within a reasonable window (7 days)
+    
     This handles the case where the same process tries to re-create
     a guard (e.g., after a soft restart), but does NOT clean up
-    guards left by crashed processes with different PIDs - that's
-    handled by TTL-based stale detection in _create_writer_guard_or_exit.
+    guards left by crashed processes - that's handled by TTL-based
+    stale detection in _create_writer_guard_or_exit.
     
-    Note: PID reuse is theoretically possible after a crash, but rare
-    enough that we accept this as a benign edge case.
+    Why all three checks? On busy HPC clusters, PID reuse is not rare.
+    A stale guard from a dead process could have the same PID as the
+    current process (after kernel PID wraparound). Requiring host match
+    and recent timestamp greatly reduces false positives.
     """
+    import socket
+    import time
+    
     get_runtime()  # ensure WRITER_GUARD is bound
     try:
         if WRITER_GUARD.exists():
-            # Parse guard file with explicit field extraction (avoids silent truncation)
+            # Parse guard file: PID HOST TIMESTAMP
             parts = WRITER_GUARD.read_text().split()
-            pid = parts[0] if len(parts) >= 1 else ""
-            # host and ts unused here, but kept for clarity if parsing expands
-            if pid.isdigit() and int(pid) == os.getpid():
+            if len(parts) < 3:
+                return  # malformed guard, don't touch
+            
+            pid_str, host, ts_str = parts[0], parts[1], parts[2]
+            
+            # Only cleanup if ALL three match "this process":
+            # 1. PID matches current process
+            # 2. Host matches current hostname (guards against PID reuse on different node)
+            # 3. Timestamp is within reasonable window (7 days = 604800 sec)
+            MAX_AGE_SEC = 604800  # 7 days
+            if (pid_str.isdigit() 
+                and int(pid_str) == os.getpid()
+                and host == socket.gethostname()
+                and ts_str.isdigit() 
+                and (time.time() - int(ts_str)) < MAX_AGE_SEC):
                 WRITER_GUARD.unlink(missing_ok=True)
     except Exception:
         pass
