@@ -1812,21 +1812,15 @@ def shortlist_papers(
     *,
     embedder: Embedder | None = None,
 ) -> list[int]:
-    """Stage 1: encode the question with SPECTER2 and retrieve top-k paper IDs
-    from the paper index (HNSW by default). Returns a list of paper ids.
-    """
-    get_runtime()  # ensure path globals are initialized for library use
+    """Thin wrapper: delegates to litkit.retrieval.shortlist_papers."""
+    get_runtime()
     enc = embedder or make_paper_embedder()[0]
-    q = enc.encode([question]).astype("float32", copy=False)
-    faiss.normalize_L2(q)
-    ids, _, meta = _faiss_search(PAPER_INDEX_PATH, q, k, efSearch=efsearch)
-    try:
-        es = meta.get("efSearch")
-        if es is not None:
-            _eprint(f"[retrieve] papers: HNSW efSearch={es} k={k}")
-    except Exception:
-        pass
-    return ids
+    return retrieval_shortlist_papers(
+        question, k,
+        paper_index_path=PAPER_INDEX_PATH,
+        embedder=enc,
+        efsearch=efsearch,
+    )
 
 
 def search_chunks_constrained(
