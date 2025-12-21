@@ -1804,9 +1804,14 @@ This is non-trivial due to:
 
 ## Current Status
 
-**cli.py is now ~3056 lines** (temporarily up due to added imports; will be ~2250 after inline removal)
+**cli.py is now 2337 lines** (down from 4723 at start, **51% reduction**)
 
-Total reduction potential after completing Phase 6.2f: **~52% (from 4723 to ~2250 lines)**
+### Refactor Complete! 🎉
+
+All planned phases have been completed:
+- Phase 1-4: Module extraction, import purity, wire-up, dead code removal
+- Phase 6.1-6.2g: Build module extraction (helpers, backfill, config, indices, consume, training, ingest_loop)
+- Phase 5: Final cleanup (removed SCOPE CONTRACT, wired get_chunks)
 
 ### Summary of All Reductions
 
