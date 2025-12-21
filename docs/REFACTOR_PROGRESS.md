@@ -1746,9 +1746,67 @@ These require completing the refactor per SCOPE CONTRACT at top of cli.py:
 
 ---
 
+## Work Completed 2024-12-20 (Phase 6.2f Session)
+
+### Phase 6.2f: Extract tar processing loop (PARTIAL)
+
+Created the `litkit/build/ingest_loop.py` module with the tar processing loop extracted from cli.py.
+
+**Commit `0195dd0`:** `refactor(build): create ingest_loop module (Phase 6.2f WIP)`
+
+**Created `litkit/build/ingest_loop.py`** (~870 lines):
+- `iter_tar_articles()` - Unified tar article iterator (parallel/sequential based on format)
+- `process_tar_files()` - Main tar processing loop with:
+  - Checkpoint loading/saving
+  - Progress rendering with time/percentage gating
+  - Fast path checks (already_processed, unparsable XML)
+  - Savepoint-protected DB writes with buffer management
+  - Paper/chunk batch flush (producer mode: segments, writer mode: FAISS)
+  - Per-member checkpoint updates
+  - Tar-boundary flush with two-phase commit (producer mode)
+- `flush_final_buffers()` - Final buffer flush helper for end of processing
+
+**Updated `__init__.py`** to export:
+- `iter_tar_articles`
+- `process_tar_files`
+- `flush_final_buffers`
+
+**Status:** Module created and compiles. The ~550 lines of inline tar processing still exist in cli.py pending wiring step.
+
+### Updated Module Structure
+
+```
+src/litkit/build/
+├── __init__.py       # Package exports (19 items)
+├── helpers.py        # Text chunking & deduplication (~148 lines)
+├── backfill.py       # FAISS/SQLite reconciliation (~268 lines)
+├── config.py         # BuildConfig dataclass (~270 lines)
+├── indices.py        # Index creation utilities (~305 lines)
+├── consume.py        # Consumer-only mode (~120 lines)
+├── training.py       # IVF-PQ training (~370 lines)
+└── ingest_loop.py    # Tar processing loop (~870 lines) ← NEW
+```
+
+### Next Steps for Phase 6.2f Completion
+
+To complete the extraction and achieve ~500 line reduction:
+1. Replace the inline tar loop (lines ~1070-1620) with a call to `build_process_tar_files()`
+2. Replace the final flush blocks with a call to `build_flush_final_buffers()`
+3. Remove dead inline `iter_tar_articles()` function
+4. Test with `./test_build.sh --clean`
+
+This is non-trivial due to:
+- Mutable indices passed by reference (returned from module)
+- Global segment writers (`paper_seg_writer`, `chunk_seg_writer`)
+- Complex post-loop handling (producer completion marker, segment ingestion, reconcile, backfill)
+
+---
+
 ## Current Status
 
-**cli.py is now ~2770 lines** (down from ~4723 at start of 2024-12-18 session, **~1953 lines / 41% reduction**)
+**cli.py is now ~3056 lines** (temporarily up due to added imports; will be ~2250 after inline removal)
+
+Total reduction potential after completing Phase 6.2f: **~52% (from 4723 to ~2250 lines)**
 
 ### Summary of All Reductions
 
