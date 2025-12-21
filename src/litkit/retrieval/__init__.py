@@ -25,6 +25,15 @@ from litkit.retrieval.search import (
     faiss_search,
     temporary_search_params,
 )
+from litkit.retrieval.lexical import (
+    LexicalConfig,
+    LexicalResult,
+    LexicalBackend,
+    SqliteLexicalBackend,
+    find_rare_terms,
+    lexical_search,
+    merge_lexical_and_ann,
+)
 
 __all__ = [
     # Main retrieval functions
@@ -40,4 +49,12 @@ __all__ = [
     # FAISS search
     "faiss_search",
     "temporary_search_params",
+    # Lexical
+    "LexicalConfig",
+    "LexicalResult",
+    "LexicalBackend",
+    "SqliteLexicalBackend",
+    "find_rare_terms",
+    "lexical_search",
+    "merge_lexical_and_ann",
 ]
