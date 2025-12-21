@@ -37,16 +37,11 @@ def _version_banner() -> str:
 
 
 # -------------------- Standard library imports --------------------
+# Only imports needed BEFORE argparse runs (for --help/--version) are at module level.
+# Other stdlib imports are deferred to their use sites to minimize import-time side effects.
 import argparse
-import atexit
-import errno
-import logging
 import re
-import signal
-import socket
 import threading
-import time
-import unicodedata
 from pathlib import Path
 from typing import Iterator
 
@@ -227,6 +222,9 @@ def _maybe_cleanup_own_stale_guard():
 def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
     """Create a writer guard file or exit if another writer is active.
     
+    Stdlib imports (atexit, errno, signal, socket, time) are deferred to this function
+    to minimize import-time side effects for --help/--version.
+    
     Uses a bounded retry loop (max 2 attempts) to handle stale guard cleanup.
     
     DESIGN DECISIONS (cross-host TTL eviction & signal handling):
@@ -253,6 +251,13 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
          * Normal shutdown can deadlock if interrupted during a lock hold
        - Accepted tradeoff: rely on reconcile+backfill vs. risk deadlock/blocked runs
     """
+    # Deferred imports to minimize module-level side effects
+    import atexit
+    import errno
+    import signal
+    import socket
+    import time
+    
     get_runtime()  # ensure WRITER_GUARD is bound
     _maybe_cleanup_own_stale_guard()
     if not getattr(args, "faiss_writer", False):
@@ -1604,6 +1609,7 @@ def _normalize_and_strip_citations(text: str) -> str:
        2) Remove '†Lx–Ly' / location tails by only keeping the leading numeric list.
        3) Normalize commas/spacing, de-duplicate while preserving order.
     """
+    import unicodedata  # deferred to minimize module-level side effects
     try:
         s = unicodedata.normalize("NFKC", text)
     except Exception:
@@ -1684,9 +1690,8 @@ def main():
         MIN_CPP_DEFAULT = float(min_cpp_env) if min_cpp_env is not None else 2.0
     except ValueError:
         MIN_CPP_DEFAULT = 2.0
-        logging.warning(
-            "[args] Ignoring invalid LITKIT_MIN_CHUNKS_PER_PAPER=%r; using 2.0", min_cpp_env
-        )
+        # logging deferred to main(); use stderr for early warnings
+        sys.stderr.write(f"[args] WARNING: Ignoring invalid LITKIT_MIN_CHUNKS_PER_PAPER={min_cpp_env!r}; using 2.0\n")
     ap.add_argument(
         "--min-chunks-per-paper",
         type=float,
@@ -1993,7 +1998,8 @@ def main():
     # Load heavy dependencies (idempotent - delegates to _load_heavy_deps())
     _load_heavy_deps()
     
-    # logging + device threads
+    # logging + device threads (import deferred to minimize module-level side effects)
+    import logging
     logging.basicConfig(
         level=(logging.ERROR if args.quiet else logging.WARNING),
         format="%(levelname)s %(name)s: %(message)s",
