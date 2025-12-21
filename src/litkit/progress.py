@@ -110,6 +110,12 @@ class Progress:
             process(item)
             prog.tick()
         prog.finish()
+    
+    Args:
+        force_append: If True, always emit newlines between updates instead
+                      of using TTY-aware single-line overwriting. Useful for
+                      long-running operations where log visibility matters
+                      (e.g., IVF-PQ training).
     """
     
     def __init__(
@@ -120,6 +126,7 @@ class Progress:
         min_interval: float = 0.2,
         stream: TextIO | None = None,
         emit_final_line: bool = True,
+        force_append: bool = False,
     ):
         self.label = label
         self.total = total if (total is not None and total > 0) else None
@@ -129,10 +136,17 @@ class Progress:
         self.min_interval = float(min_interval)
         self.stream = stream if stream is not None else sys.stderr
         self.emit_final_line = bool(emit_final_line)
+        self.force_append = bool(force_append)
         self._last_len = 0
 
     def _write_line(self, s: str) -> None:
-        _progress_write(s, self.stream)
+        if self.force_append:
+            # Always emit newlines (explicit append mode)
+            with _PROGRESS_LOCK:
+                self.stream.write(s + "\n")
+                self.stream.flush()
+        else:
+            _progress_write(s, self.stream)
 
     def _fmt(self) -> str:
         elapsed = max(1e-3, time.time() - self.start_ts)
