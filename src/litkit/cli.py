@@ -1,4 +1,20 @@
 # src/litkit/cli.py
+# ═══════════════════════════════════════════════════════════════════════════════
+# CRITICAL: macOS FAISS threading fix MUST come BEFORE any other imports
+# ═══════════════════════════════════════════════════════════════════════════════
+# On macOS, FAISS + MPS threading causes segfaults. The env vars must be set
+# BEFORE any C extension (faiss, numpy, torch) is loaded because OpenMP
+# initializes its thread pool at library load time.
+#
+# This block must stay at the absolute top of this file.
+# ═══════════════════════════════════════════════════════════════════════════════
+import os as _os
+import sys as _sys
+if _sys.platform == "darwin":
+    _os.environ.setdefault("FAISS_NUM_THREADS", "1")
+    _os.environ.setdefault("OMP_NUM_THREADS", "1")
+# ═══════════════════════════════════════════════════════════════════════════════
+
 """Litkit CLI entrypoint.
 
 This module provides the command-line interface for litkit, including:
@@ -39,7 +55,6 @@ def _version_banner() -> str:
 # Only imports needed BEFORE argparse runs (for --help/--version) are at module level.
 # Other stdlib imports are deferred to their use sites to minimize import-time side effects.
 import argparse
-import re
 import threading
 from pathlib import Path
 from typing import Iterator
@@ -692,7 +707,6 @@ DEFAULT_EMBED_SEGMENT_DTYPE = os.environ.get("LITKIT_EMBED_SEGMENT_DTYPE", "fp16
 DEFAULT_BUSY_TIMEOUT_MS = int(os.environ.get("LITKIT_SQLITE_BUSY_TIMEOUT_MS", "120000"))
 
 
-PROMPT_HEADROOM_TOKENS = int(os.environ.get("LITKIT_PROMPT_HEADROOM_TOKENS", "200"))
 
 
 # FileLock wrapper that binds the DB_LOCK and FAISS_LOCK paths at runtime
@@ -780,12 +794,6 @@ BATCH_TRAIN_FLUSH = int(
     os.environ.get("LITKIT_TRAIN_FLUSH", "4000")
 )  # how many training chunks per embed flush
 
-# token budgets (approx; ~4 chars/token heuristic used)
-# Override via env for local models with different context sizes:
-#   LITKIT_BUDGET_O3=128000  (e.g., for 128k context models)
-#   LITKIT_BUDGET_OSS20B=16000 (e.g., for larger local models)
-BUDGET_TOKENS_O3 = int(os.environ.get("LITKIT_BUDGET_O3", "32000"))
-BUDGET_TOKENS_OSS20B = int(os.environ.get("LITKIT_BUDGET_OSS20B", "8000"))
 
 # -------------------- Destructive action confirmation --------------------
 def _fmt_bytes(n: int) -> str:
@@ -1568,399 +1576,6 @@ def get_chunks(conn, ids: list[int]) -> list[dict[str, str]]:
     return retrieval_get_chunks(conn, ids)
 
 
-# -------------------- LLM + token-budgeting --------------------
-# OpenAI client is imported lazily inside LLM paths to keep build-only runs offline-safe.
-
-# Define a single system prompt constant at module scope
-SYS_PROMPT = (
-    "You are a precise scientific assistant. Use ONLY the provided context chunks to answer; "
-    "do not use prior knowledge. You MUST include bracketed citations like [1], [2] that refer "
-    "to the provided chunks. Cite what you use in your answer and prefer multiple sources when "
-    "the claim spans chunks. If context is insufficient, say so briefly."
-)
-
-
-def approx_tokens(s: str) -> int:
-    """Very rough char→token approximation used to enforce context budgets.
-    Uses ≈4 chars per token, returns at least 1.
-    """
-    return max(1, len(s) // 4)
-
-
-def pack_context(
-    chunks: list[dict[str, str]],
-    question: str,
-    model_name: str,
-    *,
-    sys_prompt: str = SYS_PROMPT,
-    max_out_tokens: int = 3000,
-) -> tuple[str, list[int], dict]:
-    """Assemble a model-aware context window from ranked chunks, respecting an approximate
-    token budget determined by the target model. Uses the *actual* system prompt for
-    budgeting to avoid drift.
-
-    Args:
-        chunks: Ranked list of chunk dicts with 'text', 'paper_title', etc.
-        question: User question text.
-        model_name: Model identifier for budget selection (e.g., "o3-mini", "gpt-oss:20b").
-        sys_prompt: System prompt to budget for.
-        max_out_tokens: Output token allowance to reserve (deducted from input budget).
-
-    Returns:
-    -------
-    (context_text, used_indices, token_meta)
-      context_text : str
-          Concatenated context blocks prefixed with [i] and paper metadata.
-      used_indices : List[int]
-          1-based indices of chunks that fit within the budget (in order).
-      token_meta : dict
-          Token budget metadata for logging:
-          - approx_tokens: approximate tokens used (heuristic: 4 chars/token)
-          - budget: total token budget for the model
-          - input_budget: budget minus max_out_tokens
-          - max_out_tokens: reserved output allowance
-    """
-    # Choose token budget per model family
-    budget = BUDGET_TOKENS_O3 if model_name.lower().startswith("o3") else BUDGET_TOKENS_OSS20B
-
-    # Safety clamp: if max_out_tokens >= budget, we'd have no room for input context
-    # This catches misconfiguration like budget=8000, max_out=8000 → input_budget=0
-    if max_out_tokens >= budget:
-        old_max = max_out_tokens
-        max_out_tokens = max(128, budget // 4)  # reserve at most 25% for output
-        _eprint(
-            f"[context] WARNING: max_out_tokens ({old_max}) >= budget ({budget}); "
-            f"clamping to {max_out_tokens}"
-        )
-
-    # Reserve output allowance from the total budget first
-    # This prevents overflow exceptions by ensuring we have room for the response
-    input_budget = max(0, budget - max_out_tokens)
-
-    # Budget against exactly what you'll send (prompt + "QUESTION:/CONTEXT:" wrappers)
-    base_cost = (
-        approx_tokens(sys_prompt)
-        + approx_tokens("QUESTION:\n")
-        + approx_tokens(question)
-        + approx_tokens("\n\nCONTEXT:\n")
-        + PROMPT_HEADROOM_TOKENS  # safety buffer for tool/SDK scaffolding
-    )
-    remain = max(0, input_budget - base_cost)
-
-    blocks: list[str] = []
-    used: list[int] = []
-
-    for i, ch in enumerate(chunks, 1):
-        meta = []
-        if ch.get("pmcid"):
-            meta.append(f"PMCID:{ch['pmcid']}")
-        if ch.get("pmid") and not ch.get("pmcid"):
-            meta.append(f"PMID:{ch['pmid']}")
-        meta_str = f" ({', '.join(meta)})" if meta else ""
-
-        block = f"[{i}] {ch.get('paper_title','').strip()}{meta_str}\n{ch['text']}"
-        cost = approx_tokens(block) + 20  # small join/formatting overhead
-
-        if cost <= remain:
-            blocks.append(block)
-            used.append(i)
-            remain -= cost
-        else:
-            break
-
-    ctx_text = "\n\n".join(blocks) if blocks else "(no context)"
-    approx_used = input_budget - remain  # how many tokens we consumed
-    token_meta = {
-        "approx_tokens": approx_used,
-        "budget": budget,
-        "input_budget": input_budget,
-        "max_out_tokens": max_out_tokens,
-    }
-    return ctx_text, used, token_meta
-
-
-def answer_with_llm(
-    question, chunks, model, base_url, api_key, max_out_tokens=None, *, sys_prompt: str = SYS_PROMPT
-) -> tuple[str, list[dict]]:
-    """Call an OpenAI-compatible endpoint to answer using ONLY the provided context.
-
-    Policy:
-      - "o3*" -> Responses API with reasoning.
-      - otherwise -> Chat Completions.
-      - Fallback: if Responses API is unavailable (e.g., local endpoint), fall back to Chat.
-
-    Overflow handling:
-      - Detect a broader set of context/token-limit errors.
-      - On each retry, trim chunks AND reduce max_out to actually free room.
-
-    Returns:
-        (answer_text, final_chunks_sent): The answer and the exact chunks that were
-        actually sent to the model (after any overflow trimming). Use final_chunks_sent
-        for citation normalization to avoid desync bugs.
-    """
-
-    def _clarify_llm_error(model: str, base_url: str, raw: str) -> str:
-        msg = (raw or "").strip()
-        low = msg.lower()
-        # Common local/LM Studio cases
-        if (
-            ("no models loaded" in low)
-            or ("model_not_found" in low)
-            or ("404" in low and "model" in low)
-        ):
-            return (
-                "[llm] ERROR: The endpoint is up but has no model loaded (or does not recognize "
-                f"{model!r}).\n"
-                f"  • Endpoint: {base_url}\n"
-                "  • Fix (LM Studio): open LM Studio, load a chat model, and enable the local server "
-                "(or run: `lms load <model_name>`). Then rerun your command.\n"
-                "  • Alt: use OpenAI — e.g., `--llm-model o3-mini --openai-api-key $OPENAI_API_KEY`.\n"
-                "  • Alt: retrieval only — add `--no-llm`.\n"
-                f"  • Provider message: {msg}\n"
-            )
-        if ("unauthorized" in low) or ("invalid api key" in low) or ("401" in low):
-            return (
-                "[llm] ERROR: Authentication failed for the LLM endpoint.\n"
-                f"  • Endpoint: {base_url}\n"
-                "  • Fix: pass a valid `--openai-api-key` (OpenAI), or for local servers set a dummy token or none, "
-                "depending on the server’s requirements.\n"
-                f"  • Provider message: {msg}\n"
-            )
-        return (
-            "[llm] ERROR: LLM call failed.\n"
-            f"  • Endpoint: {base_url}\n"
-            f"  • Model: {model}\n"
-            "  • Try: load a local model, switch to an OpenAI model with a valid API key, "
-            "or run with `--no-llm`.\n"
-            f"  • Provider message: {msg}\n"
-        )
-
-    # Lazy import to avoid hard dependency during build-only runs.
-    try:
-        from openai import OpenAI
-    except Exception as e:
-        raise RuntimeError(
-            "[llm] OpenAI client not installed; use --build-only or install 'openai'."
-        ) from e
-
-    client = OpenAI(base_url=base_url, api_key=api_key, timeout=OPENAI_TIMEOUT_SEC)
-    m = (model or "").lower()
-    is_o3 = m.startswith("o3")
-
-    # Preflight check: local servers often support `models.list`.
-    # NOTE: Some OpenAI-compatible servers (vLLM, text-generation-inference, etc.)
-    # return empty from models.list() but still accept completions. We now treat
-    # empty results as a warning, not an error.
-    try:
-        models_resp = client.models.list()
-        available = [
-            getattr(x, "id", str(x)) for x in getattr(models_resp, "data", list(models_resp) or [])
-        ]
-        if ("localhost" in base_url or "127.0.0.1" in base_url) and not available:
-            # Some servers don't implement models.list properly - warn but continue
-            sys.stderr.write(
-                "[llm] WARNING: models.list() returned empty; proceeding anyway.\n"
-                "  (Some servers don't implement this endpoint but still accept completions.)\n"
-            )
-        elif (
-            available
-            and (model not in available)
-            and ("localhost" in base_url or "127.0.0.1" in base_url)
-        ):
-            # Model not in list - warn but continue (server might accept it anyway)
-            sys.stderr.write(
-                f"[llm] WARNING: Model {model!r} not in models.list() response.\n"
-                f"  Available: {', '.join(available[:8])}{' …' if len(available) > 8 else ''}\n"
-                "  Proceeding anyway - server may still accept this model.\n"
-            )
-    except Exception:
-        # Not fatal: some providers don't implement models.list; proceed to the main call.
-        pass
-
-    # Default output budgets (conservative)
-    max_out = int(max_out_tokens) if max_out_tokens is not None else 3000
-
-    # Work on a local copy so we can trim safely on retry
-    working_chunks = list(chunks)
-
-    # Up to 4 tries: progressively trim the number of chunks *and* reduce max_out
-    for attempt in range(4):
-        ctx_text, _used_idxs, _ = pack_context(working_chunks, question, model, sys_prompt=sys_prompt, max_out_tokens=max_out)
-        sys_msg = sys_prompt
-
-        try:
-            if is_o3:
-                # Primary: Responses API (use string `input` + `instructions`)
-                try:
-                    resp = client.responses.create(
-                        model=model,
-                        input=f"QUESTION:\n{question}\n\nCONTEXT:\n{ctx_text}",
-                        instructions=sys_msg,
-                        max_output_tokens=max_out,
-                        reasoning={"effort": "medium"},
-                    )
-                    text = getattr(resp, "output_text", None)
-                    if text is None:
-                        # Older SDKs: synthesize from content if needed
-                        try:
-                            parts = []
-                            for item in getattr(resp, "output", []) or []:
-                                for c in getattr(item, "content", []) or []:
-                                    if getattr(c, "type", "") == "output_text":
-                                        parts.append(getattr(c, "text", ""))
-                            text = "".join(parts).strip() if parts else ""
-                        except Exception:
-                            text = ""
-                    return (text or "").strip(), working_chunks
-                except Exception as ee:
-                    # If the endpoint doesn't support Responses, surface a clear error.
-                    msg = (str(ee) or "").lower()
-                    if any(
-                        s in msg
-                        for s in (
-                            "404",
-                            "not found",
-                            "405",
-                            "method not allowed",
-                            "responses.create",
-                            "unknown parameter",
-                            "unexpected argument",
-                            "unrecognized field",
-                            "invalid request body",
-                            "schema validation",
-                            "unsupported field",
-                            "does not support reasoning",
-                            "unsupported parameter 'reasoning'",
-                        )
-                    ):
-                        raise RuntimeError(
-                            f"[llm] The endpoint at {base_url!r} does not support the Responses API "
-                            f"for model {model!r}. Use an OpenAI endpoint for o-series (Responses-only), "
-                            "switch to a chat-compatible local model (e.g., --llm-model gpt-oss:20b), "
-                            "or run retrieval-only with --no-llm on air-gapped systems."
-                        ) from ee
-                    # Otherwise, bubble up for the outer overflow handler
-                    raise
-
-            else:
-                # Local/OSS endpoints: Chat Completions
-                resp = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": sys_msg},
-                        {
-                            "role": "user",
-                            "content": f"QUESTION:\n{question}\n\nCONTEXT:\n{ctx_text}",
-                        },
-                    ],
-                    temperature=0.2,
-                    max_tokens=max_out,
-                )
-                text = getattr(resp.choices[0].message, "content", "") or ""
-                return text.strip(), working_chunks
-
-        except Exception as e:
-            # Overflow detection via message matching only (not exception type)
-            # BadRequestError is too broad - also covers "unknown model", "invalid request", etc.
-            # We only want to retry-with-trimming for actual context/token overflow errors.
-            msg = (str(e) or "").lower()
-
-            is_overflow = (
-                "context length" in msg
-                or "maximum context length" in msg
-                or "exceeds context window" in msg
-                or "token limit" in msg
-                or "too many tokens" in msg
-                or "reduce the length of the messages" in msg
-                or "max tokens" in msg
-                or "prompt too long" in msg
-                or "input too long" in msg
-                or "payload too large" in msg
-                or "413" in msg  # HTTP 413 Payload Too Large
-            )
-
-            if is_overflow and attempt < 3:
-                # Trim chunks harder each time and reduce max_out to free space
-                if len(working_chunks) > 1:
-                    if attempt == 0:
-                        new_len = max(1, int(len(working_chunks) * 0.7))
-                    else:
-                        new_len = max(1, len(working_chunks) // 2)
-                    working_chunks = working_chunks[:new_len]
-                # reduce output allowance by 25% each retry (floor at 128)
-                max_out = max(128, int(max_out * 0.75))
-                continue
-
-            # Not an overflow, or no sensible retry left
-            raise RuntimeError(_clarify_llm_error(model, base_url, str(e))) from e
-
-
-# -------------------- Citations: normalize + print only cited --------------------
-
-# We’ll normalize by extracting only the leading numeric list inside a bracket and
-# discarding any trailing “†L1–L8” or similar. Accept -, – or — in those tails.
-_CITATION_LINELOC = re.compile(r"([\[【]\s*\d+)\s*†L\d+(?:[–—-]\d+)?(\s*[】\]])")
-
-# General bracket grabber; we’ll rebuild the contents canonically.
-_CITATION_ANYBR = re.compile(r"(?P<open>[\[【])(?P<inside>[^\[\]【】]{0,200}?)(?P<close>[】\]])")
-
-# Leading numeric list only (before any tails); supports ASCII/CJK commas.
-_LEADING_NUM_LIST = re.compile(r"^\s*(\d+(?:\s*[，、,]\s*\d+)*)")
-
-def _normalize_and_strip_citations(text: str) -> str:
-    """Canonically normalize bracketed numeric citations so downstream matching works:
-       1) Convert fullwidth brackets to ASCII [ ].
-       2) Remove '†Lx–Ly' / location tails by only keeping the leading numeric list.
-       3) Normalize commas/spacing, de-duplicate while preserving order.
-    """
-    import unicodedata  # deferred to minimize module-level side effects
-    try:
-        s = unicodedata.normalize("NFKC", text)
-    except Exception:
-        s = text
-
-    # Strip common zero-width junk that can sneak in
-    for z in ("\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"):
-        s = s.replace(z, "")
-
-    # Unify bracket style so later regexes see ASCII brackets
-    s = s.replace("【", "[").replace("】", "]")
-
-    # Collapse explicit †L tails like “[2†L1–L8]” -> “[2]” (still leave contents to the next pass)
-    s = _CITATION_LINELOC.sub(r"\1\2", s)
-
-    # Rebuild each bracketed group canonically from just the *leading* numeric list
-    def _rebuild(m: re.Match) -> str:
-        inside = m.group("inside")
-        lead = _LEADING_NUM_LIST.match(inside)
-        if not lead:
-            # Not a numeric citation; leave untouched (e.g., [Note])
-            return m.group(0)
-
-        nums_str = lead.group(1)
-        parts = [p.strip() for p in re.split(r"[，、,]", nums_str) if p.strip()]
-
-        out, seen = [], set()
-        for p in parts:
-            if p.isdigit():
-                n = int(p)
-                if n not in seen:
-                    seen.add(n)
-                    out.append(n)
-
-        if not out:
-            # Nothing numeric survived; drop the brackets entirely
-            return ""
-
-        return "[" + ", ".join(str(n) for n in out) + "]"
-
-    return _CITATION_ANYBR.sub(_rebuild, s)
-
-# Back-compat for existing call sites that invoke _normalize_citations()
-def _normalize_citations(text: str) -> str:
-    return _normalize_and_strip_citations(text)
-
-
 # -------------------- Main --------------------
 def main():
     """CLI entry point."""
@@ -2683,61 +2298,85 @@ def main():
 
     # If the user asked for retrieval only, print the context and exit
     if args.no_llm:
-        ctx_text, used_idx, token_meta = pack_context(chunks, question, args.llm_model, max_out_tokens=args.max_out_tokens)
+        from litkit.llm import pack_context as llm_pack_context, LLMConfig
+        llm_cfg = LLMConfig.from_env_and_args(
+            model=args.llm_model,
+            base_url=args.openai_base_url,
+            api_key=args.openai_api_key,
+        )
+        ctx_text, used_idx, token_meta = llm_pack_context(
+            chunks, question, llm_cfg, max_out_tokens=args.max_out_tokens
+        )
         print("CONTEXT")
         print("=" * 80)
         print(ctx_text)
         print("=" * 80)
         if not args.quiet:
-            _eprint(f"[context] packed ~{token_meta['approx_tokens']} tokens (budget={token_meta['budget']}, input_budget={token_meta['input_budget']})")
+            _eprint(
+                f"[context] packed ~{token_meta['approx_tokens']} tokens "
+                f"(budget={token_meta['budget']}, "
+                f"input_budget={token_meta['input_budget']})"
+            )
         _eprint(f"[info] used {len(used_idx)} chunks; meta={meta}")
         return
 
-    # Fail fast for o-series when no API key is available (unless retrieval-only)
-    # Only enforce this when targeting OpenAI cloud; local/on-prem endpoints may not need auth.
+    # Fail fast for o-series when no API key available (unless retrieval-only)
+    # Only enforce on OpenAI cloud; local endpoints may not need auth.
     base_url = args.openai_base_url or _default_base_url_for(args.llm_model)
-    api_key  = args.openai_api_key if args.openai_api_key is not None else _default_api_key_for(args.llm_model)
-    if args.llm_model.lower().startswith("o3") and _is_openai_cloud(base_url) and not api_key:
+    api_key = (
+        args.openai_api_key
+        if args.openai_api_key is not None
+        else _default_api_key_for(args.llm_model)
+    )
+    if (
+        args.llm_model.lower().startswith("o3")
+        and _is_openai_cloud(base_url)
+        and not api_key
+    ):
         raise SystemExit(
             "[llm] o-series on OpenAI cloud requires an API key. "
             "Either pass --openai-api-key, set OPENAI_API_KEY, "
             "or point --openai-base-url at your on-prem endpoint."
         )
 
-    # -------- LLM call (strict RAG prompt) --------
-    # (re-use the resolved base_url/api_key for the call below)
-    # base_url = args.openai_base_url or _default_base_url_for(args.llm_model)
-    # api_key = args.openai_api_key or _default_api_key_for(args.llm_model)
+    # -------- LLM call (using litkit.llm module) --------
+    from litkit.llm import LLMConfig, answer_question, LLMError
+    from litkit.formatting import normalize_citations
 
-    ctx_text, used_idx, token_meta = pack_context(chunks, question, args.llm_model, max_out_tokens=args.max_out_tokens)
-    if not args.quiet:
-        _eprint(f"[context] packed ~{token_meta['approx_tokens']} tokens (budget={token_meta['budget']}, input_budget={token_meta['input_budget']})")
-    selected_chunks = [chunks[i - 1] for i in used_idx]  # 0-based indexing
+    llm_cfg = LLMConfig.from_env_and_args(
+        model=args.llm_model,
+        base_url=base_url,
+        api_key=api_key,
+    )
+
     try:
-        # answer_with_llm returns (answer_text, final_chunks_sent) to avoid citation desync
-        # when overflow retry trims chunks internally
-        answer, final_chunks = answer_with_llm(
+        # answer_question returns (answer_text, final_chunks_sent, token_meta)
+        # to avoid citation desync when overflow retry trims chunks internally
+        answer, final_chunks, token_meta = answer_question(
             question=question,
-            chunks=selected_chunks,  # pass only packed subset
-            model=args.llm_model,
-            base_url=base_url,
-            api_key=api_key,
+            ranked_chunks=chunks,
+            config=llm_cfg,
             max_out_tokens=args.max_out_tokens,
-            sys_prompt=SYS_PROMPT,
         )
-    except Exception as e:
+        if not args.quiet:
+            _eprint(
+                f"[context] packed ~{token_meta['approx_tokens']} tokens "
+                f"(budget={token_meta['budget']}, "
+                f"input_budget={token_meta['input_budget']})"
+            )
+    except LLMError as e:
         sys.stderr.write(str(e).rstrip() + "\n")
         # Fall back to printing context to unblock usage
         _eprint("\n[llm] Falling back to retrieval-only output.\n")
         answer = ""
-        final_chunks = selected_chunks  # fallback uses original selection
+        final_chunks = chunks  # fallback uses all chunks
 
     if answer:
         # Normalize oddball citation shapes the model may emit
-        answer = _normalize_citations(answer)
-        # Collapse chunk-level citations to doc-level and render a clean bibliography
-        # CRITICAL: Use final_chunks (what was actually sent after any overflow trimming),
-        # not selected_chunks, to avoid citation/bibliography desync bugs.
+        answer = normalize_citations(answer)
+        # Collapse chunk-level citations to doc-level and render bibliography
+        # CRITICAL: Use final_chunks (what was actually sent after any overflow
+        # trimming), not chunks, to avoid citation/bibliography desync bugs.
         answer, doc_refs = d.normalize_answer_and_build_refs(answer, final_chunks)
         print(answer)
         print()
@@ -2745,6 +2384,10 @@ def main():
         print()
     else:
         # No model output -> print the context
+        from litkit.llm import pack_context as llm_pack_context
+        ctx_text, used_idx, _ = llm_pack_context(
+            chunks, question, llm_cfg, max_out_tokens=args.max_out_tokens
+        )
         print("CONTEXT")
         print("=" * 80)
         print(ctx_text)
