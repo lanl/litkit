@@ -17,23 +17,23 @@ import faiss
 import numpy as np
 
 from litkit.retrieval.helpers import (
-    query_terms,
-    sqlite_norm_expr,
-    escape_like,
-    normalize_for_search_py,
     avg_chunks_for_papers,
 )
 from litkit.retrieval.search import faiss_search
+from litkit.retrieval.lexical import (
+    LexicalConfig,
+    LexicalResult,
+    SqliteLexicalBackend,
+    find_rare_terms,
+    merge_lexical_and_ann,
+)
 from litkit.progress import eprint as _eprint
 
 if TYPE_CHECKING:
     from litkit.embeddings.base import Embedder
 
 
-# One-shot guard for noisy sqlite3.OperationalError logging
-_LEXICAL_WARN_ONCE = False
-
-# Optional kill-switch for lexical prefilter
+# Optional kill-switch for lexical prefilter (env var)
 DISABLE_LEXICAL = os.environ.get("LITKIT_NO_LEXICAL", "0") == "1"
 
 
@@ -166,8 +166,8 @@ def search_chunks_constrained(
                 if ann_chunk_to_paper.get(cid) in cand
             ]
 
-        # Lexical front-loading
-        ALLOW_GLOBAL = (
+        # Lexical front-loading via modular lexical module
+        force_global = (
             allow_global_lexical
             if allow_global_lexical is not None
             else os.environ.get("LITKIT_ALLOW_GLOBAL_LEXICAL", "0") == "1"
@@ -176,107 +176,35 @@ def search_chunks_constrained(
         if did_fallback:
             _eprint("[lexical] enabling global lexical front-load (Stage-2 fallback).")
 
-        terms = query_terms(question)
-        rare_terms = [
-            t for t in terms
-            if any(ch.isdigit() for ch in t) or any(ch in "-_%\\" for ch in t)
-        ]
-        if not rare_terms:
-            rare_terms = [t for t in terms if len(t) >= 9]
-
-        title_hint = normalize_for_search_py(
-            rare_terms[0] if rare_terms else (terms[0] if terms else "")
+        # Build lexical config
+        lexical_config = LexicalConfig(
+            enabled=not DISABLE_LEXICAL,
+            cap=lexical_cap,
+            limit=lexical_limit,
+            allow_global=force_global,
         )
-        title_like_param = f"%{escape_like(title_hint)}%" if title_hint else "%"
 
-        lexical_ids: list[int] = []
-        if rare_terms and not DISABLE_LEXICAL and ((cand is not None) or ALLOW_GLOBAL):
-            norm = sqlite_norm_expr("text")
-            like_parts = [f"{norm} LIKE ? ESCAPE '\\'"] * len(rare_terms)
-            like_clause = " OR ".join(like_parts)
-            params = [
-                f"%{escape_like(normalize_for_search_py(t))}%"
-                for t in rare_terms
-            ]
-
-            cur = db_conn.cursor()
-            scope_is_global = bool(ALLOW_GLOBAL or did_fallback)
+        # Find rare terms and execute lexical search
+        rare_terms = find_rare_terms(question, lexical_config)
+        
+        lexical_result = LexicalResult()  # empty by default
+        if rare_terms and lexical_config.enabled:
+            # Determine scope: global if forced or candidates available
+            if force_global or cand is None:
+                candidate_scope = None  # global
+            else:
+                candidate_scope = cand
             
-            try:
-                if scope_is_global:
-                    cur.execute(
-                        f"""
-                        SELECT c.id
-                        FROM chunks c
-                        JOIN papers p ON p.id = c.paper_id
-                        WHERE ({like_clause.replace('text', 'c.text')})
-                        ORDER BY (c.ord = -1) DESC,
-                                ({sqlite_norm_expr('p.title')} LIKE ? ESCAPE '\\') DESC,
-                                (p.pmid IS NOT NULL) DESC,
-                                (p.pmcid IS NOT NULL) DESC,
-                                c.id ASC
-                        LIMIT ?
-                        """,
-                        params + [title_like_param] + [int(lexical_limit)],
-                    )
-                else:
-                    load_temp_candidates(db_conn, list(cand))
-                    cur.execute(
-                        f"""
-                        SELECT c.id
-                        FROM chunks c
-                        JOIN papers p ON p.id = c.paper_id
-                        WHERE ({like_clause.replace('text', 'c.text')})
-                        AND c.paper_id IN (SELECT id FROM cand_papers)
-                        ORDER BY (c.ord = -1) DESC,
-                                ({sqlite_norm_expr('p.title')} LIKE ? ESCAPE '\\') DESC,
-                                (p.pmid IS NOT NULL) DESC,
-                                (p.pmcid IS NOT NULL) DESC,
-                                c.id ASC
-                        LIMIT ?
-                        """,
-                        params + [title_like_param] + [int(lexical_limit)],
-                    )
-                lexical_ids = [row[0] for row in cur.fetchall()]
-            except sqlite3.OperationalError as e:
-                msg = f"[lexical] disabled: {e.__class__.__name__}: {e}"
-                if not _LEXICAL_WARN_ONCE:
-                    _LEXICAL_WARN_ONCE = True
-                    where = (
-                        "candidate papers only"
-                        if (cand is not None and not scope_is_global)
-                        else "global"
-                    )
-                    logging.warning(
-                        "%s (scope=%s). Tip: set --allow-global-lexical.",
-                        msg, where,
-                    )
-                lexical_ids = []
+            # Only search if we have scope
+            if candidate_scope is not None or force_global:
+                backend = SqliteLexicalBackend(db_conn, load_temp_candidates)
+                lexical_result = backend.search(
+                    rare_terms, candidate_scope, lexical_config
+                )
 
         # Merge lexical + ANN with cap
         LEX_CAP = lexical_cap if lexical_cap is not None else max(5, k // 3)
-        lexical_ids = lexical_ids[:LEX_CAP]
-
-        seen = set()
-        merged: list[int] = []
-        i = j = 0
-        while len(merged) < k and (i < len(lexical_ids) or j < len(ranked)):
-            if i < len(lexical_ids):
-                cid = lexical_ids[i]
-                i += 1
-                if cid not in seen:
-                    seen.add(cid)
-                    merged.append(cid)
-            if len(merged) >= k:
-                break
-            if j < len(ranked):
-                cid, _ = ranked[j]
-                j += 1
-                if cid not in seen:
-                    seen.add(cid)
-                    merged.append(cid)
-
-        out = merged[:k]
+        out = merge_lexical_and_ann(lexical_result, ranked, k, LEX_CAP)
 
         # Per-paper cap
         if per_paper_cap:
