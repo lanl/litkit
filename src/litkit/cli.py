@@ -851,7 +851,7 @@ def _post_build_sanity_check(conn, args):
 
 def _auto_top_papers() -> int:
     """Heuristic for Stage-1 shortlist size based on corpus size."""
-    _load_heavy_deps()  # ensure db_connect_db is available
+    d = deps()  # ensures loaded + returns namespace (consistent pattern)
     get_runtime()  # ensure path globals are initialized for library use
     
     def _piecewise_heuristic(n: int) -> int:
@@ -865,7 +865,7 @@ def _auto_top_papers() -> int:
     
     conn = None
     try:
-        conn = _deps.db_connect_db(DB_PATH)
+        conn = d.db_connect_db(DB_PATH)
         n = conn.execute("SELECT COUNT(1) FROM papers").fetchone()[0]
         return _piecewise_heuristic(n)
     except Exception:
