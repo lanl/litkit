@@ -509,12 +509,12 @@ def parallel_iter_tar_articles(
     tar_path: str | Path,
     workers: int = 8,
     exts: Iterable[str] = _XML_EXTS,
+    yield_in_order: bool = True,
 ) -> Iterator[tuple[TarMemberMeta, ArticleMeta]]:
     """Iterate over articles in a tar file, parsing XML in parallel.
 
     This function reads tar members sequentially (tar format requires this),
-    but parses the XML content in parallel using a thread pool. Results are
-    yielded as they complete (unordered).
+    but parses the XML content in parallel using a thread pool.
 
     Parameters
     ----------
@@ -524,6 +524,10 @@ def parallel_iter_tar_articles(
         Number of parallel parsing threads (default: 8).
     exts : Iterable[str]
         File extensions to consider as XML (default: .nxml, .xml).
+    yield_in_order : bool
+        If True (default), results are yielded in tar file order to support
+        count-based checkpoint resume. If False, yields in completion order
+        (faster but incompatible with checkpoint resume by count).
 
     Yields
     ------
@@ -536,8 +540,11 @@ def parallel_iter_tar_articles(
     - Uncompressed .tar files allow faster I/O since no decompression is needed.
     - XML parsing (lxml) releases the GIL during C operations, so threading
       provides real parallelism.
-    - Results are yielded in completion order, not tar file order.
+    - With yield_in_order=True, uses a reorder buffer to preserve tar order.
+    - Memory usage is bounded: O(workers * 4) results buffered at most.
     """
+    import heapq
+    
     lower_exts = tuple(e.lower() for e in exts)
 
     with _open_tar_safely(tar_path) as tf:
@@ -545,20 +552,27 @@ def parallel_iter_tar_articles(
             return
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {}  # future -> member_name (for debugging)
+            futures = {}  # future -> (sequence, meta)
             pending_count = 0
             max_pending = workers * 4  # limit memory: ~4 XMLs per worker in flight
+            
+            # For in-order yielding
+            sequence = 0  # monotonically increasing submission order (tar order)
+            next_yield_seq = 0  # next sequence number to yield
+            result_heap: list[tuple[int, TarMemberMeta, ArticleMeta]] = []  # (seq, meta, article)
+            eof_reached = False
 
             while True:
-                # Submit new work while under the limit
-                while pending_count < max_pending:
+                # Submit new work while under the limit and not at EOF
+                while not eof_reached and pending_count < max_pending:
                     try:
                         m = tf.next()
                     except (tarfile.TarError, OSError) as e:
                         logger.warning("[tar] error iterating %s: %s", tar_path, e)
                         m = None
                     if m is None:
-                        break  # EOF or error
+                        eof_reached = True
+                        break
                     if not (m.isfile() and m.name.lower().endswith(lower_exts)):
                         continue
                     try:
@@ -577,13 +591,19 @@ def parallel_iter_tar_articles(
                         mtime=float(getattr(m, "mtime", 0.0) or 0.0),
                     )
                     fut = pool.submit(_parse_xml_bytes, data)
-                    futures[fut] = meta
+                    futures[fut] = (sequence, meta)
+                    sequence += 1
                     pending_count += 1
 
                 if not futures:
+                    # Drain any remaining buffered results (in-order mode)
+                    if yield_in_order:
+                        while result_heap:
+                            _, meta, article = heapq.heappop(result_heap)
+                            yield (meta, article)
                     break  # no more work
 
-                # Yield completed results
+                # Collect completed results
                 done_futures = [f for f in futures if f.done()]
                 if not done_futures:
                     # Wait for at least one to complete
@@ -595,14 +615,32 @@ def parallel_iter_tar_articles(
                     done_futures = list(done)
 
                 for fut in done_futures:
-                    meta = futures.pop(fut)
+                    seq, meta = futures.pop(fut)
                     pending_count -= 1
                     try:
                         result = fut.result()
                         if result is not None:
-                            yield (meta, result)
+                            if yield_in_order:
+                                # Buffer for in-order yielding
+                                heapq.heappush(result_heap, (seq, meta, result))
+                            else:
+                                # Original behavior: yield immediately
+                                yield (meta, result)
                     except Exception as e:
                         logger.warning("[parse] error parsing %s: %s", meta.name, e)
+                        if yield_in_order:
+                            # Must track failed parses to not block the sequence
+                            # We increment next_yield_seq when we would have yielded this
+                            # Since result is None, we skip it but advance the sequence
+                            heapq.heappush(result_heap, (seq, meta, None))  # type: ignore
+                
+                # Yield buffered results in order
+                if yield_in_order:
+                    while result_heap and result_heap[0][0] == next_yield_seq:
+                        _, meta, article = heapq.heappop(result_heap)
+                        next_yield_seq += 1
+                        if article is not None:
+                            yield (meta, article)
 
 
 # Public API

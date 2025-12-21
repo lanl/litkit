@@ -228,6 +228,147 @@ backend = MyFTS5Backend(db_conn)
 lexical_result = backend.search(rare_terms, candidate_scope, lexical_config)
 ```
 
+## Developer Guide: Improving Tar Processing Efficiency
+
+LitKit is designed to process the full PMC-OA corpus (~5M articles) in under 10 hours
+using multi-node GPU parallelism.
+
+### Current Architecture
+
+| Stage | Parallelism | Bottleneck |
+|-------|-------------|------------|
+| Tar I/O | Per-shard (N producers) | FS bandwidth, stripe width |
+| XML Parsing | Thread pool (8 workers/shard) | CPU-bound |
+| Embedding | GPU (multi-device pooling) | GPU memory/bandwidth |
+| DB Writes | Per-shard SQLite (lock-free) | Disk IOPS |
+| FAISS Updates | Single consumer | Index structure |
+
+### Improvement Areas
+
+#### 1. SQLite Batching
+
+**Current:** Row-by-row `INSERT` statements via `execute()`.
+
+**Improvement:** Use `executemany()` with batched inserts:
+```python
+# Before
+for row in rows:
+    cur.execute("INSERT INTO chunks (...) VALUES (...)", row)
+
+# After
+cur.executemany("INSERT INTO chunks (...) VALUES (?,?,?)", rows)
+```
+
+Expected impact: 2-5x faster DB writes for large batches.
+
+**Implementation notes:**
+- Batch papers/chunks buffers before INSERT
+- Consider staging table without indices during ingest, then CREATE INDEX at end
+- Test with SQLite PRAGMA optimizations (`synchronous=OFF` during bulk, larger `cache_size`)
+
+#### 2. Uncompressed Tar Shards
+
+**Strongly recommended:** Use uncompressed `.tar` files, not `.tar.gz`.
+
+Compressed tars force sequential decompression, serializing the entire I/O path.
+Uncompressed tars allow:
+- Parallel I/O across shard files
+- Multi-threaded XML parsing (lxml releases GIL)
+
+Pre-decompress shards: `gunzip -k shard_*.tar.gz`
+
+#### 3. Pipeline Overlap
+
+**Current:** Parse → Embed → Write are sequential per batch.
+
+**Future:** True async pipeline:
+- Parser fills embedding queue while GPU processes previous batch
+- DB writes happen while next batch embeds
+
+This requires restructuring the main loop with asyncio or thread-based producers/consumers.
+
+#### 4. FAISS Training Optimization
+
+IVF-PQ training samples 150K chunks from tar files. For very large corpora:
+- Consider pre-computed training set (sample once, reuse)
+- Or train on first N tars only, not random sample from all
+
+## Developer Guide: Lustre Filesystem Optimization
+
+On Lustre filesystems, file striping dramatically affects I/O throughput. Under-striped
+tar shards will bottleneck all downstream GPU processing.
+
+### Recommended Stripe Settings
+
+For tar shards on Lustre:
+- `stripe_count`: -1 (all OSTs) or at least 8
+- `stripe_size`: 4M or larger for sequential reads
+
+### Checking Stripe Width
+
+```bash
+# Check a specific file
+lfs getstripe /path/to/shard.tar
+
+# Check directory default
+lfs getstripe -d /path/to/tar_shards/
+```
+
+### Future Work: Automatic Stripe Detection
+
+LitKit could detect poor striping and warn users at startup:
+
+```python
+import subprocess
+
+def check_lustre_stripe(path: Path, min_stripe_count: int = 4) -> tuple[bool, str]:
+    """Check if path has adequate Lustre striping.
+    
+    Returns (ok, message) where ok=True if striping is adequate or non-Lustre.
+    """
+    # Detect Lustre via statfs magic number (0x0BD00BD0)
+    # ... statfs check ...
+    
+    # Run lfs getstripe
+    try:
+        result = subprocess.run(
+            ["lfs", "getstripe", "-c", str(path)],
+            capture_output=True, text=True, timeout=10
+        )
+        stripe_count = int(result.stdout.strip())
+        if stripe_count < min_stripe_count:
+            return False, f"Low stripe count ({stripe_count}); recommend >= {min_stripe_count}"
+        return True, f"Stripe count: {stripe_count}"
+    except FileNotFoundError:
+        return True, "lfs not available"  # Degrade gracefully
+    except Exception as e:
+        return True, f"Stripe check failed: {e}"
+```
+
+**Usage in CLI startup:**
+```python
+if args.tar_dir:
+    ok, msg = check_lustre_stripe(args.tar_dir)
+    if not ok:
+        _eprint(f"[warn] Tar directory has suboptimal Lustre striping: {msg}")
+        _eprint(f"[warn] Consider: lfs setstripe -c -1 {args.tar_dir}")
+```
+
+### User Remediation
+
+If LitKit warns about poor striping:
+
+```bash
+# Option 1: Re-stripe existing files (requires copy)
+mkdir /new/tar_shards
+lfs setstripe -c -1 -S 4M /new/tar_shards
+cp /old/tar_shards/*.tar /new/tar_shards/
+
+# Option 2: Set directory default for new files
+lfs setstripe -c -1 -S 4M /path/to/tar_shards/
+# Then copy/download tars fresh
+```
+
 ## License
 
 Proprietary — LANL
