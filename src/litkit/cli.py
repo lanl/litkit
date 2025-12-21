@@ -1354,7 +1354,29 @@ def build_or_update_indices(args):
                 del chunk_paper_doc_ids_buf[cp_len:]
                 del chunk_ords_buf[co_len:]
                 
-                handled_ok = False  # do not advance processed_count; retry next run
+                # --strict-ingest: fail fast (default prior behavior, now opt-in)
+                # Default: mark-and-skip (log failure, advance checkpoint, continue)
+                if getattr(args, "strict_ingest", False):
+                    # Re-raise to fail the entire job (current behavior, now opt-in)
+                    raise
+                
+                # Mark-and-skip: log failure to ingest_failures.jsonl and continue
+                # This allows the build to complete even if some members are pathological.
+                try:
+                    failure_log = SQLITE_DIR / "ingest_failures.jsonl"
+                    failure_entry = {
+                        "tar": str(tpath),
+                        "member": m.name,
+                        "error": f"{e.__class__.__name__}: {e}",
+                        "ts": int(time.time()),
+                    }
+                    with open(failure_log, "a", encoding="utf-8") as ff:
+                        ff.write(json.dumps(failure_entry) + "\n")
+                except Exception as log_err:
+                    _eprint(f"[ingest] WARNING: could not log failure: {log_err}")
+                
+                _eprint(f"[ingest] SKIP: {m.name} (use --strict-ingest to fail fast)")
+                handled_ok = True  # advance checkpoint, skip this member permanently
 
             # ═══════════════════════════════════════════════════════════════════════
             # BATCH FLUSH - OUTSIDE SAVEPOINT REGION
@@ -2466,6 +2488,11 @@ def main():
         "--yes",
         action="store_true",
         help="Skip confirmation prompts (for automation). Equivalent to LITKIT_ASSUME_YES=1.",
+    )
+    ap.add_argument(
+        "--strict-ingest",
+        action="store_true",
+        help="Fail fast on ingest errors instead of mark-and-skip (default: skip failed members and continue)",
     )
 
     # index types / params
