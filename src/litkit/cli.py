@@ -737,9 +737,9 @@ BATCH_TRAIN_FLUSH = int(
 # token budgets (approx; ~4 chars/token heuristic used)
 # Override via env for local models with different context sizes:
 #   LITKIT_BUDGET_O3=128000  (e.g., for 128k context models)
-#   LITKIT_BUDGET_OSS20B=8000  (e.g., for larger local models)
+#   LITKIT_BUDGET_OSS20B=16000 (e.g., for larger local models)
 BUDGET_TOKENS_O3 = int(os.environ.get("LITKIT_BUDGET_O3", "32000"))
-BUDGET_TOKENS_OSS20B = int(os.environ.get("LITKIT_BUDGET_OSS20B", "3000"))
+BUDGET_TOKENS_OSS20B = int(os.environ.get("LITKIT_BUDGET_OSS20B", "8000"))
 
 # -------------------- Destructive action confirmation --------------------
 def _fmt_bytes(n: int) -> str:
@@ -1561,6 +1561,16 @@ def pack_context(
     """
     # Choose token budget per model family
     budget = BUDGET_TOKENS_O3 if model_name.lower().startswith("o3") else BUDGET_TOKENS_OSS20B
+
+    # Safety clamp: if max_out_tokens >= budget, we'd have no room for input context
+    # This catches misconfiguration like budget=8000, max_out=8000 → input_budget=0
+    if max_out_tokens >= budget:
+        old_max = max_out_tokens
+        max_out_tokens = max(128, budget // 4)  # reserve at most 25% for output
+        _eprint(
+            f"[context] WARNING: max_out_tokens ({old_max}) >= budget ({budget}); "
+            f"clamping to {max_out_tokens}"
+        )
 
     # Reserve output allowance from the total budget first
     # This prevents overflow exceptions by ensuring we have room for the response
