@@ -476,27 +476,20 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
                                 is_live = True  # Process exists but we can't signal it
                             else:
                                 is_live = True  # Unknown error, be conservative
-                    # Different host: cannot check PID, use timestamp-based staleness only
-                    # ⚠️  CROSS-HOST TTL EVICTION: This is inherently risky!
-                    #     We have no way to verify if the remote process is still alive.
-                    #     A long-running build on another host WILL be evicted when TTL expires.
-                    if guard_host != socket.gethostname() and not is_live:
+                    # Different host: NEVER auto-evict. We cannot verify PID liveness,
+                    # so auto-eviction could corrupt data if a build is still running.
+                    # User must manually remove the guard: rm .writer_guard
+                    if guard_host != socket.gethostname():
                         sys.stderr.write(
-                            "\n╔══════════════════════════════════════════════════════════════════════════════╗\n"
-                            "║  ⚠️  WARNING: CROSS-HOST TTL EVICTION                                         ║\n"
-                            "╠══════════════════════════════════════════════════════════════════════════════╣\n"
-                            f"║  Guard file: {str(WRITER_GUARD)[:60]:<60s} ║\n"
-                            f"║  Guard host: {str(guard_host)[:60]:<60s} ║\n"
-                            f"║  This host:  {socket.gethostname()[:60]:<60s} ║\n"
-                            "║                                                                              ║\n"
-                            "║  Cannot verify if remote process is still alive!                             ║\n"
-                            "║  If a build is running on the other host, THIS WILL CORRUPT DATA.            ║\n"
-                            "║                                                                              ║\n"
-                            "║  Proceeding because TTL expired and LITKIT_WRITER_GUARD_TTL is set.          ║\n"
-                            "║  Consider adding heartbeat updates for long builds (see README.md).          ║\n"
-                            "╚══════════════════════════════════════════════════════════════════════════════╝\n\n"
+                            f"[writer] Guard held by DIFFERENT HOST ({guard_host}); cannot verify if process is alive.\n"
+                            f"         Guard file: {WRITER_GUARD}\n"
+                            f"         Guard info: {info}\n"
+                            "         If you are CERTAIN the other job is dead, manually remove the guard:\n"
+                            f"           rm {WRITER_GUARD}\n"
                         )
+                        sys.exit(2)
                     
+                    # Same host: we verified PID is dead (is_live=False), safe to evict
                     if not is_live:
                         _eprint(f"[writer] Guard appears stale (> {ttl_sec}s, process dead): {info}. Attempting exclusive cleanup.")
                         try:
