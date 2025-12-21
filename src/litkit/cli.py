@@ -1156,124 +1156,124 @@ def build_or_update_indices(args):
                 elif meta is None:
                     handled_ok = True  # permanently skip bad member next time
                 else:
-                        # ---------- BEGIN INGEST BODY (same semantics; no member-based checkpointing here) ----------
-                        pmcid = (meta["pmcid"] or "").strip()
-                        pmid = (meta["pmid"] or "").strip()
-                        
-                        # Content-addressed doc_id: use DB's canonical doc_id when reusing
-                        # an existing paper row. This ensures segment files use the same
-                        # doc_id that's in the DB for doc_id → paper_id resolution.
-                        # 
-                        # IMPORTANT: Same paper (by pmcid/pmid) may appear at different tar paths
-                        # across runs. We canonicalize to the FIRST doc_id seen (stored in DB).
-                        
-                        existing_row = None
-                        if pmcid:
-                            existing_row = cur.execute(
-                                "SELECT id, doc_id FROM papers WHERE pmcid=?", (pmcid,)
-                            ).fetchone()
-                        if (existing_row is None) and pmid:
-                            existing_row = cur.execute(
-                                "SELECT id, doc_id FROM papers WHERE pmid=?", (pmid,)
-                            ).fetchone()
-                        
-                        if existing_row:
-                            pid, existing_doc_id = existing_row
-                            # Use existing doc_id if present, otherwise set it from current path
-                            if existing_doc_id:
-                                canon_doc_id = existing_doc_id
-                            else:
-                                canon_doc_id = str(f)
-                                cur.execute(
-                                    "UPDATE papers SET doc_id = ? WHERE id = ?",
-                                    (canon_doc_id, pid)
-                                )
+                    # ---------- BEGIN INGEST BODY (same semantics; no member-based checkpointing here) ----------
+                    pmcid = (meta["pmcid"] or "").strip()
+                    pmid = (meta["pmid"] or "").strip()
+                    
+                    # Content-addressed doc_id: use DB's canonical doc_id when reusing
+                    # an existing paper row. This ensures segment files use the same
+                    # doc_id that's in the DB for doc_id → paper_id resolution.
+                    # 
+                    # IMPORTANT: Same paper (by pmcid/pmid) may appear at different tar paths
+                    # across runs. We canonicalize to the FIRST doc_id seen (stored in DB).
+                    
+                    existing_row = None
+                    if pmcid:
+                        existing_row = cur.execute(
+                            "SELECT id, doc_id FROM papers WHERE pmcid=?", (pmcid,)
+                        ).fetchone()
+                    if (existing_row is None) and pmid:
+                        existing_row = cur.execute(
+                            "SELECT id, doc_id FROM papers WHERE pmid=?", (pmid,)
+                        ).fetchone()
+                    
+                    if existing_row:
+                        pid, existing_doc_id = existing_row
+                        # Use existing doc_id if present, otherwise set it from current path
+                        if existing_doc_id:
+                            canon_doc_id = existing_doc_id
                         else:
-                            # New paper: use current path as canonical doc_id
                             canon_doc_id = str(f)
                             cur.execute(
-                                "INSERT INTO papers(doc_id, pmid, pmcid, title, abstract) VALUES (?,?,?,?,?)",
-                                (canon_doc_id, pmid, pmcid, meta["title"], meta["abstract"]),
+                                "UPDATE papers SET doc_id = ? WHERE id = ?",
+                                (canon_doc_id, pid)
                             )
-                            pid = cur.lastrowid
-
-                        seen_this_path = (
-                            cur.execute("SELECT 1 FROM files WHERE path=?", (str(f),)).fetchone()
-                            is not None
+                    else:
+                        # New paper: use current path as canonical doc_id
+                        canon_doc_id = str(f)
+                        cur.execute(
+                            "INSERT INTO papers(doc_id, pmid, pmcid, title, abstract) VALUES (?,?,?,?,?)",
+                            (canon_doc_id, pmid, pmcid, meta["title"], meta["abstract"]),
                         )
-                        if seen_this_path:
-                            if args.faiss_writer:
+                        pid = cur.lastrowid
+
+                    seen_this_path = (
+                        cur.execute("SELECT 1 FROM files WHERE path=?", (str(f),)).fetchone()
+                        is not None
+                    )
+                    if seen_this_path:
+                        if args.faiss_writer:
+                            with FileLock(FAISS_LOCK):
+                                if not isinstance(paper_index, faiss.IndexIDMap2):
+                                    paper_index = faiss.IndexIDMap2(paper_index)
+                                selp = make_id_selector([pid])
+                                safe_remove_ids(paper_index, selp)
+                                faiss_save_force(paper_index, PAPER_INDEX_PATH)
+
+                            old_ids = [
+                                row[0]
+                                for row in cur.execute(
+                                    "SELECT id FROM chunks WHERE paper_id=?", (pid,)
+                                )
+                            ]
+                            if old_ids:
                                 with FileLock(FAISS_LOCK):
-                                    if not isinstance(paper_index, faiss.IndexIDMap2):
-                                        paper_index = faiss.IndexIDMap2(paper_index)
-                                    selp = make_id_selector([pid])
-                                    safe_remove_ids(paper_index, selp)
-                                    faiss_save_force(paper_index, PAPER_INDEX_PATH)
+                                    if not isinstance(chunk_index, faiss.IndexIDMap2):
+                                        chunk_index = faiss.IndexIDMap2(chunk_index)
+                                    selc = make_id_selector(old_ids)
+                                    safe_remove_ids(chunk_index, selc)
+                                    faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+                        with FileLock(DB_LOCK):
+                            cur.execute("DELETE FROM chunks WHERE paper_id=?", (pid,))
+                            cur.execute("UPDATE papers SET in_index=0 WHERE id=?", (pid,))
 
-                                old_ids = [
-                                    row[0]
-                                    for row in cur.execute(
-                                        "SELECT id FROM chunks WHERE paper_id=?", (pid,)
-                                    )
-                                ]
-                                if old_ids:
-                                    with FileLock(FAISS_LOCK):
-                                        if not isinstance(chunk_index, faiss.IndexIDMap2):
-                                            chunk_index = faiss.IndexIDMap2(chunk_index)
-                                        selc = make_id_selector(old_ids)
-                                        safe_remove_ids(chunk_index, selc)
-                                        faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
-                            with FileLock(DB_LOCK):
-                                cur.execute("DELETE FROM chunks WHERE paper_id=?", (pid,))
-                                cur.execute("UPDATE papers SET in_index=0 WHERE id=?", (pid,))
+                    db_register_file(cur, str(f), pid, st)
 
-                        db_register_file(cur, str(f), pid, st)
+                    ta = (meta["title"] or "").strip()
+                    ab = (meta["abstract"] or "").strip()
+                    ta_ab = (ta + " " + ab).strip() or (
+                        meta["paragraphs"][0][:800] if meta["paragraphs"] else "untitled"
+                    )
+                    paper_ids_buf.append(pid)
+                    paper_texts_buf.append(ta_ab)
+                    paper_doc_ids_buf.append(canon_doc_id)
 
-                        ta = (meta["title"] or "").strip()
-                        ab = (meta["abstract"] or "").strip()
-                        ta_ab = (ta + " " + ab).strip() or (
-                            meta["paragraphs"][0][:800] if meta["paragraphs"] else "untitled"
+                    proposed_chunks = []
+                    if ta_ab:
+                        proposed_chunks.append((-1, ta_ab))
+
+                    paras = meta["paragraphs"] or ([ab] if ab else [])
+                    chunks = (
+                        pack_paragraphs(
+                            paras,
+                            max_chars=int(
+                                getattr(args, "chunk_target_chars", CHUNK_TARGET_CHARS)
+                            ),
+                            min_chars=int(getattr(args, "chunk_min_chars", BODY_MIN_CHARS)),
+                            overlap_chars=int(
+                                getattr(args, "chunk_overlap", CHUNK_OVERLAP_CHARS)
+                            ),
                         )
-                        paper_ids_buf.append(pid)
-                        paper_texts_buf.append(ta_ab)
-                        paper_doc_ids_buf.append(canon_doc_id)
+                        if paras
+                        else []
+                    )
+                    for ord_i, ch in enumerate(chunks):
+                        proposed_chunks.append((ord_i, ch))
 
-                        proposed_chunks = []
-                        if ta_ab:
-                            proposed_chunks.append((-1, ta_ab))
-
-                        paras = meta["paragraphs"] or ([ab] if ab else [])
-                        chunks = (
-                            pack_paragraphs(
-                                paras,
-                                max_chars=int(
-                                    getattr(args, "chunk_target_chars", CHUNK_TARGET_CHARS)
-                                ),
-                                min_chars=int(getattr(args, "chunk_min_chars", BODY_MIN_CHARS)),
-                                overlap_chars=int(
-                                    getattr(args, "chunk_overlap", CHUNK_OVERLAP_CHARS)
-                                ),
-                            )
-                            if paras
-                            else []
+                    for ord_i, text_i in proposed_chunks:
+                        cur.execute(
+                            "INSERT INTO chunks(paper_id, ord, text) VALUES (?,?,?)",
+                            (pid, ord_i, text_i),
                         )
-                        for ord_i, ch in enumerate(chunks):
-                            proposed_chunks.append((ord_i, ch))
+                        cid = cur.lastrowid
+                        chunk_ids_buf.append(cid)
+                        chunk_texts_buf.append(text_i)
+                        chunk_paper_doc_ids_buf.append(canon_doc_id)
+                        chunk_ords_buf.append(ord_i)
 
-                        for ord_i, text_i in proposed_chunks:
-                            cur.execute(
-                                "INSERT INTO chunks(paper_id, ord, text) VALUES (?,?,?)",
-                                (pid, ord_i, text_i),
-                            )
-                            cid = cur.lastrowid
-                            chunk_ids_buf.append(cid)
-                            chunk_texts_buf.append(text_i)
-                            chunk_paper_doc_ids_buf.append(canon_doc_id)
-                            chunk_ords_buf.append(ord_i)
+                    # ---------- END INGEST BODY ----------
 
-                        # ---------- END INGEST BODY ----------
-
-                        handled_ok = True
+                    handled_ok = True
 
                 # Release savepoint on success (keep changes in transaction)
                 # IMPORTANT: Release savepoint BEFORE any conn.commit() calls.
