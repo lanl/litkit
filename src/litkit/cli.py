@@ -40,20 +40,14 @@ def _version_banner() -> str:
 import argparse
 import atexit
 import errno
-import hashlib
-import json
 import logging
-import math
-import random
 import re
 import signal
 import socket
-import sqlite3
 import threading
 import time
 import unicodedata
 from pathlib import Path
-from contextlib import contextmanager, nullcontext
 from typing import Iterator
 
 
@@ -62,31 +56,14 @@ from typing import Iterator
 from types import SimpleNamespace
 
 from litkit.embeddings.base import (
-    _PROGRESS_LOCK,  # reuse the shared lock
-)
-from litkit.embeddings.base import (
     Embedder,  # protocol for type hints
-)
-from litkit.embeddings.base import (
-    progress_is_append as _progress_is_append,
-)
-from litkit.embeddings.base import (
-    progress_newline as _progress_newline,
-)
-from litkit.embeddings.base import (
-    progress_write as _progress_write,
 )
 from litkit.progress import (
     eprint as _eprint,
-    Progress as _Progress,
-    Pulse as _Pulse,
-    phase as _phase,
 )
 from litkit.concurrent import (
     FileLock as _FileLockBase,
     FLOCK_AVAILABLE,
-    in_faiss_lock as _in_faiss_lock,
-    in_db_lock as _in_db_lock,
 )
 from litkit.embeddings.devices import configure_threads, detect_device
 from litkit.embeddings.factory import make_chunk_embedder, make_paper_embedder
@@ -94,11 +71,9 @@ from litkit.formatting.answers import (
     normalize_answer_and_build_refs,
     render_references,
 )
-from litkit.frontload.cap import cap_chunks_per_paper
 from litkit.ingest.ingest import (
     ArticleMeta,
     TarMemberMeta,
-    count_tar_xml_members,
     iter_tar_paths,
     iter_tar_xml_streams,
     parallel_iter_tar_articles,
@@ -107,92 +82,43 @@ from litkit.ingest.ingest import (
 from litkit.ingest import is_uncompressed_tar, shard_filter
 from litkit.index import (
     # Constants
-    PQ_BITS,
-    USE_DOWNCAST_FALLBACK,
-    # Factory
-    flat_ip_index,
-    hnsw_index,
-    ivfpq_index,
-    safe_pq_m,
-    # I/O
-    faiss_save,
     faiss_save_force,
     faiss_load,
-    faiss_load_cached,
-    # Introspection
-    unwrap_core_and_kind,
     kind_and_core,
-    extract_ivf,
-    report_faiss_index,
-    faiss_present_ids,
-    # IDs
-    make_id_selector,
-    safe_remove_ids,
-    # Search
-    pick_nprobe,
-    auto_set_nprobe,
-    faiss_search,
-    # Dedup
-    add_with_ids_dedup,
 )
 from litkit.build import (
-    pack_paragraphs,
-    dedupe_papers_with_doc_ids,
-    dedupe_chunks_with_doc_ids,
-    ensure_parent,
-    maybe_fsync_dir,
     backfill_unindexed_vectors as build_backfill_unindexed_vectors,
     reconcile_sqlite_flags_with_faiss as build_reconcile_sqlite_flags,
     post_build_sanity_check as build_post_build_sanity_check,
     BuildConfig,
-    build_config_from_args,
     init_empty_indices as build_init_empty_indices,
     run_consume_only_mode as build_run_consume_only_mode,
     load_or_create_paper_index as build_load_or_create_paper_index,
     load_or_create_chunk_index as build_load_or_create_chunk_index,
     train_ivfpq_index as build_train_ivfpq_index,
     process_tar_files as build_process_tar_files,
-    flush_final_buffers as build_flush_final_buffers,
-    iter_tar_articles as build_iter_tar_articles,
 )
 from litkit.retrieval import (
     shortlist_papers as retrieval_shortlist_papers,
     search_chunks_constrained as retrieval_search_chunks_constrained,
     get_chunks as retrieval_get_chunks,
-    faiss_search as retrieval_faiss_search,
-    temporary_search_params as retrieval_temporary_search_params,
-    query_terms as retrieval_query_terms,
-    sqlite_norm_expr as retrieval_sqlite_norm_expr,
-    escape_like as retrieval_escape_like,
-    normalize_for_search_py as retrieval_normalize_for_search_py,
-    avg_chunks_for_papers as retrieval_avg_chunks_for_papers,
 )
 from litkit.db import (
     init_db as db_init_db,
     init_shard_db as db_init_shard_db,
     connect_db as db_connect_db,
     shard_db_path as db_shard_db_path,
-    list_shard_dbs as db_list_shard_dbs,
-    merge_shard_databases as db_merge_shard_databases,
-    already_processed as db_already_processed,
-    register_file as db_register_file,
-    preload_paper_id_map as db_preload_paper_id_map,
-    preload_chunk_id_map as db_preload_chunk_id_map,
     chunk_ids_to_paper_ids as db_chunk_ids_to_paper_ids,
-    mark_in_index as db_mark_in_index,
     flush_pending_marks as db_flush_pending_marks,
     load_temp_candidates as db_load_temp_candidates,
 )
 from litkit.segments import (
-    load_checkpoint as seg_load_checkpoint,
-    save_checkpoint as seg_save_checkpoint,
     validate_shard_consistency as seg_validate_shard_consistency,
     write_build_meta as seg_write_build_meta,
     read_build_meta as seg_read_build_meta,
     has_segment_files as seg_has_segment_files,
     SegmentWriter,
     ChunkSegmentWriter,
-    SegmentWriterConfig,
     ProducerCoordinator as SegProducerCoordinator,
     ConsumerCoordinator as SegConsumerCoordinator,
     ingest_paper_segments as seg_ingest_paper_segments,
@@ -710,8 +636,6 @@ def _resolve_question(args) -> str | None:
 
 
 # -------------------- Embedders --------------------
-import faiss
-import numpy as np
 
 # Note: faiss.cvar.seed is set inside _init_runtime() to avoid import-time side effects
 
