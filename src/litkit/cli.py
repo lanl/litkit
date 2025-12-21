@@ -2795,6 +2795,26 @@ def main():
             "  • --init-indices-only only creates empty FAISS indices (bootstrap step).\n"
             "Run --init-indices-only first, then start producers separately."
         )
+    
+    # Destructive / store-defining operations require writer role
+    if args.rebuild and not args.faiss_writer:
+        sys.exit(
+            "[args] ERROR: --rebuild requires --faiss-writer.\n"
+            "  • --rebuild wipes DB and indices; only a writer can rebuild them.\n"
+            "  • Without --faiss-writer, you'd have a wiped store with no rebuilt indices."
+        )
+    if args.rebuild and args.consume_only:
+        sys.exit(
+            "[args] ERROR: --rebuild and --consume-only are mutually exclusive.\n"
+            "  • --rebuild performs a full wipe-and-rebuild from tar shards.\n"
+            "  • --consume-only only ingests pre-computed segments."
+        )
+    if args.init_indices_only and not args.faiss_writer:
+        sys.exit(
+            "[args] ERROR: --init-indices-only requires --faiss-writer.\n"
+            "  • --init-indices-only creates empty FAISS indices.\n"
+            "  • Only a writer can create/save FAISS index files."
+        )
 
     _create_writer_guard_or_exit(args)
 
