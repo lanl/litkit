@@ -1629,6 +1629,34 @@ is deferred, not the heavy imports or side effects on attribute access.
 This is orthogonal to line count reduction - it's about achieving true import purity
 so `from litkit.cli import X` doesn't have side effects.
 
+#### Global Mutable State Leaks Across Modes (P2)
+
+**Problem:** cli.py has module-level mutable globals that are only initialized in `main()`:
+- `paper_seg_writer`, `chunk_seg_writer` - set in `main()`, read in `build_or_update_indices()`
+- `_last_save_ts` - FAISS save throttling state (in `litkit/index/io.py`)
+- Lazy path globals via `__getattr__` (SQLITE_DIR, DB_PATH, etc.)
+- Batching constants (`PAPER_BATCH`, `CHUNK_BATCH`) mutated from `args`
+
+**Impact:** The "library use" comments (`get_runtime()`, wrapper helpers) suggest these
+functions can be called from outside `main()`, but they silently depend on globals that
+only `main()` initializes. This causes:
+- Unpredictable behavior when importing cli.py functions for tests
+- Hidden coupling between functions and module-level state
+- Stateful behavior that doesn't reset between calls
+
+**Current state:** Module functions in `litkit.build` and `litkit.retrieval` take
+explicit parameters (paths, locks, writers) - this is the correct pattern. The
+cli.py wrappers bridge the gap by passing globals to module functions.
+
+**Proper fix (requires Phase 6.2f extraction):**
+1. Pass all context (writers, paths, locks, config) explicitly down the call stack
+2. Eliminate `global paper_seg_writer` patterns - pass writers as parameters
+3. Bundle path/lock context in `BuildConfig` or `RuntimeContext` dataclass
+4. Module functions should never access cli.py globals
+
+This is orthogonal to line count - it's about eliminating implicit coupling so
+functions are self-contained and testable.
+
 ### Refactor Architecture (Complete)
 
 ```
