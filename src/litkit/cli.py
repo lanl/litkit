@@ -820,7 +820,7 @@ def build_or_update_indices(args):
     need = args.rebuild or not (
         DB_PATH.exists() and PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists()
     )
-    if not need and not args.update and not args.build_only and not args.consume_only and not args.init_indices_only:
+    if not need and not args.update and not args.build_only and not args.consume_only and not args.init_indices_only and not args.embed_producer:
         # nothing to do
         return
 
