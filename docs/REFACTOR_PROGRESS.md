@@ -1065,27 +1065,62 @@ cli.py: 3480 → 3441 lines (-39 lines)
 | Metric | Value |
 |--------|-------|
 | cli.py at session start | 3480 lines |
-| cli.py now | 3441 lines |
-| **Session reduction** | **-39 lines** |
-| **Total reduction (since 2024-12-18)** | **~1324 lines (28%)** |
+| cli.py now | 3398 lines |
+| **Session reduction** | **-82 lines** |
+| **Total reduction (since 2024-12-18)** | **~1325 lines (28%)** |
 
 ### Remaining Phase 6.2d Steps
 
 | Step | Description | Status | Est. Lines |
 |------|-------------|--------|------------|
 | Step A | Wire paper index load/create | ✅ COMPLETE | -39 |
-| Step B | Wire chunk index load/create | Not started | ~50 |
+| Step B | Wire chunk index load/create | ✅ COMPLETE | -43 |
 | Step C | Extract IVF-PQ training to module | Not started | ~200 |
 | Step D | Wire training call in cli.py | Not started | ~5 |
 
+### Completed Step B Details
+
+**Commit `04f9e68`:** `refactor(cli): wire chunk index load to module function (Phase 6.2d Step B)`
+
+Replaced ~55 lines of inline chunk index load/create code with a call to the module function:
+
+```python
+# Before: 55 lines of inline CHUNK_INDEX_PATH.exists() / faiss_load / ivfpq_index / etc.
+
+# After:
+chunk_index, needs_training = build_load_or_create_chunk_index(
+    chunk_index_path=CHUNK_INDEX_PATH,
+    chunk_trained_flag=CHUNK_TRAINED_FLAG,
+    faiss_lock_path=FAISS_LOCK,
+    db_lock_path=DB_LOCK,
+    FileLock=FileLock,
+    chunk_dim=chunk_dim,
+    chunks_index=args.chunks_index,
+    ivf_nlist=args.ivf_nlist,
+    pq_m=args.pq_m,
+    is_faiss_writer=args.faiss_writer,
+)
+
+# If IVF-PQ needs training, run training pass (one-time)
+if needs_training:
+    ...
+```
+
+Key changes:
+- Module function returns `(chunk_index, needs_training)` tuple
+- Training block now guards on `needs_training` boolean
+- Removed redundant `ivf_core = extract_ivf()` and `isinstance()` checks
+
+cli.py: 3441 → 3398 lines (-43 lines)
+
 ### Next Steps (Resume Point)
 
-Continue with Phase 6.2d Step B:
-- Replace inline chunk index load/create block (~55 lines) with `build_load_or_create_chunk_index()`
-- Then extract IVF-PQ training (~200 lines) to a module function
+Continue with Phase 6.2d Step C:
+- Extract IVF-PQ training (~200 lines) to a module function in `litkit/build/training.py`
+- Create `train_chunks_ivfpq()` function that returns the trained index
 
 ---
 
 ## Current Status
 
-**cli.py is now 3441 lines** (down from ~4723 at start of 2024-12-18 session, **~1324 lines / 28% reduction**)
+**cli.py is now 3398 lines** (down from ~4723 at start of 2024-12-18 session, **~1325 lines / 28% reduction**)
