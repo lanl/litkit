@@ -938,7 +938,7 @@ def build_or_update_indices(args):
     save indices. Other processes (possibly using --shard-id/--num-shards) only
     populate SQLite rows and commit; they do not mutate FAISS indices.
     """
-    _load_heavy_deps()  # ensure db_*, seg_*, make_* etc. are available
+    d = deps()  # ensures loaded + returns namespace (consistent pattern)
     _require_faiss("building/updating indices")
     # Lazy imports to defer faiss/numpy loading until actually needed
     from litkit.build import (
@@ -967,24 +967,24 @@ def build_or_update_indices(args):
     seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
     
     # Always validate if segment directory exists with prior work
-    if _deps.seg_has_segment_files(seg_dir) or _deps.seg_read_build_meta(seg_dir) is not None:
-        _deps.seg_validate_shard_consistency(seg_dir, args.num_shards, current_mode=build_mode)
+    if d.seg_has_segment_files(seg_dir) or d.seg_read_build_meta(seg_dir) is not None:
+        d.seg_validate_shard_consistency(seg_dir, args.num_shards, current_mode=build_mode)
     
     # Write build metadata if this is a fresh start
     # For multi-node: producer 0 writes it; for single-node: the writer writes it
     if is_multi_node:
         if args.embed_producer and args.shard_id == 0:
-            meta = _deps.seg_read_build_meta(seg_dir)
+            meta = d.seg_read_build_meta(seg_dir)
             if meta is None:
                 manifest_path = str(args.tar_manifest) if args.tar_manifest else None
-                _deps.seg_write_build_meta(seg_dir, args.num_shards, manifest_path, mode="multi")
+                d.seg_write_build_meta(seg_dir, args.num_shards, manifest_path, mode="multi")
     else:
         # Single-node mode: write metadata if fresh start
         if args.faiss_writer:
-            meta = _deps.seg_read_build_meta(seg_dir)
+            meta = d.seg_read_build_meta(seg_dir)
             if meta is None and not args.init_indices_only:
                 manifest_path = str(args.tar_manifest) if args.tar_manifest else None
-                _deps.seg_write_build_meta(seg_dir, args.num_shards, manifest_path, mode="single")
+                d.seg_write_build_meta(seg_dir, args.num_shards, manifest_path, mode="single")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # DATABASE CONCURRENCY CONTRACT
@@ -1011,10 +1011,10 @@ def build_or_update_indices(args):
     # Use shard-specific DB for producers (lock-free parallel writes)
     if args.embed_producer and not args.faiss_writer:
         _eprint(f"[build] Producer mode: using shard-specific DB for shard {args.shard_id}")
-        conn = _deps.db_init_shard_db(_deps.db_shard_db_path(SQLITE_DIR, args.shard_id), args.shard_id, args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
+        conn = d.db_init_shard_db(d.db_shard_db_path(SQLITE_DIR, args.shard_id), args.shard_id, args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
     else:
         _eprint(f"[build] using DB at {DB_PATH}")
-        conn = _deps.db_init_db(DB_PATH, args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
+        conn = d.db_init_db(DB_PATH, args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
     cur = conn.cursor()
 
     if args.init_indices_only:
@@ -1057,8 +1057,8 @@ def build_or_update_indices(args):
         return  # Success - end consume-only mode
 
     # Embedders
-    paper_embedder, _paper_cfg = _deps.make_paper_embedder()
-    chunk_embedder, _chunk_cfg = _deps.make_chunk_embedder(
+    paper_embedder, _paper_cfg = d.make_paper_embedder()
+    chunk_embedder, _chunk_cfg = d.make_chunk_embedder(
         devices=args.embed_devices,
         workers=args.embed_workers,
         force_devices=args.force_embed_devices,
@@ -1076,15 +1076,15 @@ def build_or_update_indices(args):
             conflict_reasons = []
             
             # Check for unconsumed segment files
-            if _deps.seg_has_segment_files(seg_dir):
+            if d.seg_has_segment_files(seg_dir):
                 conflict_reasons.append(f"Segment directory {seg_dir} contains unconsumed segment files")
             
             # Check for producer completion markers (indicates multi-node run)
             # Use shard count from build_meta.json (if exists) to correctly interpret markers.
-            meta = _deps.seg_read_build_meta(seg_dir)
+            meta = d.seg_read_build_meta(seg_dir)
             effective_num_shards = meta.get("num_shards", args.num_shards) if meta else args.num_shards
             
-            coordinator = _deps.SegConsumerCoordinator(seg_dir, effective_num_shards)
+            coordinator = d.SegConsumerCoordinator(seg_dir, effective_num_shards)
             completed = coordinator.completed_shards()
             if completed:
                 if len(completed) < effective_num_shards:
@@ -1208,8 +1208,8 @@ def build_or_update_indices(args):
     # FAISS indices (1-10GB), embedding batches (100-500MB), SQLite (10-50MB).
     # PMC-OA corpus has ~600-2000 shard files, so ~200-400KB total.
     tar_paths = list(
-        _deps.shard_filter(
-            _deps.iter_tar_paths(args.tar_dir, args.tar_manifest), args.shard_id, args.num_shards
+        d.shard_filter(
+            d.iter_tar_paths(args.tar_dir, args.tar_manifest), args.shard_id, args.num_shards
         )
     )
 
@@ -1262,7 +1262,7 @@ def build_or_update_indices(args):
     # Write completion marker for producer
     if args.embed_producer:
         seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
-        producer_coordinator = _deps.SegProducerCoordinator(seg_dir, args.shard_id, args.num_shards)
+        producer_coordinator = d.SegProducerCoordinator(seg_dir, args.shard_id, args.num_shards)
         producer_coordinator.mark_complete()
         _eprint(f"[producer] Shard {args.shard_id}/{args.num_shards} marked complete")
 
@@ -1271,11 +1271,11 @@ def build_or_update_indices(args):
 
         if args.consume_segments and seg_dir and Path(seg_dir).exists():
             # Ingest segments - functions handle IDMap2 wrapping and return the (possibly wrapped) index
-            paper_index, p_added = _deps.seg_ingest_paper_segments(
+            paper_index, p_added = d.seg_ingest_paper_segments(
                 conn, paper_index, seg_dir, FAISS_LOCK, PAPER_INDEX_PATH, DB_LOCK,
                 FileLock=FileLock
             )
-            chunk_index, c_added = _deps.seg_ingest_chunk_segments(
+            chunk_index, c_added = d.seg_ingest_chunk_segments(
                 conn, chunk_index, seg_dir, FAISS_LOCK, CHUNK_INDEX_PATH, DB_LOCK,
                 FileLock=FileLock
             )
@@ -1330,7 +1330,7 @@ def build_or_update_indices(args):
             faiss_save_force(paper_index, PAPER_INDEX_PATH)
             faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
         with FileLock(DB_LOCK):
-            _deps.db_flush_pending_marks(conn.cursor())
+            d.db_flush_pending_marks(conn.cursor())
             conn.commit()
 
         try:
