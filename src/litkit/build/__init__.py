@@ -32,6 +32,11 @@ from litkit.build.training import train_ivfpq_index
 from litkit.build.consume import (
     run_consume_only_mode,
 )
+from litkit.build.ingest_loop import (
+    iter_tar_articles,
+    process_tar_files,
+    flush_final_buffers,
+)
 
 __all__ = [
     # helpers
@@ -55,4 +60,8 @@ __all__ = [
     "train_ivfpq_index",
     # consume
     "run_consume_only_mode",
+    # ingest_loop
+    "iter_tar_articles",
+    "process_tar_files",
+    "flush_final_buffers",
 ]

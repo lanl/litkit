@@ -167,6 +167,9 @@ from litkit.build import (
     load_or_create_paper_index as build_load_or_create_paper_index,
     load_or_create_chunk_index as build_load_or_create_chunk_index,
     train_ivfpq_index as build_train_ivfpq_index,
+    process_tar_files as build_process_tar_files,
+    flush_final_buffers as build_flush_final_buffers,
+    iter_tar_articles as build_iter_tar_articles,
 )
 from litkit.retrieval import (
     shortlist_papers as retrieval_shortlist_papers,
