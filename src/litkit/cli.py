@@ -165,6 +165,7 @@ from litkit.build import (
     run_consume_only_mode as build_run_consume_only_mode,
     load_or_create_paper_index as build_load_or_create_paper_index,
     load_or_create_chunk_index as build_load_or_create_chunk_index,
+    train_ivfpq_index as build_train_ivfpq_index,
 )
 from litkit.db import (
     init_db as db_init_db,

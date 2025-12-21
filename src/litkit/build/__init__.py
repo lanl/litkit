@@ -28,6 +28,7 @@ from litkit.build.indices import (
     load_or_create_paper_index,
     load_or_create_chunk_index,
 )
+from litkit.build.training import train_ivfpq_index
 from litkit.build.consume import (
     run_consume_only_mode,
 )
@@ -50,6 +51,8 @@ __all__ = [
     "init_empty_indices",
     "load_or_create_paper_index",
     "load_or_create_chunk_index",
+    # training
+    "train_ivfpq_index",
     # consume
     "run_consume_only_mode",
 ]
