@@ -1666,7 +1666,6 @@ def answer_with_llm(
 
     # Lazy import to avoid hard dependency during build-only runs.
     try:
-        import openai
         from openai import OpenAI
     except Exception as e:
         raise RuntimeError(
