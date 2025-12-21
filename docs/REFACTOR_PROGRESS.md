@@ -1912,15 +1912,833 @@ Per user feedback, these are noted for future work but not blocking:
 
 ---
 
+---
+
+## Phase 7: LLM Module Extraction
+
+### Overview
+
+Extract all LLM handling from `src/litkit/cli.py` into a dedicated `litkit/llm/` module package.
+This is approximately 200-250 lines of code including constants, helpers, and the main LLM call logic.
+
+**Current LLM code in cli.py (~200-250 lines):**
+- Constants/defaults (~15 lines): `DEFAULT_LLM_MODEL`, `OPENAI_TIMEOUT_SEC`, `SYS_PROMPT`, `BUDGET_TOKENS_*`
+- Config helpers (~30 lines): `_default_base_url_for()`, `_default_api_key_for()`, `_is_openai_cloud()`
+- Token budgeting (~70 lines): `approx_tokens()`, `pack_context()`
+- LLM call (~130 lines): `answer_with_llm()` with nested `_clarify_llm_error()`
+- Citation normalization (~50 lines): `_normalize_and_strip_citations()`, regexes (→ moves to `formatting/`)
+
+### Goals
+
+1. **Provider-agnostic**: Support OpenAI cloud vs local OpenAI-compatible endpoints
+2. **Multi-turn ready**: Session/turn history types for future interactive modes
+3. **Query rewriting ready**: Support future automatic + operator-in-the-loop rewriting
+4. **UI-neutral**: CLI, REPL, TUI/web can call the same engine
+5. **Import purity**: No heavy deps at import time (OpenAI SDK lazy-loaded)
+6. **Citation correctness**: No desync when overflow trimming occurs
+
+### Target Module Structure
+
+```
+src/litkit/llm/
+├── __init__.py        # Re-exports: LLMConfig, answer_question, rewrite_query
+├── errors.py          # Typed exceptions + helpers (~60 lines)
+├── types.py           # LLMConfig, LLMResponse, SessionState, Turn (~80 lines)
+├── prompts.py         # SYS_PROMPT_QA, SYS_PROMPT_REWRITE (~15 lines)
+├── provider.py        # LLMProvider protocol + implementations (~180 lines)
+├── qa.py              # pack_context, answer_question (~150 lines)
+└── rewrite.py         # Query rewriting (stub initially) (~30 lines)
+```
+
+**Also affected:**
+```
+src/litkit/formatting/
+├── citations.py       # NEW: citation normalization (~60 lines)
+└── ...
+```
+
+---
+
+### Detailed Specifications
+
+#### 1. `errors.py` - Typed Exceptions (~60 lines)
+
+**Purpose:** Replace brittle string-matching with typed exceptions for error handling.
+
+```python
+"""LLM-specific exceptions and error helpers."""
+
+class LLMError(Exception):
+    """Base exception for all LLM operations."""
+    pass
+
+class AuthError(LLMError):
+    """Authentication/API key failure."""
+    pass
+
+class ModelNotFoundError(LLMError):
+    """Model not loaded or not recognized by endpoint."""
+    pass
+
+class EndpointNotSupportedError(LLMError):
+    """Endpoint doesn't support required API (e.g., Responses API for o-series)."""
+    pass
+
+class ContextOverflowError(LLMError):
+    """Input context exceeds model's context window."""
+    pass
+
+class TransportError(LLMError):
+    """Network/connection failure."""
+    pass
+
+def is_overflow_error(exc: Exception) -> bool:
+    """Check if exception indicates context/token overflow.
+    
+    Centralizes the string-matching logic currently scattered in answer_with_llm().
+    Returns True for errors like:
+    - "context length exceeded"
+    - "maximum context length"
+    - "token limit"
+    - "prompt too long"
+    - HTTP 413
+    """
+    msg = (str(exc) or "").lower()
+    return any(s in msg for s in (
+        "context length",
+        "maximum context length",
+        "exceeds context window",
+        "token limit",
+        "too many tokens",
+        "reduce the length",
+        "max tokens",
+        "prompt too long",
+        "input too long",
+        "payload too large",
+        "413",
+    ))
+
+def clarify_error(model: str, base_url: str, exc: Exception) -> str:
+    """Generate operator-grade error message from raw exception.
+    
+    Consolidates the current _clarify_llm_error() logic.
+    """
+    # ... implementation moves from cli.py
+```
+
+#### 2. `types.py` - Data Contracts (~80 lines)
+
+**Purpose:** UI- and provider-neutral data structures.
+
+```python
+"""LLM type definitions and data contracts."""
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+@dataclass
+class LLMConfig:
+    """Configuration for LLM operations (reusable across calls)."""
+    model: str = "gpt-oss:20b"
+    base_url: str = "http://localhost:1234/v1"
+    api_key: str = "no-auth"
+    timeout_sec: int = 15
+    max_out_tokens_default: int = 3000
+    sys_prompt: str = ""  # Empty = use prompts.SYS_PROMPT_QA
+    provider_preference: Literal["auto", "detect", "responses", "chat"] = "detect"
+    
+    # Token budgets (approximate; ~4 chars/token heuristic)
+    budget_o3: int = 32000
+    budget_oss: int = 8000
+    prompt_headroom: int = 200
+    
+    @classmethod
+    def from_env_and_args(
+        cls,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        **kwargs
+    ) -> "LLMConfig":
+        """Build config from environment variables with CLI arg overrides."""
+        import os
+        return cls(
+            model=model or os.environ.get("LLM_MODEL", "gpt-oss:20b"),
+            base_url=base_url or os.environ.get("OPENAI_BASE_URL", "http://localhost:1234/v1"),
+            api_key=api_key or os.environ.get("OPENAI_API_KEY", "no-auth"),
+            timeout_sec=int(os.environ.get("LITKIT_OPENAI_TIMEOUT_SEC", "15")),
+            budget_o3=int(os.environ.get("LITKIT_BUDGET_O3", "32000")),
+            budget_oss=int(os.environ.get("LITKIT_BUDGET_OSS20B", "8000")),
+            prompt_headroom=int(os.environ.get("LITKIT_PROMPT_HEADROOM_TOKENS", "200")),
+            **kwargs
+        )
+
+@dataclass
+class LLMResponse:
+    """Response from an LLM call."""
+    text: str
+    provider: str  # "openai-responses" | "openai-chat" | "local-chat"
+    usage: dict[str, Any] | None = None
+    raw: Any | None = None  # Optional for debugging (keep small/redacted)
+
+# Future multi-turn support (implement types now, use later)
+
+@dataclass
+class Turn:
+    """Single turn in a conversation."""
+    turn_id: str
+    user_text: str
+    rewritten_text: str | None = None
+    retrieval_query: str = ""
+    answer_text: str | None = None
+    selected_chunk_ids: list[int] | None = None
+    timestamp: float = 0.0
+
+@dataclass 
+class SessionState:
+    """Multi-turn session state."""
+    session_id: str
+    turns: list[Turn] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+```
+
+#### 3. `prompts.py` - System Prompts (~15 lines)
+
+**Purpose:** Keep prompt strings out of logic for testability and tuning.
+
+```python
+"""System prompts for LLM operations."""
+
+SYS_PROMPT_QA = (
+    "You are a precise scientific assistant. Use ONLY the provided context chunks to answer; "
+    "do not use prior knowledge. You MUST include bracketed citations like [1], [2] that refer "
+    "to the provided chunks. Cite what you use in your answer and prefer multiple sources when "
+    "the claim spans chunks. If context is insufficient, say so briefly."
+)
+
+SYS_PROMPT_REWRITE = (
+    "You are a query optimization assistant. Rewrite the user's question to improve retrieval "
+    "from a scientific literature database. Expand acronyms, add relevant synonyms, remove "
+    "conversational filler, and ensure key technical terms are present. Return only the "
+    "rewritten query, no explanation."
+)
+```
+
+#### 4. `provider.py` - Provider Abstraction (~180 lines)
+
+**Purpose:** Encapsulate OpenAI SDK interactions behind a protocol.
+
+```python
+"""LLM provider abstraction and implementations."""
+from typing import Protocol, Any
+from .types import LLMConfig, LLMResponse
+from .errors import (
+    LLMError, AuthError, ModelNotFoundError, 
+    EndpointNotSupportedError, ContextOverflowError, is_overflow_error
+)
+
+class LLMProvider(Protocol):
+    """Protocol for LLM providers."""
+    
+    def generate(self, 
+                 prompt: str, 
+                 config: LLMConfig,
+                 *,
+                 max_out_tokens: int | None = None,
+                 sys_prompt: str | None = None) -> LLMResponse:
+        """Generate a response from the LLM."""
+        ...
+    
+    def preflight(self, config: LLMConfig) -> dict[str, Any]:
+        """Optional: probe endpoint capabilities (models.list, etc).
+        
+        Best-effort; never fatal on servers that lack models.list().
+        """
+        ...
+
+
+class OpenAIChatProvider:
+    """Chat Completions API provider (local/OSS models)."""
+    
+    def generate(self, prompt: str, config: LLMConfig, **kwargs) -> LLMResponse:
+        # Lazy import - critical for offline/build-only runs
+        from openai import OpenAI
+        
+        client = OpenAI(
+            base_url=config.base_url,
+            api_key=config.api_key,
+            timeout=config.timeout_sec
+        )
+        
+        max_out = kwargs.get("max_out_tokens") or config.max_out_tokens_default
+        sys_prompt = kwargs.get("sys_prompt") or config.sys_prompt
+        
+        try:
+            resp = client.chat.completions.create(
+                model=config.model,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=max_out,
+            )
+            text = getattr(resp.choices[0].message, "content", "") or ""
+            return LLMResponse(
+                text=text.strip(),
+                provider="openai-chat",
+                usage=dict(resp.usage) if resp.usage else None,
+            )
+        except Exception as e:
+            if is_overflow_error(e):
+                raise ContextOverflowError(str(e)) from e
+            raise LLMError(str(e)) from e
+    
+    def preflight(self, config: LLMConfig) -> dict[str, Any]:
+        # ... probe models.list() if available
+        return {}
+
+
+class OpenAIResponsesProvider:
+    """Responses API provider (o-series models)."""
+    
+    def generate(self, prompt: str, config: LLMConfig, **kwargs) -> LLMResponse:
+        from openai import OpenAI
+        
+        client = OpenAI(
+            base_url=config.base_url,
+            api_key=config.api_key,
+            timeout=config.timeout_sec
+        )
+        
+        max_out = kwargs.get("max_out_tokens") or config.max_out_tokens_default
+        sys_prompt = kwargs.get("sys_prompt") or config.sys_prompt
+        
+        try:
+            resp = client.responses.create(
+                model=config.model,
+                input=prompt,
+                instructions=sys_prompt,
+                max_output_tokens=max_out,
+                reasoning={"effort": "medium"},
+            )
+            text = getattr(resp, "output_text", "") or ""
+            return LLMResponse(
+                text=text.strip(),
+                provider="openai-responses",
+                usage=None,  # Responses API usage format differs
+            )
+        except Exception as e:
+            # Detect "endpoint doesn't support Responses API"
+            msg = str(e).lower()
+            if any(s in msg for s in ("404", "not found", "405", "method not allowed",
+                                       "unknown parameter", "unsupported")):
+                raise EndpointNotSupportedError(
+                    f"Endpoint {config.base_url} doesn't support Responses API for {config.model}"
+                ) from e
+            if is_overflow_error(e):
+                raise ContextOverflowError(str(e)) from e
+            raise LLMError(str(e)) from e
+
+
+class AutoProvider:
+    """Auto-selecting provider based on model and endpoint capabilities."""
+    
+    def __init__(self):
+        self._chat = OpenAIChatProvider()
+        self._responses = OpenAIResponsesProvider()
+    
+    def generate(self, prompt: str, config: LLMConfig, **kwargs) -> LLMResponse:
+        # Selection logic:
+        # 1. If provider_preference is explicit ("responses" or "chat"), use it
+        # 2. If model is o-series (o3*), try Responses first, fall back to Chat
+        # 3. Otherwise, use Chat
+        
+        pref = config.provider_preference
+        is_o_series = config.model.lower().startswith("o3")
+        
+        if pref == "chat":
+            return self._chat.generate(prompt, config, **kwargs)
+        elif pref == "responses":
+            return self._responses.generate(prompt, config, **kwargs)
+        elif is_o_series:
+            # Try Responses first for o-series
+            try:
+                return self._responses.generate(prompt, config, **kwargs)
+            except EndpointNotSupportedError:
+                # Fall back to Chat (with warning)
+                import sys
+                sys.stderr.write(
+                    f"[llm] Responses API not available; falling back to Chat for {config.model}\n"
+                )
+                return self._chat.generate(prompt, config, **kwargs)
+        else:
+            return self._chat.generate(prompt, config, **kwargs)
+```
+
+#### 5. `qa.py` - Question Answering (~150 lines)
+
+**Purpose:** Main entry point for RAG-style Q&A with context packing and overflow retry.
+
+```python
+"""Question answering with context packing and overflow handling."""
+from typing import Any
+from .types import LLMConfig, LLMResponse
+from .provider import AutoProvider
+from .prompts import SYS_PROMPT_QA
+from .errors import ContextOverflowError, clarify_error, LLMError
+
+def approx_tokens(s: str) -> int:
+    """Rough char→token approximation (~4 chars/token). Returns at least 1."""
+    return max(1, len(s) // 4)
+
+
+def pack_context(
+    chunks: list[dict[str, str]],
+    question: str,
+    config: LLMConfig,
+    *,
+    sys_prompt: str | None = None,
+    max_out_tokens: int | None = None,
+) -> tuple[str, list[int], dict[str, Any]]:
+    """Pack ranked chunks into a context string respecting token budget.
+    
+    Returns:
+        (context_text, used_indices, token_meta)
+        - context_text: Concatenated context blocks with [i] prefixes
+        - used_indices: 1-based indices of chunks that fit (may be < len(chunks))
+        - token_meta: Budget metadata for logging
+    
+    Note: Returns partial results if not all chunks fit (caller decides how to handle).
+    """
+    prompt = sys_prompt or SYS_PROMPT_QA
+    max_out = max_out_tokens or config.max_out_tokens_default
+    
+    # Choose budget based on model family
+    is_o_series = config.model.lower().startswith("o3")
+    budget = config.budget_o3 if is_o_series else config.budget_oss
+    
+    # Safety clamp: ensure room for output
+    if max_out >= budget:
+        max_out = max(128, budget // 4)
+    
+    input_budget = max(0, budget - max_out)
+    
+    # Reserve space for fixed prompt components
+    base_cost = (
+        approx_tokens(prompt)
+        + approx_tokens("QUESTION:\n")
+        + approx_tokens(question)
+        + approx_tokens("\n\nCONTEXT:\n")
+        + config.prompt_headroom
+    )
+    remain = max(0, input_budget - base_cost)
+    
+    blocks: list[str] = []
+    used: list[int] = []
+    
+    for i, ch in enumerate(chunks, 1):
+        meta_parts = []
+        if ch.get("pmcid"):
+            meta_parts.append(f"PMCID:{ch['pmcid']}")
+        if ch.get("pmid") and not ch.get("pmcid"):
+            meta_parts.append(f"PMID:{ch['pmid']}")
+        meta_str = f" ({', '.join(meta_parts)})" if meta_parts else ""
+        
+        block = f"[{i}] {ch.get('paper_title', '').strip()}{meta_str}\n{ch['text']}"
+        cost = approx_tokens(block) + 20  # formatting overhead
+        
+        if cost <= remain:
+            blocks.append(block)
+            used.append(i)
+            remain -= cost
+        else:
+            break  # No more room
+    
+    ctx_text = "\n\n".join(blocks) if blocks else "(no context)"
+    token_meta = {
+        "approx_tokens": input_budget - remain,
+        "budget": budget,
+        "input_budget": input_budget,
+        "max_out_tokens": max_out,
+        "chunks_used": len(used),
+        "chunks_total": len(chunks),
+    }
+    return ctx_text, used, token_meta
+
+
+def answer_question(
+    question: str,
+    ranked_chunks: list[dict[str, str]],
+    config: LLMConfig,
+    *,
+    max_out_tokens: int | None = None,
+    sys_prompt: str | None = None,
+) -> tuple[str, list[dict[str, str]], dict[str, Any]]:
+    """Answer a question using ranked context chunks.
+    
+    Handles overflow by progressively trimming chunks and reducing max_out.
+    
+    Args:
+        question: User question text
+        ranked_chunks: List of chunk dicts with 'text', 'paper_title', etc.
+        config: LLM configuration
+        max_out_tokens: Override for config.max_out_tokens_default
+        sys_prompt: Override for config.sys_prompt or SYS_PROMPT_QA
+    
+    Returns:
+        (answer_text, final_chunks_sent, token_meta)
+        - answer_text: LLM response
+        - final_chunks_sent: The exact chunks sent (after any overflow trimming)
+        - token_meta: Budget/usage metadata
+    
+    Raises:
+        LLMError: On non-recoverable LLM errors (auth, model not found, etc.)
+    """
+    provider = AutoProvider()
+    prompt_template = sys_prompt or config.sys_prompt or SYS_PROMPT_QA
+    max_out = max_out_tokens or config.max_out_tokens_default
+    
+    working_chunks = list(ranked_chunks)
+    
+    # Up to 4 attempts with progressive trimming
+    for attempt in range(4):
+        ctx_text, used_idx, token_meta = pack_context(
+            working_chunks, question, config,
+            sys_prompt=prompt_template,
+            max_out_tokens=max_out,
+        )
+        
+        final_chunks = [working_chunks[i - 1] for i in used_idx]
+        prompt = f"QUESTION:\n{question}\n\nCONTEXT:\n{ctx_text}"
+        
+        try:
+            response = provider.generate(
+                prompt, config,
+                max_out_tokens=max_out,
+                sys_prompt=prompt_template,
+            )
+            return response.text, final_chunks, token_meta
+            
+        except ContextOverflowError:
+            if attempt >= 3:
+                raise  # Give up after 4 attempts
+            
+            # Trim chunks more aggressively each time
+            if len(working_chunks) > 1:
+                if attempt == 0:
+                    new_len = max(1, int(len(working_chunks) * 0.7))
+                else:
+                    new_len = max(1, len(working_chunks) // 2)
+                working_chunks = working_chunks[:new_len]
+            
+            # Also reduce output allowance
+            max_out = max(128, int(max_out * 0.75))
+            continue
+        
+        except LLMError as e:
+            # Non-overflow errors: generate user-friendly message
+            raise LLMError(clarify_error(config.model, config.base_url, e)) from e
+    
+    # Should not reach here, but satisfy type checker
+    raise LLMError("Unexpected: exhausted retry attempts")
+```
+
+#### 6. `rewrite.py` - Query Rewriting Stub (~30 lines)
+
+**Purpose:** Placeholder for future query rewriting capabilities.
+
+```python
+"""Query rewriting for improved retrieval."""
+from dataclasses import dataclass
+from typing import Literal
+from .types import LLMConfig, SessionState
+
+@dataclass
+class RewriteResult:
+    """Result of query rewriting."""
+    final_query: str
+    alternates: list[str]
+    notes: str | None = None
+
+def rewrite_query(
+    session: SessionState | None,
+    user_text: str,
+    config: LLMConfig,
+    *,
+    mode: Literal["none", "light", "interactive"] = "none",
+    max_alternates: int = 3,
+) -> RewriteResult:
+    """Rewrite user query for improved retrieval.
+    
+    Modes:
+    - none: passthrough (final_query == user_text)
+    - light: single best rewrite (expand acronyms, add synonyms)
+    - interactive: multiple alternates for operator selection
+    
+    Note: "light" and "interactive" modes are not yet implemented.
+    """
+    if mode == "none":
+        return RewriteResult(final_query=user_text, alternates=[])
+    
+    # TODO: Implement light and interactive modes
+    raise NotImplementedError(f"rewrite mode={mode!r} not yet implemented")
+```
+
+#### 7. `__init__.py` - Package Exports
+
+```python
+"""LLM module for litkit."""
+from .types import LLMConfig, LLMResponse, SessionState, Turn
+from .qa import answer_question, pack_context, approx_tokens
+from .rewrite import rewrite_query, RewriteResult
+from .errors import (
+    LLMError, AuthError, ModelNotFoundError,
+    EndpointNotSupportedError, ContextOverflowError, TransportError,
+    is_overflow_error, clarify_error,
+)
+from .prompts import SYS_PROMPT_QA, SYS_PROMPT_REWRITE
+
+__all__ = [
+    # Types
+    "LLMConfig", "LLMResponse", "SessionState", "Turn", "RewriteResult",
+    # Core functions
+    "answer_question", "pack_context", "approx_tokens", "rewrite_query",
+    # Errors
+    "LLMError", "AuthError", "ModelNotFoundError",
+    "EndpointNotSupportedError", "ContextOverflowError", "TransportError",
+    "is_overflow_error", "clarify_error",
+    # Prompts
+    "SYS_PROMPT_QA", "SYS_PROMPT_REWRITE",
+]
+```
+
+#### 8. Citation Normalization → `formatting/citations.py`
+
+**Purpose:** Move citation processing to formatting module (not LLM module).
+
+```python
+"""Citation normalization utilities."""
+import re
+import unicodedata
+
+# Regex patterns for citation normalization
+_CITATION_LINELOC = re.compile(r"([\[【]\s*\d+)\s*†L\d+(?:[–—-]\d+)?(\s*[】\]])")
+_CITATION_ANYBR = re.compile(r"(?P<open>[\[【])(?P<inside>[^\[\]【】]{0,200}?)(?P<close>[】\]])")
+_LEADING_NUM_LIST = re.compile(r"^\s*(\d+(?:\s*[，、,]\s*\d+)*)")
+
+def normalize_citations(text: str) -> str:
+    """Canonically normalize bracketed numeric citations.
+    
+    1. Convert fullwidth brackets to ASCII [ ]
+    2. Remove '†Lx–Ly' location tails
+    3. Normalize commas/spacing, de-duplicate while preserving order
+    """
+    # ... implementation from cli.py _normalize_and_strip_citations()
+```
+
+---
+
+### Implementation Phases
+
+| Phase | Files | Description | Status |
+|-------|-------|-------------|--------|
+| 7.1 | `llm/errors.py` | Exception classes + `is_overflow_error()` + `clarify_error()` | Not started |
+| 7.2 | `llm/types.py` | `LLMConfig`, `LLMResponse`, `SessionState`, `Turn` | Not started |
+| 7.3 | `llm/prompts.py` | `SYS_PROMPT_QA`, `SYS_PROMPT_REWRITE` | Not started |
+| 7.4 | `llm/provider.py` | `LLMProvider` protocol + implementations | Not started |
+| 7.5 | `llm/qa.py` | `pack_context()`, `answer_question()` with retry | Not started |
+| 7.6 | `llm/rewrite.py` | Stub with `mode="none"` passthrough | Not started |
+| 7.7 | `llm/__init__.py` + cli.py wiring | Package exports, replace cli.py inline code | Not started |
+| 7.8 | `formatting/citations.py` | Move citation normalization | Not started |
+
+**Estimated impact:**
+- New module lines: ~515
+- cli.py reduction: ~200 lines
+- cli.py after: ~2100 lines (~56% reduction from original 4723)
+
+---
+
+### Testing Requirements
+
+1. **`errors.py`:**
+   - `is_overflow_error()` with real exception strings from OpenAI/local endpoints
+   - `clarify_error()` produces actionable messages for common failure modes
+
+2. **`qa.py`:**
+   - `pack_context()` respects budget and returns partial results correctly
+   - `pack_context()` clamps `max_out_tokens` when >= budget
+   - `answer_question()` overflow retry trims chunks AND reduces `max_out`
+   - `answer_question()` returns `final_chunks_sent` matching actual context
+
+3. **`provider.py`:**
+   - `AutoProvider` selects Responses for o3* models
+   - `OpenAIResponsesProvider` raises `EndpointNotSupportedError` on 404/405
+   - Both providers raise `ContextOverflowError` on overflow
+
+4. **`rewrite.py`:**
+   - `rewrite_query(mode="none")` is identity (passthrough)
+   - `rewrite_query(mode="light")` raises `NotImplementedError` (for now)
+
+---
+
+### CLI Integration (After Module Complete)
+
+```python
+# In cli.py main(), replace ~200 lines with:
+
+from litkit.llm import LLMConfig, answer_question, SYS_PROMPT_QA
+from litkit.formatting.citations import normalize_citations
+
+# Build config from args
+llm_config = LLMConfig.from_env_and_args(
+    model=args.llm_model,
+    base_url=args.openai_base_url,
+    api_key=args.openai_api_key,
+)
+
+# Call module
+answer_text, final_chunks, token_meta = answer_question(
+    question=question,
+    ranked_chunks=selected_chunks,
+    config=llm_config,
+    max_out_tokens=args.max_out_tokens,
+)
+
+# Post-process citations (not in LLM module)
+answer_text = normalize_citations(answer_text)
+answer_text, doc_refs = d.normalize_answer_and_build_refs(answer_text, final_chunks)
+```
+
+---
+
+### Key Design Decisions
+
+1. **`pack_context()` returns partial results** - Truncation is expected behavior, not an error. Caller can log a warning if desired.
+
+2. **Citation normalization stays in `formatting/`** - LLM module returns raw text; citation processing is a post-step. Clean separation of concerns.
+
+3. **Overflow retry in `qa.py`, not `provider.py`** - Providers raise `ContextOverflowError`; `answer_question()` catches and retries.
+
+4. **`provider_preference` values:**
+   - `"detect"` (default): probe endpoint, prefer Responses for o-series, fall back to Chat
+   - `"auto"`: alias for detect
+   - `"responses"`: force Responses API (fail if unavailable)
+   - `"chat"`: force Chat Completions
+
+5. **Session/Turn types now, multi-turn later** - Types are defined for future REPL/TUI work but not used yet.
+
+---
+
+## Work Completed 2024-12-21 (LLM Module Extraction - Phase 7)
+
+### Phase 7: Extract LLM Module (COMPLETE)
+
+Created the `litkit/llm/` module package with all LLM handling extracted from cli.py.
+
+| Phase | File | Description | Status |
+|-------|------|-------------|--------|
+| 7.1 | `llm/errors.py` | Exception classes + `is_overflow_error()` + `clarify_error()` | ✅ Complete |
+| 7.2 | `llm/types.py` | `LLMConfig`, `LLMResponse`, `SessionState`, `Turn` | ✅ Complete |
+| 7.3 | `llm/prompts.py` | `SYS_PROMPT_QA`, `SYS_PROMPT_REWRITE` | ✅ Complete |
+| 7.4 | `llm/provider.py` | `LLMProvider` protocol + implementations | ✅ Complete |
+| 7.5 | `llm/qa.py` | `pack_context()`, `answer_question()` with retry | ✅ Complete |
+| 7.6 | `llm/rewrite.py` | Stub with `mode="none"` passthrough | ✅ Complete |
+| 7.7 | cli.py wiring | Replace inline code with module calls | ✅ Complete |
+| 7.8 | `formatting/citations.py` | Move citation normalization | ✅ Complete |
+
+**Module Structure Created:**
+```
+src/litkit/llm/
+├── __init__.py        # Package exports (16 items)
+├── errors.py          # Typed exceptions (~70 lines)
+├── types.py           # LLMConfig, LLMResponse, SessionState, Turn (~120 lines)
+├── prompts.py         # SYS_PROMPT_QA, SYS_PROMPT_REWRITE (~20 lines)
+├── provider.py        # LLMProvider protocol + implementations (~200 lines)
+├── qa.py              # pack_context, answer_question (~180 lines)
+└── rewrite.py         # Query rewriting stub (~40 lines)
+```
+
+**Also created:**
+```
+src/litkit/formatting/
+├── citations.py       # Citation normalization (~70 lines) ← NEW
+└── __init__.py        # Updated to export normalize_citations
+```
+
+**Key Features:**
+- **Provider-agnostic**: Supports OpenAI cloud and local OpenAI-compatible endpoints
+- **Multi-turn ready**: SessionState/Turn types defined for future interactive modes
+- **Query rewriting ready**: RewriteResult and stub implementation
+- **Import purity**: OpenAI SDK lazy-loaded inside method bodies
+- **Typed exceptions**: LLMError hierarchy replaces string matching
+- **Overflow retry**: Progressive chunk trimming + max_out reduction
+
+**CLI Integration:**
+```python
+# In cli.py main():
+from litkit.llm import LLMConfig, answer_question, LLMError
+from litkit.formatting import normalize_citations
+
+llm_cfg = LLMConfig.from_env_and_args(
+    model=args.llm_model,
+    base_url=base_url,
+    api_key=api_key,
+)
+
+answer, final_chunks, token_meta = answer_question(
+    question=question,
+    ranked_chunks=chunks,
+    config=llm_cfg,
+    max_out_tokens=args.max_out_tokens,
+)
+
+answer = normalize_citations(answer)
+```
+
+---
+
+## Work Completed 2024-12-21 (Session 2) - macOS Fixes + Cleanup
+
+### Bug Fixes
+
+| Fix | Description |
+|-----|-------------|
+| **macOS FAISS segfault** | Added `FAISS_NUM_THREADS=1` and `OMP_NUM_THREADS=1` at absolute top of `cli.py` before any imports. Required because console script entry point bypasses `__main__.py`. |
+| **IVF-PQ training progress** | Added `force_append` parameter to `Progress` class; training progress now emits newlines instead of \r overwrites for log visibility. |
+| **cli.py cleanup** | Removed ~300 lines of backward-compatible local definitions that were now redundant with `litkit.llm` module. |
+
+### LLM Module Final State
+
+The `litkit.llm` module is **functionally complete** for v1:
+
+**✅ Completed (working):**
+- `types.py` - LLMConfig, LLMResponse, SessionState, Turn dataclasses
+- `errors.py` - Typed exceptions (LLMError, AuthError, ContextOverflowError, etc.)
+- `prompts.py` - SYS_PROMPT_QA, SYS_PROMPT_REWRITE
+- `provider.py` - OpenAIChatProvider, OpenAIResponsesProvider, AutoProvider
+- `qa.py` - `answer_question()` with overflow retry, `pack_context()`
+- `__init__.py` - Clean public API
+
+**⏳ Intentionally stubbed (future work, per spec):**
+- `rewrite.py` - `mode="light"` and `mode="interactive"` raise `NotImplementedError`
+  - This is correct per spec: "do NOT couple to UI" / "TUI later"
+  - `mode="none"` passthrough works (identity function)
+
+**📋 The spec items NOT implemented (but marked as "future" in original spec):**
+1. **JSONL session persistence** - SessionState/Turn types exist but no `save_session()` / `load_session()`
+2. **REPL mode in cli.py** - `--interactive` flag (planned for after module split)
+
+---
+
 ## Current Status
 
-**cli.py is now ~2300 lines** (down from 4723 at start, **~51% reduction**)
+**cli.py is now ~2401 lines** (down from 4723 at start, **~51% reduction**)
 
 ### Refactor Architecture (Complete)
 
 ```
 src/litkit/
-├── cli.py              # ~2770 lines (down from 4723, -41%)
+├── cli.py              # ~2401 lines (down from 4723, -51%)
 ├── concurrent/         # Locking primitives
 ├── config/             # WorkspacePaths
 ├── db/                 # All SQLite operations
@@ -1928,19 +2746,111 @@ src/litkit/
 ├── segments/           # Embedding segment I/O + checkpoints
 ├── ingest/             # Tar/XML parsing
 ├── pipeline/           # Build pipeline logic
-├── build/              # Build orchestration (~1480 lines) ← NEW
+├── build/              # Build orchestration (~1850 lines)
 │   ├── helpers.py      # Text chunking & deduplication
 │   ├── backfill.py     # FAISS/SQLite reconciliation
 │   ├── config.py       # BuildConfig dataclass
 │   ├── indices.py      # Index creation utilities
 │   ├── consume.py      # Consumer-only mode
-│   └── training.py     # IVF-PQ training
-├── retrieval/          # RAG retrieval (~820 lines) ← NEW
+│   ├── training.py     # IVF-PQ training
+│   └── ingest_loop.py  # Tar processing loop
+├── retrieval/          # RAG retrieval (~820 lines)
 │   ├── helpers.py      # query_terms, normalization
 │   ├── search.py       # faiss_search wrapper
 │   ├── stages.py       # shortlist_papers, search_chunks_constrained
 │   └── lexical.py      # Modular lexical front-loading
-├── embeddings/         # (existing) Embedding models
-├── formatting/         # (existing) Answer formatting
-└── frontload/          # (existing) Chunk capping
+├── llm/                # LLM integration (~630 lines) ← NEW
+│   ├── errors.py       # Typed exceptions + helpers
+│   ├── types.py        # LLMConfig, LLMResponse, SessionState, Turn
+│   ├── prompts.py      # System prompts
+│   ├── provider.py     # LLMProvider protocol + implementations
+│   ├── qa.py           # pack_context, answer_question
+│   └── rewrite.py      # Query rewriting (stub)
+├── embeddings/         # Embedding models
+├── formatting/         # Answer formatting + citation normalization
+│   ├── answers.py      # Answer rendering
+│   └── citations.py    # Citation normalization
+└── frontload/          # Chunk capping
+```
+
+---
+
+## Unit Testing Requirements (NOT YET IMPLEMENTED)
+
+The refactored codebase has **no unit tests**. This is a critical gap that should be addressed.
+
+### Priority 1: LLM Module Tests
+
+| Module | Test Cases |
+|--------|------------|
+| `llm/errors.py` | `is_overflow_error()` with real exception strings from OpenAI/local endpoints |
+| `llm/qa.py` | `pack_context()` respects budget, returns partial results correctly |
+| `llm/qa.py` | `pack_context()` clamps `max_out_tokens` when >= budget |
+| `llm/qa.py` | `answer_question()` overflow retry trims chunks AND reduces `max_out` |
+| `llm/qa.py` | `answer_question()` returns `final_chunks_sent` matching actual context |
+| `llm/provider.py` | `AutoProvider` selects Responses for o3* models |
+| `llm/provider.py` | `OpenAIResponsesProvider` raises `EndpointNotSupportedError` on 404/405 |
+| `llm/rewrite.py` | `rewrite_query(mode="none")` is identity (passthrough) |
+
+### Priority 2: Build Module Tests
+
+| Module | Test Cases |
+|--------|------------|
+| `build/helpers.py` | `pack_paragraphs()` chunking with overlap |
+| `build/training.py` | `_effective_nlist()` data-aware caps |
+| `build/indices.py` | Index creation with correct types |
+| `build/backfill.py` | `reconcile_sqlite_flags_with_faiss()` finds desync |
+
+### Priority 3: Retrieval Module Tests
+
+| Module | Test Cases |
+|--------|------------|
+| `retrieval/lexical.py` | `find_rare_terms()` term extraction |
+| `retrieval/lexical.py` | `merge_lexical_and_ann()` interleaving |
+| `retrieval/stages.py` | `shortlist_papers()` returns valid paper IDs |
+
+### Priority 4: Formatting Tests
+
+| Module | Test Cases |
+|--------|------------|
+| `formatting/citations.py` | Fullwidth bracket normalization |
+| `formatting/citations.py` | `†Lx–Ly` tail removal |
+| `formatting/citations.py` | Edge cases: `[Figure 2]`, `[p < 0.05]`, nested brackets |
+
+### Test Infrastructure Needed
+
+1. **Create `tests/` structure:**
+   ```
+   tests/
+   ├── conftest.py          # Shared fixtures (mock LLM, test DB, etc.)
+   ├── test_llm/
+   │   ├── test_qa.py
+   │   ├── test_provider.py
+   │   └── test_errors.py
+   ├── test_build/
+   │   ├── test_helpers.py
+   │   └── test_training.py
+   ├── test_retrieval/
+   │   └── test_lexical.py
+   └── test_formatting/
+       └── test_citations.py
+   ```
+
+2. **Add pytest to dev dependencies** (already in pyproject.toml under `[project.optional-dependencies] dev`)
+
+3. **CI integration** (if desired):
+   - GitHub Actions or similar to run `pytest` on PR/push
+   - Coverage reporting with pytest-cov
+
+### Running Tests
+
+```bash
+# Install dev dependencies
+uv pip install -e ".[dev]"
+
+# Run tests
+pytest tests/ -v
+
+# With coverage
+pytest tests/ --cov=litkit --cov-report=html
 ```
