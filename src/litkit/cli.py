@@ -1541,7 +1541,7 @@ def pack_context(
 
 def answer_with_llm(
     question, chunks, model, base_url, api_key, max_out_tokens=None, *, sys_prompt: str = SYS_PROMPT
-):
+) -> tuple[str, list[dict]]:
     """Call an OpenAI-compatible endpoint to answer using ONLY the provided context.
 
     Policy:
@@ -1552,6 +1552,11 @@ def answer_with_llm(
     Overflow handling:
       - Detect a broader set of context/token-limit errors.
       - On each retry, trim chunks AND reduce max_out to actually free room.
+
+    Returns:
+        (answer_text, final_chunks_sent): The answer and the exact chunks that were
+        actually sent to the model (after any overflow trimming). Use final_chunks_sent
+        for citation normalization to avoid desync bugs.
     """
 
     def _clarify_llm_error(model: str, base_url: str, raw: str) -> str:
@@ -1667,7 +1672,7 @@ def answer_with_llm(
                             text = "".join(parts).strip() if parts else ""
                         except Exception:
                             text = ""
-                    return (text or "").strip()
+                    return (text or "").strip(), working_chunks
                 except Exception as ee:
                     # If the endpoint doesn't support Responses, surface a clear error.
                     msg = (str(ee) or "").lower()
@@ -1713,7 +1718,7 @@ def answer_with_llm(
                     max_tokens=max_out,
                 )
                 text = getattr(resp.choices[0].message, "content", "") or ""
-                return text.strip()
+                return text.strip(), working_chunks
 
         except Exception as e:
             # Overflow detection via message matching only (not exception type)
@@ -2570,7 +2575,9 @@ def main():
         _eprint(f"[context] packed ~{token_meta['approx_tokens']} tokens (budget={token_meta['budget']}, input_budget={token_meta['input_budget']})")
     selected_chunks = [chunks[i - 1] for i in used_idx]  # 0-based indexing
     try:
-        answer = answer_with_llm(
+        # answer_with_llm returns (answer_text, final_chunks_sent) to avoid citation desync
+        # when overflow retry trims chunks internally
+        answer, final_chunks = answer_with_llm(
             question=question,
             chunks=selected_chunks,  # pass only packed subset
             model=args.llm_model,
@@ -2584,12 +2591,15 @@ def main():
         # Fall back to printing context to unblock usage
         _eprint("\n[llm] Falling back to retrieval-only output.\n")
         answer = ""
+        final_chunks = selected_chunks  # fallback uses original selection
 
     if answer:
         # Normalize oddball citation shapes the model may emit
         answer = _strip_citation_linelocs(answer)
         # Collapse chunk-level citations to doc-level and render a clean bibliography
-        answer, doc_refs = d.normalize_answer_and_build_refs(answer, selected_chunks)
+        # CRITICAL: Use final_chunks (what was actually sent after any overflow trimming),
+        # not selected_chunks, to avoid citation/bibliography desync bugs.
+        answer, doc_refs = d.normalize_answer_and_build_refs(answer, final_chunks)
         print(answer)
         print()
         print(d.render_references(doc_refs))
