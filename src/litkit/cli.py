@@ -78,7 +78,7 @@ from typing import Iterator
 from types import SimpleNamespace
 
 from litkit.embeddings.base import (
-    _PROGRESS_LOCK as _PROGRESS_LOCK,  # reuse the shared lock
+    _PROGRESS_LOCK,  # reuse the shared lock
 )
 from litkit.embeddings.base import (
     Embedder,  # protocol for type hints
@@ -825,7 +825,9 @@ def iter_tar_articles(
     
     if use_parallel:
         # Parallel path for uncompressed tars
-        _eprint(f"[scan] using parallel XML parsing ({parse_workers} workers) for {tar_path.name}")
+        from litkit.progress import is_quiet
+        if not is_quiet():
+            _eprint(f"[scan] using parallel XML parsing ({parse_workers} workers) for {tar_path.name}")
         for member_meta, article_meta in parallel_iter_tar_articles(tar_path, workers=parse_workers):
             yield member_meta, article_meta
     else:
