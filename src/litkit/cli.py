@@ -2417,10 +2417,11 @@ def main():
 
     if args.reconcile_only:
         _require_faiss("reconcile-only mode")
+        d = deps()  # ensures loaded + returns namespace (consistent pattern)
         # Lazy import for reconcile-only path
         from litkit.index import faiss_load, faiss_save_force
         
-        conn = _deps.db_connect_db(DB_PATH)
+        conn = d.db_connect_db(DB_PATH)
         try:
             try:
                 paper_index = faiss_load(PAPER_INDEX_PATH)
@@ -2434,8 +2435,8 @@ def main():
             if p_reset or c_reset:
                 _eprint(f"[reconcile] reset flags — papers={p_reset} chunks={c_reset}")
             # backfill (uses current embedders)
-            paper_embedder, _ = _deps.make_paper_embedder()
-            chunk_embedder, _ = _deps.make_chunk_embedder(
+            paper_embedder, _ = d.make_paper_embedder()
+            chunk_embedder, _ = d.make_chunk_embedder(
                 devices=args.embed_devices,
                 workers=args.embed_workers,
                 force_devices=args.force_embed_devices,
@@ -2528,7 +2529,8 @@ def main():
         )
         return
 
-    conn = _deps.db_connect_db(DB_PATH)
+    d = deps()  # ensures loaded + returns namespace (consistent pattern)
+    conn = d.db_connect_db(DB_PATH)
     try:
         chunks = get_chunks(conn, chunk_ids)
     finally:
@@ -2586,10 +2588,10 @@ def main():
         # Normalize oddball citation shapes the model may emit
         answer = _strip_citation_linelocs(answer)
         # Collapse chunk-level citations to doc-level and render a clean bibliography
-        answer, doc_refs = _deps.normalize_answer_and_build_refs(answer, selected_chunks)
+        answer, doc_refs = d.normalize_answer_and_build_refs(answer, selected_chunks)
         print(answer)
         print()
-        print(_deps.render_references(doc_refs))
+        print(d.render_references(doc_refs))
         print()
     else:
         # No model output -> print the context
