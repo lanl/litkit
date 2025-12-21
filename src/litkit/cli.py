@@ -1957,6 +1957,12 @@ def main():
     seen_flags = {s.split("=", 1)[0] for s in sys.argv}
     args._ivf_nlist_forced = ("--ivf-nlist" in seen_flags)
 
+    # Honor --offline FIRST (before any heavy imports that touch transformers/HF)
+    # Transformers checks HF_HUB_OFFLINE at import time, so this MUST come before _load_heavy_deps()
+    if args.offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
     # Load heavy dependencies (idempotent - delegates to _load_heavy_deps())
     _load_heavy_deps()
     
@@ -1971,11 +1977,6 @@ def main():
     if not (args.quiet or _SUPPRESS_EARLY):
         _eprint(f"[version] {_version_banner()}")
         _eprint(f"[device] using {device}")
-
-    # Honor --offline explicitly (must be BEFORE get_runtime() so setup_environment sees it)
-    if args.offline:
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
     # Trigger lazy runtime initialization - populates path globals like WORKSPACE, DB_PATH, etc.
     # This must happen before any code that uses path globals (e.g., _vector_store_exists).
