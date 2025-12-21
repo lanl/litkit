@@ -1786,6 +1786,12 @@ def main():
         help="Wipe DB & indices; full rebuild (asks for confirmation in TTY)",
     )
     ap.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Force --rebuild even if unconsumed segments or active producers exist. "
+        "WARNING: This can cause data corruption if producers are still active.",
+    )
+    ap.add_argument(
         "-y",
         "--yes",
         action="store_true",
@@ -2158,6 +2164,40 @@ def main():
             "  • --init-indices-only creates empty FAISS indices.\n"
             "  • Only a writer can create/save FAISS index files."
         )
+
+    # Guard: --rebuild with unconsumed segments or active producers can corrupt data
+    # Check BEFORE writer guard so user sees this error first
+    if args.rebuild and not args.force_rebuild:
+        seg_dir = Path(args.embed_outdir) if args.embed_outdir else EMBED_SEGMENTS_DIR
+        conflict_reasons = []
+        
+        # Check for unconsumed segment files
+        if seg_has_segment_files(seg_dir):
+            conflict_reasons.append(f"Segment directory {seg_dir} contains unconsumed segment files")
+        
+        # Check for producer completion markers (indicates multi-node run)
+        coordinator = SegConsumerCoordinator(seg_dir, args.num_shards)
+        completed = coordinator.completed_shards()
+        if completed:
+            if len(completed) < args.num_shards:
+                conflict_reasons.append(
+                    f"Incomplete multi-node run: {len(completed)}/{args.num_shards} producer shards marked done"
+                )
+            else:
+                conflict_reasons.append(
+                    f"Unconsumed multi-node run: all {args.num_shards} producer shards done but not consumed"
+                )
+        
+        if conflict_reasons:
+            reasons_str = "\n  • ".join(conflict_reasons)
+            raise SystemExit(
+                f"[rebuild] BLOCKED: Active or unconsumed build detected:\n  • {reasons_str}\n\n"
+                "A rebuild would corrupt this in-progress or unconsumed build.\n"
+                "Options:\n"
+                "  • First consume pending segments: --faiss-writer --consume-only\n"
+                f"  • Or clean up manually: rm -rf {seg_dir}/*\n"
+                "  • Or force (DATA LOSS WARNING): --force-rebuild"
+            )
 
     _create_writer_guard_or_exit(args)
 
