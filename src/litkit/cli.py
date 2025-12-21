@@ -2127,16 +2127,22 @@ def main():
             conflict_reasons.append(f"Segment directory {seg_dir} contains unconsumed segment files")
         
         # Check for producer completion markers (indicates multi-node run)
-        coordinator = SegConsumerCoordinator(seg_dir, args.num_shards)
+        # Use shard count from build_meta.json (if exists) to correctly interpret markers.
+        # Without this, CLI --num-shards can mismatch the actual build config and cause
+        # misdiagnosis (e.g., "3/4 incomplete" when the build was actually 3-shard and complete).
+        meta = seg_read_build_meta(seg_dir)
+        effective_num_shards = meta.get("num_shards", args.num_shards) if meta else args.num_shards
+        
+        coordinator = SegConsumerCoordinator(seg_dir, effective_num_shards)
         completed = coordinator.completed_shards()
         if completed:
-            if len(completed) < args.num_shards:
+            if len(completed) < effective_num_shards:
                 conflict_reasons.append(
-                    f"Prior multi-node run (incomplete): {len(completed)}/{args.num_shards} producer shards marked done"
+                    f"Prior multi-node run (incomplete): {len(completed)}/{effective_num_shards} producer shards marked done"
                 )
             else:
                 conflict_reasons.append(
-                    f"Prior multi-node run (not consumed): all {args.num_shards} producer shards done"
+                    f"Prior multi-node run (not consumed): all {effective_num_shards} producer shards done"
                 )
         
         if conflict_reasons:
