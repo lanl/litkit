@@ -1186,6 +1186,167 @@ Continue with Phase 6.2e:
 
 ---
 
+---
+
+## Work Completed 2024-12-20 (Session 2)
+
+### Phase 6.2e: Extract Retrieval Module + Modular Lexical (COMPLETE)
+
+Created the `litkit/retrieval/` module package with modular lexical front-loading.
+
+#### Created litkit/retrieval/lexical.py (~290 lines)
+
+**Commit `7aa8a25`:** `refactor(retrieval): add modular lexical front-loading module`
+
+Design following user requirements:
+
+**LexicalConfig** - narrow, stable configuration:
+```python
+@dataclass
+class LexicalConfig:
+    enabled: bool = True
+    cap: int | None = None          # None => caller computes from k
+    limit: int = 200                # SQL LIMIT
+    allow_global: bool = False      # "force global" override
+    min_term_length: int = 9        # long-term fallback threshold
+    max_terms: int = 8              # cap # of rare terms
+    require_rare_terms: bool = True # if False, allow long-only matches
+```
+
+**LexicalResult** - scoring-ready for future BM25:
+```python
+@dataclass
+class LexicalResult:
+    chunk_ids: list[int]           # score-descending order
+    scores: dict[int, float]       # chunk_id -> score (1.0 for now)
+    terms_used: list[str]          # diagnostic: what matched
+    scope: str                     # "candidates" | "global"
+```
+
+**LexicalBackend** - protocol for swappable backends:
+```python
+class LexicalBackend(Protocol):
+    def search(self, terms, candidate_papers, config) -> LexicalResult: ...
+```
+
+**Functions:**
+- `find_rare_terms(question, config)` - pure function, no DB deps
+- `SqliteLexicalBackend` - default LIKE-based implementation
+- `lexical_search(terms, config, backend, ...)` - main entry point
+- `merge_lexical_and_ann(lexical, ann_ranked, k, cap)` - interleave results
+
+Future-proofing:
+- `scores` dict ready for BM25-ish ranking
+- Backend protocol enables FTS5/Tantivy swap
+- Config is narrow; caller decides orchestration
+
+#### Refactored stages.py to Use Lexical Module
+
+**Commit `2e34bdc`:** `refactor(retrieval): use lexical module in search_chunks_constrained`
+
+Replaced ~90 lines of inline lexical SQL with:
+```python
+lexical_config = LexicalConfig(
+    enabled=not DISABLE_LEXICAL,
+    cap=lexical_cap,
+    limit=lexical_limit,
+    allow_global=force_global,
+)
+rare_terms = find_rare_terms(question, lexical_config)
+backend = SqliteLexicalBackend(db_conn, load_temp_candidates)
+lexical_result = backend.search(rare_terms, candidate_scope, lexical_config)
+out = merge_lexical_and_ann(lexical_result, ranked, k, LEX_CAP)
+```
+
+stages.py: ~340 → ~270 lines (inline lexical SQL removed)
+
+#### Earlier Today: Wire shortlist_papers
+
+**Commit `4088ada`:** `refactor(cli): wire shortlist_papers to module function`
+
+cli.py `shortlist_papers` now delegates to module:
+```python
+def shortlist_papers(...):
+    get_runtime()
+    enc = embedder or make_paper_embedder()[0]
+    return retrieval_shortlist_papers(
+        question, k,
+        paper_index_path=PAPER_INDEX_PATH,
+        embedder=enc,
+        efsearch=efsearch,
+    )
+```
+
+### Updated Module Structure
+
+```
+src/litkit/retrieval/
+├── __init__.py      # Re-exports (17 items)
+├── helpers.py       # query_terms, normalization (~160 lines)
+├── search.py        # faiss_search wrapper (~100 lines)
+├── stages.py        # shortlist_papers, search_chunks_constrained (~270 lines)
+└── lexical.py       # Modular lexical front-loading (~290 lines) ← NEW
+```
+
+### Session Summary
+
+| Commit | Description |
+|--------|-------------|
+| `d691616` | Create retrieval module |
+| `917737e` | Add retrieval imports to cli.py |
+| `4088ada` | Wire shortlist_papers to module |
+| `7aa8a25` | Add modular lexical front-loading module |
+| `2e34bdc` | Use lexical module in stages.py |
+
+### Remaining cli.py Inline Code
+
+The following retrieval functions still have inline implementations in cli.py
+(module versions exist but wiring deferred):
+
+- `search_chunks_constrained` (~200 lines) - complex, uses globals
+- `get_chunks` (~30 lines)
+- Inline helpers: `_query_terms`, `_escape_like`, `_normalize_for_search_py`, `_sqlite_norm_expr`
+
+Estimated ~250-300 lines removable when fully wired.
+
+---
+
 ## Current Status
 
-**cli.py is now 3194 lines** (down from ~4723 at start of 2024-12-18 session, **~1529 lines / 32% reduction**)
+**cli.py is now 3200 lines** (down from ~4723 at start of 2024-12-18 session, **~1523 lines / 32% reduction**)
+
+### Summary of All Reductions
+
+| Phase | Description | Lines Removed |
+|-------|-------------|---------------|
+| 2024-12-18 | FAISS, Progress, FileLock, Runtime extraction | ~664 |
+| 2024-12-18 | Dead code removal (_ingest_*, _add_ids_union_compat) | ~374 |
+| 2024-12-19 | Bug fixes + minor cleanup | ~23 |
+| 2024-12-19 | Phase 6.1 helpers + backfill extraction | ~127 |
+| 2024-12-19 | Phase 6.2a-b (BuildConfig, init_empty_indices) | ~43 |
+| 2024-12-19 | Phase 6.2c (run_consume_only_mode) | ~42 |
+| 2024-12-19 | Phase 6.2d (index load + IVF-PQ training) | ~287 |
+| **2024-12-20** | **Phase 6.2e (retrieval + lexical module)** | **Module created, wiring in progress** |
+
+### New Module Lines Created
+
+| Module | Lines | Purpose |
+|--------|-------|---------|
+| litkit/build/ | ~1480 | Build pipeline orchestration |
+| litkit/retrieval/ | ~820 | RAG retrieval + lexical |
+
+### What Should Stay in cli.py
+
+- Argparse (~300 lines)
+- `main()` orchestration (~150 lines)
+- Version/path reporting (~50 lines)
+- Writer guard logic (~80 lines)
+- Signal handlers (~30 lines)
+- LLM code (~200 lines) - diminishing returns
+
+### Next Steps
+
+1. **Wire search_chunks_constrained** - Replace 200-line inline version
+2. **Remove dead inline helpers** - ~50 lines
+3. **Optional: Extract LLM** - ~200 lines (low priority)
+4. **Git tag** - "retrieval-modularized" milestone
