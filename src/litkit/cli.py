@@ -327,7 +327,7 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
                     if not is_live:
                         _eprint(f"[writer] Guard appears stale (> {ttl_sec}s, process dead): {info}. Attempting exclusive cleanup.")
                         try:
-                            stale = WRITER_GUARD.with_suffix(".guard.stale."+str(os.getpid()))
+                            stale = WRITER_GUARD.with_name(f"{WRITER_GUARD.name}.stale.{os.getpid()}")
                             # Atomic claim: if this replace fails, someone else is cleaning.
                             os.replace(WRITER_GUARD, stale)
                             stale.unlink(missing_ok=False)
