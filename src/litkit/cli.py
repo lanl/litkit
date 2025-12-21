@@ -385,6 +385,18 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
             atexit.register(_cleanup_guard)
             try:
                 if threading.current_thread() is threading.main_thread():
+                    # ═══════════════════════════════════════════════════════════════
+                    # SIGNAL HANDLER SCOPE: ENTIRE WRITER SESSION
+                    # ═══════════════════════════════════════════════════════════════
+                    # This handler is installed for the ENTIRE --faiss-writer session,
+                    # not just critical regions. Any SIGINT/SIGTERM during writer mode
+                    # will hard-exit and rely on reconcile+backfill to repair partial
+                    # state on next startup. This is intentional and documented.
+                    #
+                    # Non-writer roles (--embed-producer, query-only) do NOT get this
+                    # handler - they use normal Python shutdown.
+                    # ═══════════════════════════════════════════════════════════════
+                    
                     # HARD KILL on SIGINT/SIGTERM: clean up guard file, then os._exit(1).
                     #
                     # WHY os._exit(1) instead of sys.exit():
