@@ -235,7 +235,19 @@ def _load_heavy_deps() -> None:
         # Probe optional third-party dependencies
         faiss_available = _probe_faiss()
         
-        # Consolidate into deps namespace
+        # Reserved keys that _load_heavy_deps() sets explicitly (not from modules)
+        # If modules ever exports a conflicting name, we fail fast rather than
+        # silently overriding with zero warning.
+        reserved_keys = frozenset({"faiss_available"})
+        module_keys = set(vars(modules).keys())
+        collisions = reserved_keys & module_keys
+        if collisions:
+            raise RuntimeError(
+                f"_load_internal_modules() exported reserved key(s): {collisions}. "
+                "Rename in the module to avoid namespace collision with _load_heavy_deps()."
+            )
+        
+        # Consolidate into deps namespace (collision-safe after check above)
         _deps = SimpleNamespace(
             faiss_available=faiss_available,
             **vars(modules),  # Merge all module exports
