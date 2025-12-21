@@ -35,6 +35,9 @@ uv pip install -e . --no-deps
 # With full log output
 ./test_build.sh --clean --verbose
 
+# Submit a prompt to the local LM Studio endpoint
+litkit @workspace/question.txt --llm-model openai/gpt-oss-20b --openai-base-url http://localhost:1234/v1
+
 
 # --- VERIFY INSTALLATION ---
 
