@@ -216,18 +216,6 @@ from litkit.segments import (
 # logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
 
-def _effective_nlist(n_train: int, requested_nlist: int, min_nlist: int = 16, *, user_forced: bool=False) -> int:
-    if n_train <= 0:
-        return 0
-    
-    cap_by_data = min(requested_nlist, n_train)
-    cap_by_heuristic = min(n_train, max(1, int(4 * math.sqrt(n_train))))
-    dynamic_floor = 128 if (n_train >= 100_000 and not user_forced) else min_nlist
-    floor = min(n_train, max(1, dynamic_floor))
-    
-    return max(floor, min(cap_by_data, cap_by_heuristic))
-
-
 def _maybe_cleanup_own_stale_guard():
     """Best-effort cleanup of a guard file left by THIS process.
     
@@ -677,17 +665,6 @@ _last_save_ts = {"papers": 0.0, "chunks": 0.0}
 
 
 
-def _clear_chunk_trained_flag():
-    try:
-        CHUNK_TRAINED_FLAG.unlink()
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        _eprint(f"[train] WARNING: could not remove {CHUNK_TRAINED_FLAG}: {e}")
-
-
-
-
 # -------------------- Embedding segment I/O (producer↔writer) --------------------
 
 def backfill_unindexed_vectors(
@@ -727,87 +704,6 @@ def _post_build_sanity_check(conn, args):
     )
 
 
-_STOPWORDS = {
-    "the",
-    "and",
-    "for",
-    "with",
-    "that",
-    "this",
-    "from",
-    "into",
-    "your",
-    "about",
-    "does",
-    "what",
-    "when",
-    "where",
-    "which",
-    "who",
-    "whom",
-    "whose",
-    "why",
-    "how",
-    "are",
-    "is",
-    "was",
-    "were",
-    "be",
-    "been",
-    "being",
-    "of",
-    "on",
-    "in",
-    "to",
-    "a",
-    "an",
-    "as",
-    "by",
-    "at",
-    "it",
-    "its",
-    "their",
-    "them",
-    "we",
-    "you",
-    "i",
-}
-
-# optional kill-switch for lexical prefilter on very large DBs
-DISABLE_LEXICAL = os.environ.get("LITKIT_NO_LEXICAL", "0") == "1"
-
-# one-shot guard for noisy sqlite3.OperationalError logging in lexical prefilter
-_LEXICAL_WARN_ONCE = False
-
-
-def _query_terms(s: str) -> list[str]:
-    # extract alnum/underscore/dash tokens, lowercase, drop short/common words
-    words = re.findall(r"[A-Za-z0-9_-]{3,}", s.lower())
-    # keep “rare-ish” tokens (>=5 chars OR has digits OR camel-ish separator)
-    out = []
-    for w in words:
-        if w in _STOPWORDS:
-            continue
-        if (
-            len(w) >= 5
-            or (w.isupper() and len(w) >= 3)
-            or any(ch.isdigit() for ch in w)
-            or "_" in w
-            or "-" in w
-        ):
-            out.append(w)
-    # de-dup preserve order
-    seen = set()
-    uniq = []
-    for w in out:
-        if w not in seen:
-            seen.add(w)
-            uniq.append(w)
-    return uniq
-
-
-
-
 def _auto_top_papers() -> int:
     """Heuristic for Stage-1 shortlist size based on corpus size."""
     get_runtime()  # ensure path globals are initialized for library use
@@ -831,56 +727,6 @@ def _auto_top_papers() -> int:
     finally:
         if conn is not None:
             conn.close()
-
-
-def _sqlite_norm_expr(field: str = "text") -> str:
-    """Build a SQL expression that normalizes common unicode variants so LIKE patterns match:
-    - Map hyphen/minus variants to ASCII '-'
-    - Map subscript digits to ASCII digits
-    - Lowercase
-    """
-    f = f"lower({field})"
-    # hyphen/minus variants: U+2010..U+2014, U+2212, plus soft hyphen U+00AD (strip)
-    for ch, repl in [
-        ("\u00ad", ""),
-        ("\u2010", "-"),
-        ("\u2011", "-"),
-        ("\u2012", "-"),
-        ("\u2013", "-"),
-        ("\u2014", "-"),
-        ("\u2212", "-"),
-    ]:
-        f = f"replace({f}, '{ch}', '{repl}')"
-    # subscript digits → ASCII
-    subs = "₀₁₂₃₄₅₆₇₈₉"
-    for d_sub, d in zip(subs, "0123456789", strict=False):
-        f = f"replace({f}, '{d_sub}', '{d}')"
-    return f
-
-
-def _escape_like(s: str, esc: str = "\\") -> str:
-    # Order matters: escape the escape char first, then the wildcards.
-    s = s.replace(esc, esc + esc)
-    s = s.replace("%", esc + "%")
-    s = s.replace("_", esc + "_")
-    return s
-
-
-def _normalize_for_search_py(s: str) -> str:
-    # Keep SQL ↔ Python normalization identical: SQLite LOWER() ≈ Python .lower()
-    s = unicodedata.normalize("NFKC", s).lower()
-    for ch, repl in [
-        ("\u00ad", ""),
-        ("\u2010", "-"),
-        ("\u2011", "-"),
-        ("\u2012", "-"),
-        ("\u2013", "-"),
-        ("\u2014", "-"),
-        ("\u2212", "-"),
-    ]:
-        s = s.replace(ch, repl)
-    trans = str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789")
-    return s.translate(trans)
 
 
 # NOTE: load_checkpoint and save_checkpoint moved to litkit.segments.checkpoint
@@ -1757,54 +1603,6 @@ def reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index) -> tuple[i
 
 
 
-@contextmanager
-def _temporary_search_params(kind, core, *, efSearch=None, nprobe=None):
-    saved = {}
-    try:
-        if kind == "hnsw" and hasattr(core, "hnsw"):
-            if efSearch is not None:
-                saved["efSearch"] = int(core.hnsw.efSearch)
-                core.hnsw.efSearch = int(efSearch)
-        elif kind == "ivf":
-            if nprobe is not None and hasattr(core, "nprobe"):
-                saved["nprobe"] = int(core.nprobe)
-                core.nprobe = int(nprobe)
-        yield
-    finally:
-        try:
-            if kind == "hnsw" and "efSearch" in saved:
-                core.hnsw.efSearch = saved["efSearch"]
-            elif kind == "ivf" and "nprobe" in saved:
-                core.nprobe = saved["nprobe"]
-        except Exception:
-            pass
-
-
-def _faiss_search(index_path: Path, qvec: np.ndarray, k: int, **kwargs):
-    index = faiss_load_cached(index_path)
-    kind, core = kind_and_core(index)
-    info = {}
-
-    if kind == "hnsw":
-        ef = int(kwargs.get("efSearch") or 128)
-        info["efSearch"] = ef
-        ctx = _temporary_search_params(kind, core, efSearch=ef)
-    elif kind == "ivf":
-        target = pick_nprobe(int(core.nlist), kwargs.get("nprobe", None))
-        info["nprobe"] = target
-        info["nlist"] = int(core.nlist)
-        ctx = _temporary_search_params(kind, core, nprobe=target)
-    else:
-        ctx = nullcontext()
-
-    with ctx:
-        D, indices = index.search(qvec.astype("float32"), k)
-
-    ids = [int(x) for x in indices[0] if x != -1]
-    ds  = [float(d) for (d, x) in zip(D[0], indices[0], strict=False) if x != -1]
-    return ids, ds, info
-
-
 def shortlist_papers(
     question: str,
     k: int,
@@ -1894,27 +1692,6 @@ def get_chunks(conn, ids: list[int]) -> list[dict[str, str]]:
             }
         )
     return out
-
-
-def _avg_chunks_for_papers(pids: list[int]) -> float:
-    """Average number of chunks across the requested paper ids (zeros included)."""
-    if not pids:
-        return 0.0
-    conn = db_connect_db(DB_PATH)
-    try:
-        db_load_temp_candidates(conn, pids)
-        rows = conn.execute(
-            """
-            SELECT cp.id, COUNT(c.id)
-            FROM cand_papers cp
-            LEFT JOIN chunks c ON c.paper_id = cp.id
-            GROUP BY cp.id
-        """
-        ).fetchall()
-        # rows length equals len(pids), with zero-count rows for papers with no chunks
-        return 0.0 if not rows else (sum(n for _, n in rows) / float(len(pids)))
-    finally:
-        conn.close()
 
 
 # -------------------- LLM + token-budgeting --------------------
