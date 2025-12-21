@@ -657,7 +657,8 @@ def _confirm_rebuild(conn) -> None:
     _eprint(f"  • Clear SQLite tables in: {DB_PATH}")
     _eprint(f"  • Remove checkpoint: {CKPT_PATH} [{ckpt_sz}]")
     _eprint(f"  • {counts}")
-    # resp = input("\nType 'yes' to continue (anything else aborts): ").strip().lower()
+    # Note: _eprint (litkit.progress.eprint) supports end= in its signature:
+    # def eprint(msg: str = "", *, end: str = "\n") -> None
     _eprint("\nType 'yes' to continue (anything else aborts): ", end="")
     resp = input().strip().lower()
     if resp not in ("y", "yes"):
