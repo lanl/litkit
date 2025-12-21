@@ -2132,18 +2132,18 @@ def main():
         if completed:
             if len(completed) < args.num_shards:
                 conflict_reasons.append(
-                    f"Incomplete multi-node run: {len(completed)}/{args.num_shards} producer shards marked done"
+                    f"Prior multi-node run (incomplete): {len(completed)}/{args.num_shards} producer shards marked done"
                 )
             else:
                 conflict_reasons.append(
-                    f"Unconsumed multi-node run: all {args.num_shards} producer shards done but not consumed"
+                    f"Prior multi-node run (not consumed): all {args.num_shards} producer shards done"
                 )
         
         if conflict_reasons:
             reasons_str = "\n  • ".join(conflict_reasons)
             raise SystemExit(
-                f"[rebuild] BLOCKED: Active or unconsumed build detected:\n  • {reasons_str}\n\n"
-                "A rebuild would corrupt this in-progress or unconsumed build.\n"
+                f"[rebuild] BLOCKED: Unconsumed multi-node artifacts detected:\n  • {reasons_str}\n\n"
+                "A rebuild would discard these pending segments/markers.\n"
                 "Options:\n"
                 "  • First consume pending segments: --faiss-writer --consume-only\n"
                 f"  • Or clean up manually: rm -rf {seg_dir}/*\n"
