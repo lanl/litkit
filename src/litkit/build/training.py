@@ -147,9 +147,10 @@ def train_ivfpq_index(
     samples_collected = 0
     _phase("IVF-PQ: learn IVF centroids and PQ codebooks")
     samples_prog = _Progress(
-        f"Current number of embeddings of randomly selected text chunks (desired number of vectors={train_samples})",
+        f"Collecting training vectors (target={train_samples})",
         total=train_samples,
         emit_final_line=False,
+        force_append=True,  # Use newlines so log scrollback captures all updates
     )
     
     def _flush_train(buf: list[str]) -> np.ndarray:
@@ -158,9 +159,12 @@ def train_ivfpq_index(
         if not buf:
             return np.zeros((0, chunk_dim), dtype="float32")
         
+        # Suppress inner batch progress (progress_label=None) to avoid
+        # overwriting the outer samples_prog line when multiple progress
+        # writers compete on the same terminal line.
         X = chunk_embedder.encode(
             buf,
-            progress_label=f"Generating a batch of embeddings for use in IVF-PQ training (batch size is {len(buf)})",
+            progress_label=None,
             batch_size=chunk_embed_bs,
             progress_done_summary=False,
         )
