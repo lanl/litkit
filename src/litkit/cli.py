@@ -1307,32 +1307,38 @@ def build_or_update_indices(args):
                         raise  # Fail fast; scheduler will restart from last checkpoint
 
                 elif args.faiss_writer:
-                    Xp = paper_embedder.encode(
-                        u_texts,
-                        progress_label=f"Embedding papers (batch of {len(u_texts)})",
-                        batch_size=args.paper_embed_bs,
-                        progress_done_summary=False,
-                    )
-                    # mutate & save FAISS without holding DB_LOCK
-                    prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
-                    sel = make_id_selector(u_ids)
-                    with FileLock(FAISS_LOCK):
-                        safe_remove_ids(paper_index, sel)
-                        added, ids_added = add_with_ids_dedup(paper_index, u_ids, Xp)
-                        saved = False
+                    # Writer mode: embed and update FAISS with fail-fast behavior
+                    try:
+                        Xp = paper_embedder.encode(
+                            u_texts,
+                            progress_label=f"Embedding papers (batch of {len(u_texts)})",
+                            batch_size=args.paper_embed_bs,
+                            progress_done_summary=False,
+                        )
+                        # mutate & save FAISS without holding DB_LOCK
+                        prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
+                        sel = make_id_selector(u_ids)
+                        with FileLock(FAISS_LOCK):
+                            safe_remove_ids(paper_index, sel)
+                            added, ids_added = add_with_ids_dedup(paper_index, u_ids, Xp)
+                            saved = False
+                            if added:
+                                if prior_ntotal == 0:
+                                    saved = faiss_save_force(paper_index, PAPER_INDEX_PATH)
+                                else:
+                                    saved = faiss_save(paper_index, PAPER_INDEX_PATH)
                         if added:
-                            if prior_ntotal == 0:
-                                saved = faiss_save_force(paper_index, PAPER_INDEX_PATH)
-                            else:
-                                saved = faiss_save(paper_index, PAPER_INDEX_PATH)
-                    if added:
-                        if saved:
-                            with FileLock(DB_LOCK):
-                                db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
-                                db_flush_pending_marks(cur)
-                                conn.commit()
-                        # else: save failed, reconcile_sqlite_flags_with_faiss() will fix
-                    papers_added_total += int(added) 
+                            if saved:
+                                with FileLock(DB_LOCK):
+                                    db_mark_in_index(cur, "papers", [int(i) for i in ids_added])
+                                    db_flush_pending_marks(cur)
+                                    conn.commit()
+                            # else: save failed, reconcile_sqlite_flags_with_faiss() will fix
+                        papers_added_total += int(added)
+                    except Exception as e:
+                        conn.rollback()
+                        _eprint(f"[flush] FATAL: paper FAISS flush failed: {e.__class__.__name__}: {e}")
+                        raise  # Fail fast; restart will reconcile+backfill
 
                 else:
                     conn.commit()
@@ -1374,33 +1380,39 @@ def build_or_update_indices(args):
                         raise  # Fail fast; scheduler will restart from last checkpoint
 
                 elif args.faiss_writer:
-                    Xc = chunk_embedder.encode(
-                        u_texts,
-                        progress_label=f"Embedding chunks (batch of {len(u_texts)})",
-                        batch_size=args.chunk_embed_bs,
-                        progress_done_summary=False,
-                    )
-                    # mutate & save FAISS without holding DB_LOCK
-                    prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
-                    sel = make_id_selector(u_ids)
-                    with FileLock(FAISS_LOCK):
-                        safe_remove_ids(chunk_index, sel)
-                        added, ids_added = add_with_ids_dedup(chunk_index, u_ids, Xc)
-                        saved = False
+                    # Writer mode: embed and update FAISS with fail-fast behavior
+                    try:
+                        Xc = chunk_embedder.encode(
+                            u_texts,
+                            progress_label=f"Embedding chunks (batch of {len(u_texts)})",
+                            batch_size=args.chunk_embed_bs,
+                            progress_done_summary=False,
+                        )
+                        # mutate & save FAISS without holding DB_LOCK
+                        prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
+                        sel = make_id_selector(u_ids)
+                        with FileLock(FAISS_LOCK):
+                            safe_remove_ids(chunk_index, sel)
+                            added, ids_added = add_with_ids_dedup(chunk_index, u_ids, Xc)
+                            saved = False
+                            if added:
+                                if prior_ntotal == 0:
+                                    saved = faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+                                else:
+                                    saved = faiss_save(chunk_index, CHUNK_INDEX_PATH)
                         if added:
-                            if prior_ntotal == 0:
-                                saved = faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
-                            else:
-                                saved = faiss_save(chunk_index, CHUNK_INDEX_PATH)
-                    if added:
-                        if saved:
-                            with FileLock(DB_LOCK):
-                                db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
-                                db_flush_pending_marks(cur)
-                                conn.commit()
-                        # else: save failed, reconcile_sqlite_flags_with_faiss() will fix
+                            if saved:
+                                with FileLock(DB_LOCK):
+                                    db_mark_in_index(cur, "chunks", [int(i) for i in ids_added])
+                                    db_flush_pending_marks(cur)
+                                    conn.commit()
+                            # else: save failed, reconcile_sqlite_flags_with_faiss() will fix
 
-                    chunks_added_total += int(added)
+                        chunks_added_total += int(added)
+                    except Exception as e:
+                        conn.rollback()
+                        _eprint(f"[flush] FATAL: chunk FAISS flush failed: {e.__class__.__name__}: {e}")
+                        raise  # Fail fast; restart will reconcile+backfill
 
                 else:
                     conn.commit()
