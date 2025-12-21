@@ -481,6 +481,127 @@ lfs setstripe -c -1 -S 4M /path/to/tar_shards/
 # Then copy/download tars fresh
 ```
 
+## Developer Guide: Known Limitations & Deferred Issues
+
+These issues were identified during code review but deferred to future work. They are
+documented here for transparency and to guide future improvements.
+
+### 1. Unparsable XML Permanently Skipped
+
+**Current behavior:** When XML parsing fails (`meta is None`), the member is marked as
+`handled_ok = True` and `processed_count` advances. The checkpoint permanently skips that
+member on future runs.
+
+**Risk:** If parsing was transiently flaky (I/O error, lxml edge case fixed in a later
+version), you've encoded data loss into the checkpoint.
+
+**Future improvement:** Distinguish "definitively bad" vs "transient failure":
+- For definitively bad: record a skip marker in DB (or skiplist file) with reason/hash/mtime
+- For transient: either don't advance checkpoint, or record "bad parse" with a version stamp
+  so future versions can optionally reattempt
+
+```python
+# Proposed skip tracking (future work)
+def record_skip(cur, path: str, reason: str, xml_hash: str):
+    cur.execute(
+        "INSERT OR REPLACE INTO skipped_files(path, reason, hash, ts) VALUES (?,?,?,?)",
+        (path, reason, xml_hash, int(time.time()))
+    )
+```
+
+### 2. Writer Guard Identity Verification
+
+**Current behavior:** The writer guard file contains `PID hostname timestamp`. On stale
+detection, we check if the PID is alive on the same host via `os.kill(pid, 0)`.
+
+**Risk:** PID reuse is rare but real on HPC nodes. If a process dies and another process
+gets the same PID, we could either:
+- Falsely evict a live writer (if the new process is unrelated)
+- Refuse to evict a dead writer (if we misidentify it as alive)
+
+**Future improvement:** Store stronger identity in the guard file:
+```python
+# Proposed guard format (future work)
+guard_content = {
+    "pid": os.getpid(),
+    "hostname": socket.gethostname(),
+    "timestamp": time.time(),
+    "nonce": secrets.token_hex(16),
+    "cmdline": " ".join(sys.argv),
+}
+```
+
+Then require matching nonce for same-host eviction, or `--force-evict-guard` for manual
+override.
+
+### 3. Segment File Claiming (`.ingesting` Overwrite Risk)
+
+**Current behavior:** Segment ingestion claims files by renaming `file.npz` to
+`file.npz.ingesting`. If `.ingesting` already exists (e.g., from a crashed run), 
+`os.replace()` will overwrite it.
+
+**Risk:** Could drop an un-ingested segment if two processes race or a previous crash
+left a file behind.
+
+**Future improvement:** Use unique claim names with PID and hostname:
+```python
+# Proposed unique claiming (future work)
+claim_name = f"{p.name}.ingesting.{socket.gethostname()}.{os.getpid()}"
+tmp = p.parent / claim_name
+try:
+    os.link(p, tmp)  # Hard link = atomic claim
+    os.unlink(p)     # Remove original only after claim
+except FileExistsError:
+    continue  # Another process already claimed
+```
+
+### 4. Signal Handlers Use `os._exit(1)`
+
+**Current behavior:** SIGINT/SIGTERM handlers call `os._exit(1)` after cleaning up the
+writer guard file. This bypasses Python's normal shutdown sequence.
+
+**Implications:**
+- SQLite cleanup and in-flight filesystem buffering may be skipped
+- FAISS indices may have unflushed data
+- Recovery relies on reconcile+backfill on restart
+
+**Design rationale:** This is intentional to avoid deadlocks and ensure the guard file is
+always cleaned up, even if the process is in a bad state. The tradeoff is accepted because:
+- Producer mode: segments are durable (flushed before checkpoint)
+- Writer mode: reconcile+backfill repairs any missing vectors
+- Guard cleanup is critical to avoid blocking future runs
+
+**Future improvement (optional):** Implement graceful shutdown:
+```python
+# Proposed graceful shutdown (future work)
+_shutdown_requested = threading.Event()
+
+def handle_signal(signum, frame):
+    _shutdown_requested.set()  # Signal main loop to stop
+    # Main loop checks _shutdown_requested and exits cleanly
+
+# In main loop:
+if _shutdown_requested.is_set():
+    flush_remaining_buffers()
+    save_indices()
+    cleanup_guard()
+    sys.exit(0)
+```
+
+### 5. Preloaded ID Maps Scalability
+
+**Current behavior:** Segment ingestion preloads `paper_id_map` and `chunk_id_map` into
+memory for O(1) lookups during doc_id resolution.
+
+**Risk:** On very large corpora (tens of millions of chunks), the chunk_id_map could
+consume significant RAM and cause slow startup.
+
+**Future improvement:** Use batched lookups or on-disk index:
+- Only preload mappings for doc_ids encountered in the current segment batch
+- Or use SQLite index + batched queries instead of full preload
+
+---
+
 ## License
 
 Proprietary — LANL
