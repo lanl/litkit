@@ -600,6 +600,33 @@ consume significant RAM and cause slow startup.
 - Only preload mappings for doc_ids encountered in the current segment batch
 - Or use SQLite index + batched queries instead of full preload
 
+### 6. Producer Mode: Duplicate Segments on Crash
+
+**Current behavior:** Producer nodes write embedding segments, then commit DB rows, then
+update the checkpoint. A crash between segment write and checkpoint update causes the
+producer to reprocess the same batch on restart, generating duplicate segment files.
+
+**Failure window:**
+```
+1. segment.npz written to disk (durable)
+2. CRASH HERE
+3. checkpoint not updated
+4. On restart: same data re-embedded → new segment file with same content
+```
+
+**Impact:**
+- NOT data loss: consumer ingestion is idempotent on `(paper_doc_id)` / `(paper_doc_id, ord)` keys
+- Consumer skips vectors already in FAISS (checks `in_index=1` before adding)
+- Only cost: storage bloat from orphan segment files
+
+**Why this is acceptable:**
+- HPC batch workflows: re-runs are cheap, storage is abundant
+- Consumer correctness is preserved by content-addressed idempotent ingestion
+- Adding true 2PC or deduplication would significantly complicate the codebase
+
+**Mitigation (manual):** After a known crash, manually remove duplicate `.npz` files from
+the segment directory before consumer ingestion, or just accept the storage overhead.
+
 ---
 
 ## License

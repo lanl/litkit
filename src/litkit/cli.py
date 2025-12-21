@@ -1373,6 +1373,13 @@ def build_or_update_indices(args):
 
                 if paper_seg_writer is not None:
                     # Producer mode: embed and write segments with fail-fast behavior
+                    #
+                    # KNOWN LIMITATION (segment durability window):
+                    # Crash between segment write and checkpoint update can cause
+                    # duplicate segments on restart (same data re-embedded to new files).
+                    # This is NOT data loss - consumer ingestion is idempotent on
+                    # (paper_doc_id) / (paper_doc_id, ord) keys. Only storage bloat occurs.
+                    # Accepted tradeoff for HPC batch workflows where re-runs are cheap.
                     try:
                         Xp = paper_embedder.encode(
                             u_texts,
