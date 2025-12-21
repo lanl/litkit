@@ -308,10 +308,13 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
                     # 3. Guard cleanup is CRITICAL: leftover guard blocks ALL future runs
                     #
                     # WHY this is SAFE despite bypassing normal shutdown:
-                    # 1. reconcile_sqlite_flags_with_faiss() runs on EVERY faiss_writer start
-                    # 2. backfill_unindexed_vectors() re-embeds any missing vectors
-                    # 3. Producer mode: segments are durable (written before checkpoint advance)
-                    # 4. Writer mode: FAISS saves are checkpointed; partial batches are re-embedded
+                    # 1. FAISS saves are ATOMIC (see litkit/index/io.py):
+                    #    - write to .tmp, fsync, os.replace, fsync dir
+                    #    - index file is either fully old or fully new, never corrupt
+                    # 2. reconcile_sqlite_flags_with_faiss() runs on EVERY faiss_writer start
+                    # 3. backfill_unindexed_vectors() re-embeds any missing vectors
+                    # 4. Producer mode: segments are durable (written before checkpoint advance)
+                    # 5. Writer mode: FAISS saves are checkpointed; partial batches are re-embedded
                     #
                     # The invariant: reconcile+backfill ALWAYS runs before any new work.
                     # See build_or_update_indices() near the faiss_writer block.

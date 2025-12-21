@@ -56,9 +56,20 @@ def _assert_faiss_locked() -> None:
 def faiss_save(index: faiss.Index, path: Path) -> bool:
     """Save FAISS index atomically with throttling and fsync.
     
-    Requires FAISS lock to be held. Uses atomic write pattern (temp file +
-    rename) to prevent corruption. Throttles saves to reduce I/O on shared
-    filesystems (configurable via LITKIT_SAVE_EVERY_SEC, default 120s).
+    Requires FAISS lock to be held. Uses atomic write pattern to prevent
+    corruption on SIGINT/SIGTERM:
+    
+    1. Write to <path>.tmp in the same directory
+    2. fsync() the temp file (data on disk)
+    3. os.replace(tmp, path) - atomic rename on POSIX
+    4. fsync() the parent directory (metadata durable)
+    
+    This guarantees the index file is either fully old or fully new,
+    never half-written. Critical for the os._exit(1) signal strategy
+    in cli.py which bypasses normal shutdown.
+    
+    Throttles saves to reduce I/O on shared filesystems (configurable
+    via LITKIT_SAVE_EVERY_SEC, default 120s).
     
     Args:
         index: FAISS index to save
@@ -98,8 +109,15 @@ def faiss_save(index: faiss.Index, path: Path) -> bool:
 def faiss_save_force(index: faiss.Index, path: Path) -> bool:
     """Save FAISS index atomically, bypassing throttle.
     
+    Uses same atomic write pattern as faiss_save():
+    1. Write to <path>.tmp in the same directory
+    2. fsync() the temp file (data on disk)
+    3. os.replace(tmp, path) - atomic rename on POSIX
+    4. fsync() the parent directory (metadata durable)
+    
     Used when save must happen immediately (e.g., after training,
-    explicit flush, or before exit).
+    explicit flush, or before exit). The atomicity guarantee is
+    critical for interrupt safety - see cli.py signal handler comments.
     
     Args:
         index: FAISS index to save
