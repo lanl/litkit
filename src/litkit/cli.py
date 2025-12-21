@@ -187,8 +187,7 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
 
     def _cleanup_guard():
         try:
-            if os.path.exists(WRITER_GUARD):
-                os.remove(WRITER_GUARD)
+            WRITER_GUARD.unlink(missing_ok=True)
         except Exception:
             pass
 
