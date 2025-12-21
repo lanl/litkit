@@ -1097,241 +1097,36 @@ def build_or_update_indices(args):
     # If IVF-PQ needs training, run training pass (one-time)
     if needs_training:
         if not args.faiss_writer:
-            _eprint("[train] ERROR: chunks index requires training; start a writer with --faiss-writer.")
-            sys.exit(2)
-        train_samples = TRAIN_CHUNK_SAMPLES
-        texts_buf: list[str] = []
-
-        # for tracking training progress
-        samples_collected = 0
-        _phase("IVF-PQ: learn IVF centroids and PQ codebooks")
-        samples_prog = _Progress(
-            f"Current number of embeddings of randomly selected text chunks (desired number of vectors={train_samples})",
-            total=train_samples,
-            emit_final_line=False,
-        )
-
-        def _flush_train(buf: list[str]) -> np.ndarray:
-            """Embed buffered texts and return their embeddings; clear handled by caller."""
-            nonlocal samples_collected, samples_prog
-            if not buf:
-                return np.zeros((0, chunk_dim), dtype="float32")
-            # Verbose logging: show per-batch progress while collecting training samples.
-            X = chunk_embedder.encode(
-                buf,
-                progress_label=f"Generating a batch of embeddings for use in IVF-PQ training (batch size is {len(buf)})",
-                batch_size=args.chunk_embed_bs,
-                progress_done_summary=False,  # silence the [done] message for this render
+            _eprint(
+                "[train] ERROR: chunks index requires training; "
+                "start a writer with --faiss-writer."
             )
-
-            samples_collected += int(X.shape[0])
-            # clamp to target so % doesn't exceed 100
-            samples_prog.done = min(train_samples, samples_collected)
-            samples_prog.tick(inc=0, force=True)
-            _progress_newline(samples_prog.stream)
-            return X
-
-        # Stream text chunks from tar.gz files (randomly) -> embed in mini-batches -> accumulate until we hit budget / target
-        texts_buf: list[str] = []
-        X_train_list: list[np.ndarray] = []
-        use_tar = (getattr(args, "tar_dir", None) is not None) or (
-            getattr(args, "tar_manifest", None) is not None
+            sys.exit(2)
+        
+        chunk_index = build_train_ivfpq_index(
+            chunk_dim=chunk_dim,
+            chunk_embedder=chunk_embedder,
+            tar_dir=args.tar_dir,
+            tar_manifest=args.tar_manifest,
+            ivf_nlist=args.ivf_nlist,
+            pq_m=args.pq_m,
+            nprobe=args.nprobe,
+            ivf_nlist_forced=getattr(args, "_ivf_nlist_forced", False),
+            chunk_target_chars=int(
+                getattr(args, "chunk_target_chars", CHUNK_TARGET_CHARS)
+            ),
+            chunk_min_chars=int(getattr(args, "chunk_min_chars", BODY_MIN_CHARS)),
+            chunk_overlap=int(getattr(args, "chunk_overlap", CHUNK_OVERLAP_CHARS)),
+            chunk_embed_bs=args.chunk_embed_bs,
+            train_samples=TRAIN_CHUNK_SAMPLES,
+            batch_train_flush=BATCH_TRAIN_FLUSH,
+            chunk_index_path=CHUNK_INDEX_PATH,
+            chunk_trained_flag=CHUNK_TRAINED_FLAG,
+            faiss_lock_path=FAISS_LOCK,
+            db_lock_path=DB_LOCK,
+            FileLock=FileLock,
+            is_faiss_writer=args.faiss_writer,
         )
-
-        if use_tar:
-            tar_paths_list = list(iter_tar_paths(args.tar_dir, args.tar_manifest))
-            rng = random.Random(int(os.environ.get("LITKIT_TRAIN_SEED", "314159")))
-            rng.shuffle(tar_paths_list)
-
-            _env_cap = int(os.environ.get("LITKIT_TRAIN_PER_PAPER", "0"))
-            if _env_cap > 0:
-                train_per_paper = _env_cap
-            else:
-                est_papers = 0
-                for _p in tar_paths_list:
-                    try:
-                        est_papers += count_tar_xml_members(_p)
-                    except Exception:
-                        pass
-                est_papers = max(1, est_papers)
-                train_per_paper = max(8, min(64, math.ceil(train_samples / est_papers)))
-
-            target_papers = max(1, train_samples // max(1, train_per_paper))
-            papers_used = 0
-            train_total = sum(int(x.shape[0]) for x in X_train_list)  # likely 0 here, but robust
-
-            for tpath in tar_paths_list:
-                for _member, fobj in iter_tar_xml_streams(tpath):
-                    try:
-                        meta = parse_xml_fileobj(fobj)
-                        if not meta:
-                            continue
-                        paras = meta["paragraphs"] or (
-                            [meta["abstract"]] if meta["abstract"] else []
-                        )
-
-                        chunks = (
-                            pack_paragraphs(
-                                paras,
-                                max_chars=int(
-                                    getattr(args, "chunk_target_chars", CHUNK_TARGET_CHARS)
-                                ),
-                                min_chars=int(getattr(args, "chunk_min_chars", BODY_MIN_CHARS)),
-                                overlap_chars=int(
-                                    getattr(args, "chunk_overlap", CHUNK_OVERLAP_CHARS)
-                                ),
-                            )
-                            if paras
-                            else []
-                        )
-
-                        if chunks and papers_used < target_papers:
-                            sel = (
-                                chunks
-                                if len(chunks) <= train_per_paper
-                                else rng.sample(chunks, train_per_paper)
-                            )
-                            for ch in sel:
-                                texts_buf.append(ch)
-                                if len(texts_buf) >= BATCH_TRAIN_FLUSH:
-                                    Xb = _flush_train(texts_buf)
-                                    X_train_list.append(Xb)
-                                    train_total += int(Xb.shape[0])
-                                    texts_buf.clear()
-                                    if train_total >= train_samples:
-                                        break
-                            papers_used += 1
-
-                        if papers_used >= target_papers or train_total >= train_samples:
-                            break
-
-                    finally:
-                        try:
-                            fobj.close()
-                        except Exception:
-                            pass
-
-                if papers_used >= target_papers or train_total >= train_samples:
-                    break
-
-        if texts_buf and sum(x.shape[0] for x in X_train_list) < train_samples:
-            Xb = _flush_train(texts_buf)
-            X_train_list.append(Xb)
-            texts_buf.clear()
-
-        samples_prog.finish()
-        if not X_train_list:
-            _eprint("[train] WARNING: no chunk texts found for training; falling back to FLAT index")
-            base = flat_ip_index(chunk_dim)
-            chunk_index = faiss.IndexIDMap2(base)
-            _clear_chunk_trained_flag()
-            faiss_save(chunk_index, CHUNK_INDEX_PATH)
-        else:
-            X_train = np.vstack(X_train_list)
-            if X_train.shape[0] > train_samples:
-                X_train = X_train[:train_samples]
-
-            n_train = int(X_train.shape[0])
-
-            _eprint(f"[train] chunk training samples: target={train_samples} collected={n_train}")
-            ensure_parent(CHUNK_INDEX_PATH)
-
-            pq_bits = PQ_BITS
-            k = (1 << pq_bits)
-            min_for_micro = 256
-            min_for_pq = 39 * k  # FAISS guidance ~39*k
-            m_candidate = safe_pq_m(chunk_dim, args.pq_m)
-
-            # Early floor: require enough data for codebooks and subquantizers
-            if n_train < max(min_for_micro, min_for_pq, 100 * m_candidate):
-                _eprint(f"[train] not enough samples for IVF-PQ (n={n_train}); using FLAT IP")
-                base = flat_ip_index(chunk_dim)
-                chunk_index = faiss.IndexIDMap2(base)
-                if args.faiss_writer:
-                    with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                        faiss_save(chunk_index, CHUNK_INDEX_PATH)
-                _clear_chunk_trained_flag()
-            else:
-                # 2) Choose nlist with data-aware caps
-                eff_nlist = _effective_nlist(
-                    n_train, args.ivf_nlist, user_forced=getattr(args, "_ivf_nlist_forced", False)
-                )
-                max_by_samples = max(1, n_train // 40)  # ~40 samples per centroid
-                if eff_nlist > max_by_samples:
-                    _eprint(f"[train] note: reducing nlist {eff_nlist} -> {max_by_samples} due to limited samples (n={n_train})")
-                    eff_nlist = max_by_samples
-
-                # Re-check adequacy now that nlist is known
-                if eff_nlist < 8 or n_train < max(min_for_pq, 50 * eff_nlist, 100 * m_candidate):
-                    _eprint(f"[train] nlist/m under-sampled (n={n_train}, nlist={eff_nlist}, m={m_candidate}); using FLAT IP")
-                    base = flat_ip_index(chunk_dim)
-                    chunk_index = faiss.IndexIDMap2(base)
-                    if args.faiss_writer:
-                        with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                            faiss_save(chunk_index, CHUNK_INDEX_PATH)
-                    _clear_chunk_trained_flag()
-                else:
-                    # 3) Train IVF-PQ with safe parameters
-                    m = m_candidate  # already a safe divisor from safe_pq_m
-                    if m != args.pq_m:
-                        _eprint(f"[train] note: adjusted pq_m {args.pq_m} -> {m} to divide dim={chunk_dim}")
-                    _eprint(f"[train] training IVF-PQ: nlist={eff_nlist} m={m} (dim={chunk_dim})")
-
-                    try:
-                        # after successful training
-                        new_chunk_index = ivfpq_index(
-                            chunk_dim, nlist=eff_nlist, m=m, bits=pq_bits
-                        )
-                        # best-effort verbosity
-                        try:
-                            if hasattr(new_chunk_index, "verbose"):
-                                new_chunk_index.verbose = False
-                            if hasattr(faiss, "cvar") and hasattr(faiss.cvar, "verbose"):
-                                faiss.cvar.verbose = False
-                        except Exception:
-                            pass
-                        _phase(
-                            "IVF-PQ: train centroids and PQ codebooks using collected embeddings"
-                        )
-                        pulse = _Pulse(
-                            f"[train] IVF-PQ (nlist={eff_nlist}, m={m}): k-means/codebook fitting",
-                            period=float(os.environ.get("LITKIT_TRAIN_HEARTBEAT_SEC", "0.5")),
-                        )
-                        try:
-                            faiss.normalize_L2(X_train)  # normalize IVF-PQ training vectors
-                            new_chunk_index.train(X_train)
-                        finally:
-                            pulse.stop()
-
-                        # Verify training actually succeeded
-                        if not getattr(new_chunk_index, "is_trained", False):
-                            raise RuntimeError("IVF-PQ index not trained (is_trained=False)")
-
-                        # set nprobe (no mutation elsewhere)
-                        auto_set_nprobe(new_chunk_index, args.nprobe)
-                        chunk_index = faiss.IndexIDMap2(new_chunk_index)
-
-                        if args.faiss_writer:
-                            with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                                faiss_save(chunk_index, CHUNK_INDEX_PATH)
-                                # Only now write the trained flag (we have valid nlist/m)
-                                _tf_tmp = CHUNK_TRAINED_FLAG.with_suffix(".tmp")
-                                with open(_tf_tmp, "w") as fh:
-                                    fh.write(json.dumps({"trained_on": int(time.time()), "n": n_train,
-                                                        "nlist": eff_nlist, "m": m}, indent=2))
-                                    fh.flush(); os.fsync(fh.fileno())
-                                os.replace(_tf_tmp, CHUNK_TRAINED_FLAG)
-                                maybe_fsync_dir(CHUNK_TRAINED_FLAG)
-
-                    except Exception as e:
-                        _eprint(
-                            f"[train] WARNING: IVF-PQ training failed ({e}); falling back to FLAT"
-                        )
-                        chunk_index = faiss.IndexIDMap2(flat_ip_index(chunk_dim))
-                        if args.faiss_writer:
-                            with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                                faiss_save(chunk_index, CHUNK_INDEX_PATH)
-                        _clear_chunk_trained_flag()
 
     use_tar = (getattr(args, "tar_dir", None) is not None) or (
         getattr(args, "tar_manifest", None) is not None
