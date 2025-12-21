@@ -55,9 +55,28 @@ from typing import Iterator
 # from lxml import etree
 from types import SimpleNamespace
 
-from litkit.embeddings.base import (
-    Embedder,  # protocol for type hints
-)
+# ═══════════════════════════════════════════════════════════════════════════════
+# IMPORT STRATEGY: Stdlib + lightweight only at module level
+# ═══════════════════════════════════════════════════════════════════════════════
+# 
+# Module-level imports must NOT pull in faiss, numpy, torch, lxml, transformers.
+# This ensures `python -m litkit --help` and `python -m litkit --version` work
+# even if heavy dependencies are missing.
+#
+# Heavy imports are deferred to:
+#   1. main() - after argparse runs (most imports)
+#   2. Function scope - for thin wrappers and build_or_update_indices
+#
+# What CAN stay at module level:
+#   - stdlib (os, sys, pathlib, typing, argparse, etc.)
+#   - litkit.progress (pure Python, no heavy deps)
+#   - litkit.concurrent (pure Python, uses fcntl which is stdlib)
+#   - litkit.config.paths (pure Python)
+#   - TYPE_CHECKING blocks for type hints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from typing import TYPE_CHECKING
+
 from litkit.progress import (
     eprint as _eprint,
 )
@@ -65,53 +84,14 @@ from litkit.concurrent import (
     FileLock as _FileLockBase,
     FLOCK_AVAILABLE,
 )
-from litkit.embeddings.devices import configure_threads, detect_device
-from litkit.embeddings.factory import make_chunk_embedder, make_paper_embedder
-from litkit.formatting.answers import (
-    normalize_answer_and_build_refs,
-    render_references,
-)
-from litkit.ingest.ingest import (
-    ArticleMeta,
-    TarMemberMeta,
-    iter_tar_paths,
-    iter_tar_xml_streams,
-    parallel_iter_tar_articles,
-    parse_xml_fileobj,
-)
-from litkit.ingest import is_uncompressed_tar, shard_filter
-# ═══════════════════════════════════════════════════════════════════════════════
-# DEFERRED HEAVY IMPORTS (enables --help/--version without faiss)
-# ═══════════════════════════════════════════════════════════════════════════════
-# The following imports are deferred to function scope:
-#   from litkit.index import faiss_save_force, faiss_load, kind_and_core
-#   from litkit.build import ...  (pulls in faiss/numpy)
-#   from litkit.retrieval import ... (pulls in faiss/numpy)
-# 
-# This allows `python -m litkit --help` to work even if faiss is not installed.
-# See main() and the thin wrapper functions below for the actual imports.
-# ═══════════════════════════════════════════════════════════════════════════════
-from litkit.db import (
-    init_db as db_init_db,
-    init_shard_db as db_init_shard_db,
-    connect_db as db_connect_db,
-    shard_db_path as db_shard_db_path,
-    chunk_ids_to_paper_ids as db_chunk_ids_to_paper_ids,
-    flush_pending_marks as db_flush_pending_marks,
-    load_temp_candidates as db_load_temp_candidates,
-)
-from litkit.segments import (
-    validate_shard_consistency as seg_validate_shard_consistency,
-    write_build_meta as seg_write_build_meta,
-    read_build_meta as seg_read_build_meta,
-    has_segment_files as seg_has_segment_files,
-    SegmentWriter,
-    ChunkSegmentWriter,
-    ProducerCoordinator as SegProducerCoordinator,
-    ConsumerCoordinator as SegConsumerCoordinator,
-    ingest_paper_segments as seg_ingest_paper_segments,
-    ingest_chunk_segments as seg_ingest_chunk_segments,
-)
+
+# Type hints only - not imported at runtime
+if TYPE_CHECKING:
+    from litkit.embeddings.base import Embedder
+    from litkit.ingest.ingest import ArticleMeta, TarMemberMeta
+# Heavy imports (litkit.db, litkit.segments, litkit.embeddings.*, litkit.ingest.*)
+# are deferred to main() and function scope. See _load_heavy_deps() and individual
+# functions for the actual imports.
 
 
 
@@ -719,7 +699,7 @@ def _auto_top_papers() -> int:
 def iter_tar_articles(
     tar_path: Path,
     parse_workers: int = 8,
-) -> Iterator[tuple[TarMemberMeta | SimpleNamespace, ArticleMeta]]:
+) -> Iterator[tuple["TarMemberMeta | SimpleNamespace", "ArticleMeta"]]:
     """Unified iterator over articles in a tar file.
     
     For uncompressed .tar files (when parse_workers > 1), uses parallel XML parsing.
@@ -1143,7 +1123,7 @@ def shortlist_papers(
     k: int,
     efsearch: int = 128,
     *,
-    embedder: Embedder | None = None,
+    embedder: "Embedder | None" = None,
 ) -> list[int]:
     """Thin wrapper: delegates to litkit.retrieval.shortlist_papers."""
     from litkit.retrieval import shortlist_papers as retrieval_shortlist_papers
@@ -1167,7 +1147,7 @@ def search_chunks_constrained(
     lexical_cap: int | None = None,
     lexical_limit: int = 200,
     allow_global_lexical: bool | None = None,
-    embedder: Embedder | None = None,
+    embedder: "Embedder | None" = None,
     per_paper_cap: int = 0,
 ) -> tuple[list[int], dict[str, int]]:
     """Thin wrapper: delegates to litkit.retrieval.search_chunks_constrained."""
@@ -1895,6 +1875,55 @@ def main():
     seen_flags = {s.split("=", 1)[0] for s in sys.argv}
     args._ivf_nlist_forced = ("--ivf-nlist" in seen_flags)
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # LAZY IMPORTS: Heavy dependencies loaded here (after argparse)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # These imports pull in faiss, numpy, torch, lxml, transformers.
+    # By importing here (not at module level), we ensure --help/--version work
+    # even if these dependencies are missing or broken.
+    global configure_threads, detect_device, make_paper_embedder, make_chunk_embedder
+    global normalize_answer_and_build_refs, render_references
+    global iter_tar_paths, iter_tar_xml_streams, parallel_iter_tar_articles, parse_xml_fileobj
+    global is_uncompressed_tar, shard_filter
+    global db_init_db, db_init_shard_db, db_connect_db, db_shard_db_path
+    global db_chunk_ids_to_paper_ids, db_flush_pending_marks, db_load_temp_candidates
+    global seg_validate_shard_consistency, seg_write_build_meta, seg_read_build_meta
+    global seg_has_segment_files, SegmentWriter, ChunkSegmentWriter
+    global SegProducerCoordinator, SegConsumerCoordinator
+    global seg_ingest_paper_segments, seg_ingest_chunk_segments
+    
+    from litkit.embeddings.devices import configure_threads, detect_device
+    from litkit.embeddings.factory import make_chunk_embedder, make_paper_embedder
+    from litkit.formatting.answers import normalize_answer_and_build_refs, render_references
+    from litkit.ingest.ingest import (
+        iter_tar_paths,
+        iter_tar_xml_streams,
+        parallel_iter_tar_articles,
+        parse_xml_fileobj,
+    )
+    from litkit.ingest import is_uncompressed_tar, shard_filter
+    from litkit.db import (
+        init_db as db_init_db,
+        init_shard_db as db_init_shard_db,
+        connect_db as db_connect_db,
+        shard_db_path as db_shard_db_path,
+        chunk_ids_to_paper_ids as db_chunk_ids_to_paper_ids,
+        flush_pending_marks as db_flush_pending_marks,
+        load_temp_candidates as db_load_temp_candidates,
+    )
+    from litkit.segments import (
+        validate_shard_consistency as seg_validate_shard_consistency,
+        write_build_meta as seg_write_build_meta,
+        read_build_meta as seg_read_build_meta,
+        has_segment_files as seg_has_segment_files,
+        SegmentWriter,
+        ChunkSegmentWriter,
+        ProducerCoordinator as SegProducerCoordinator,
+        ConsumerCoordinator as SegConsumerCoordinator,
+        ingest_paper_segments as seg_ingest_paper_segments,
+        ingest_chunk_segments as seg_ingest_chunk_segments,
+    )
+    
     # logging + device threads
     logging.basicConfig(
         level=(logging.ERROR if args.quiet else logging.WARNING),
