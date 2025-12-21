@@ -2054,6 +2054,17 @@ def main():
     if needs_corpus and args.tar_manifest is not None and not args.tar_manifest.exists():
         raise SystemExit(f"Manifest not found: {args.tar_manifest}")
 
+    # Guard: building from scratch requires a writer/producer role
+    # Without this, we'd create in-memory indices, do all the DB work, but never persist FAISS.
+    if needs_corpus and not args.faiss_writer and not args.embed_producer and not _vector_store_exists():
+        raise SystemExit(
+            "[build] No vector store found. A fresh build requires one of:\n"
+            "  • --faiss-writer           (single-node build, or writer node in multi-node)\n"
+            "  • --embed-producer         (producer node in multi-node setup)\n"
+            "  • --init-indices-only --faiss-writer (bootstrap empty indices first)\n\n"
+            "For query-only usage, first run a build with one of the above flags."
+        )
+
     # No source error
     if needs_corpus and args.tar_dir is None and args.tar_manifest is None:
         raise SystemExit(
