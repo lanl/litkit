@@ -80,29 +80,17 @@ from litkit.ingest.ingest import (
     parse_xml_fileobj,
 )
 from litkit.ingest import is_uncompressed_tar, shard_filter
-from litkit.index import (
-    # Constants
-    faiss_save_force,
-    faiss_load,
-    kind_and_core,
-)
-from litkit.build import (
-    backfill_unindexed_vectors as build_backfill_unindexed_vectors,
-    reconcile_sqlite_flags_with_faiss as build_reconcile_sqlite_flags,
-    post_build_sanity_check as build_post_build_sanity_check,
-    BuildConfig,
-    init_empty_indices as build_init_empty_indices,
-    run_consume_only_mode as build_run_consume_only_mode,
-    load_or_create_paper_index as build_load_or_create_paper_index,
-    load_or_create_chunk_index as build_load_or_create_chunk_index,
-    train_ivfpq_index as build_train_ivfpq_index,
-    process_tar_files as build_process_tar_files,
-)
-from litkit.retrieval import (
-    shortlist_papers as retrieval_shortlist_papers,
-    search_chunks_constrained as retrieval_search_chunks_constrained,
-    get_chunks as retrieval_get_chunks,
-)
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEFERRED HEAVY IMPORTS (enables --help/--version without faiss)
+# ═══════════════════════════════════════════════════════════════════════════════
+# The following imports are deferred to function scope:
+#   from litkit.index import faiss_save_force, faiss_load, kind_and_core
+#   from litkit.build import ...  (pulls in faiss/numpy)
+#   from litkit.retrieval import ... (pulls in faiss/numpy)
+# 
+# This allows `python -m litkit --help` to work even if faiss is not installed.
+# See main() and the thin wrapper functions below for the actual imports.
+# ═══════════════════════════════════════════════════════════════════════════════
 from litkit.db import (
     init_db as db_init_db,
     init_shard_db as db_init_shard_db,
@@ -672,6 +660,7 @@ def backfill_unindexed_vectors(
     chunk_bs=None,
 ):
     """Thin wrapper: delegates to litkit.build.backfill with runtime paths."""
+    from litkit.build import backfill_unindexed_vectors as build_backfill_unindexed_vectors
     get_runtime()
     return build_backfill_unindexed_vectors(
         conn, paper_embedder, chunk_embedder, paper_index, chunk_index,
@@ -690,6 +679,7 @@ def backfill_unindexed_vectors(
 
 def _post_build_sanity_check(conn, args):
     """Thin wrapper: delegates to litkit.build.post_build_sanity_check with runtime paths."""
+    from litkit.build import post_build_sanity_check as build_post_build_sanity_check
     get_runtime()
     return build_post_build_sanity_check(
         conn,
@@ -786,6 +776,18 @@ def build_or_update_indices(args):
     save indices. Other processes (possibly using --shard-id/--num-shards) only
     populate SQLite rows and commit; they do not mutate FAISS indices.
     """
+    # Lazy imports to defer faiss/numpy loading until actually needed
+    from litkit.build import (
+        BuildConfig,
+        init_empty_indices as build_init_empty_indices,
+        run_consume_only_mode as build_run_consume_only_mode,
+        load_or_create_paper_index as build_load_or_create_paper_index,
+        load_or_create_chunk_index as build_load_or_create_chunk_index,
+        train_ivfpq_index as build_train_ivfpq_index,
+        process_tar_files as build_process_tar_files,
+    )
+    from litkit.index import faiss_save_force, kind_and_core
+
     get_runtime()  # ensure all path globals are bound (required for library use)
     need = args.rebuild or not (
         DB_PATH.exists() and PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists()
@@ -1131,6 +1133,7 @@ def build_or_update_indices(args):
 
 def reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index) -> tuple[int, int]:
     """Thin wrapper: delegates to litkit.build.backfill."""
+    from litkit.build import reconcile_sqlite_flags_with_faiss as build_reconcile_sqlite_flags
     return build_reconcile_sqlite_flags(conn, paper_index, chunk_index)
 
 
@@ -1144,6 +1147,7 @@ def shortlist_papers(
     embedder: Embedder | None = None,
 ) -> list[int]:
     """Thin wrapper: delegates to litkit.retrieval.shortlist_papers."""
+    from litkit.retrieval import shortlist_papers as retrieval_shortlist_papers
     get_runtime()
     enc = embedder or make_paper_embedder()[0]
     return retrieval_shortlist_papers(
@@ -1168,6 +1172,7 @@ def search_chunks_constrained(
     per_paper_cap: int = 0,
 ) -> tuple[list[int], dict[str, int]]:
     """Thin wrapper: delegates to litkit.retrieval.search_chunks_constrained."""
+    from litkit.retrieval import search_chunks_constrained as retrieval_search_chunks_constrained
     get_runtime()
     enc = embedder or make_chunk_embedder()[0]
     return retrieval_search_chunks_constrained(
@@ -1192,6 +1197,7 @@ def search_chunks_constrained(
 
 def get_chunks(conn, ids: list[int]) -> list[dict[str, str]]:
     """Thin wrapper: delegates to litkit.retrieval.get_chunks."""
+    from litkit.retrieval import get_chunks as retrieval_get_chunks
     return retrieval_get_chunks(conn, ids)
 
 
@@ -2153,6 +2159,9 @@ def main():
         args.efsearch = max(args.efsearch, 256)
 
     if args.reconcile_only:
+        # Lazy import for reconcile-only path
+        from litkit.index import faiss_load, faiss_save_force
+        
         conn = db_connect_db(DB_PATH)
         try:
             try:
