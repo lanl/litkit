@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -134,6 +135,15 @@ def ingest_paper_segments(
         paper_id_map = preload_paper_id_map(conn)
         _eprint(f"[segments] preloaded {len(paper_id_map)} paper ID mappings")
     
+    # SAFETY CHECK: Refuse to ingest if DB has no paper mappings
+    # This catches the common error of running segment ingestion before shard DB merge
+    if not paper_id_map:
+        _eprint("[segments] ERROR: paper_id_map is empty. "
+                "Have shard databases been merged? Aborting paper segment ingestion.")
+        _eprint("[segments] HINT: Run --consume-only to merge DBs before ingesting segments, "
+                "or ensure producers have completed and DB merge has run.")
+        return paper_index, 0  # Safe exit, no data loss
+    
     cur = conn.cursor()
     added_total = 0
     batch_counter = 0
@@ -181,7 +191,14 @@ def ingest_paper_segments(
                                 "(doc_id not found in main DB - check doc_id canonicalization)")
                     
                     if not resolved_ids:
-                        os.remove(tmp)
+                        # QUARANTINE instead of delete: prevents data loss if DB wasn't merged
+                        quarantine_path = tmp.with_suffix(f".unresolved.{int(time.time())}")
+                        try:
+                            os.replace(tmp, quarantine_path)
+                            _eprint(f"[segments] QUARANTINE: {p.name} → {quarantine_path.name} "
+                                    "(0 IDs resolved - run again after DB merge)")
+                        except Exception:
+                            pass  # Leave .ingesting file for next attempt
                         continue
                     
                     # Filter to only valid entries
@@ -333,6 +350,15 @@ def ingest_chunk_segments(
         chunk_id_map = preload_chunk_id_map(conn)
         _eprint(f"[segments] preloaded {len(chunk_id_map)} chunk ID mappings")
     
+    # SAFETY CHECK: Refuse to ingest if DB has no mappings
+    # This catches the common error of running segment ingestion before shard DB merge
+    if not paper_id_map or not chunk_id_map:
+        _eprint("[segments] ERROR: paper_id_map or chunk_id_map is empty. "
+                "Have shard databases been merged? Aborting chunk segment ingestion.")
+        _eprint("[segments] HINT: Run --consume-only to merge DBs before ingesting segments, "
+                "or ensure producers have completed and DB merge has run.")
+        return chunk_index, 0  # Safe exit, no data loss
+    
     cur = conn.cursor()
     added_total = 0
     batch_counter = 0
@@ -393,7 +419,14 @@ def ingest_chunk_segments(
                                 "(doc_id/ord not found in main DB - check doc_id canonicalization)")
                     
                     if not resolved_ids:
-                        os.remove(tmp)
+                        # QUARANTINE instead of delete: prevents data loss if DB wasn't merged
+                        quarantine_path = tmp.with_suffix(f".unresolved.{int(time.time())}")
+                        try:
+                            os.replace(tmp, quarantine_path)
+                            _eprint(f"[segments] QUARANTINE: {p.name} → {quarantine_path.name} "
+                                    "(0 IDs resolved - run again after DB merge)")
+                        except Exception:
+                            pass  # Leave .ingesting file for next attempt
                         continue
                     
                     # Filter to only valid entries
