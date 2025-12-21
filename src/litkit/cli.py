@@ -236,12 +236,13 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
     1. Cross-host TTL eviction:
        - On same host: we check PID liveness via os.kill(pid, 0) before evicting
        - On different host: we cannot check PID liveness, so TTL expiry alone triggers eviction
-       - Risk: a long-running build on another host may be evicted if it exceeds TTL
+       - Risk: a long-running build on another host could be evicted if TTL is enabled
        - Mitigations:
-         * Default TTL is 24h (86400s), sufficient for most HPC batch jobs
-         * Set LITKIT_WRITER_GUARD_TTL=0 to disable TTL-based eviction entirely
-         * Users can manually remove stale guards if needed
-       - Accepted tradeoff: rare edge case vs. simpler implementation
+         * Default TTL is 0 (DISABLED) for safety in multi-host HPC environments
+         * Same-host PID check still works regardless of TTL setting
+         * Set LITKIT_WRITER_GUARD_TTL=86400 to enable 24h auto-eviction if desired
+         * Users can manually remove stale guards: rm .writer_guard
+       - Rationale: >24h HPC jobs are common; false eviction is catastrophic
     
     2. Signal handler uses os._exit(1):
        - On SIGINT/SIGTERM, we clean up the guard file then os._exit(1)
@@ -260,10 +261,15 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
         return
     if ttl_sec is None:
         try:
-            ttl_sec = int(os.environ.get("LITKIT_WRITER_GUARD_TTL", "86400"))
+            # Default TTL=0 (disabled) for safety in multi-host HPC environments.
+            # Cross-host TTL eviction cannot verify PID liveness, so auto-eviction
+            # risks evicting a legitimate long-running build (>24h jobs are common).
+            # Same-host: PID check via os.kill(pid, 0) still works regardless of TTL.
+            # Set LITKIT_WRITER_GUARD_TTL=86400 (or higher) to enable auto-eviction.
+            ttl_sec = int(os.environ.get("LITKIT_WRITER_GUARD_TTL", "0"))
         except ValueError:
-            _eprint("[writer] WARNING: invalid LITKIT_WRITER_GUARD_TTL; using 86400s")
-            ttl_sec = 86400
+            _eprint("[writer] WARNING: invalid LITKIT_WRITER_GUARD_TTL; using 0 (disabled)")
+            ttl_sec = 0
 
     def _cleanup_guard():
         try:
