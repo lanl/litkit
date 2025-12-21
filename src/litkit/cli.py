@@ -2458,17 +2458,17 @@ def main():
         return
 
     if args.embed_producer:
+        d = deps()  # <-- ensures heavy deps are loaded before accessing writers
         outdir = args.embed_outdir or EMBED_SEGMENTS_DIR
-        # producer_id = f"{socket.gethostname()}-{os.getpid()}"
 
-        paper_seg_writer = _deps.SegmentWriter(
+        paper_seg_writer = d.SegmentWriter(
             outdir=outdir,
             segment_size=DEFAULT_EMBED_SEGMENT_SIZE,
             dtype=DEFAULT_EMBED_SEGMENT_DTYPE,
             shard_id=args.shard_id,
             kind="papers",
         )
-        chunk_seg_writer = _deps.ChunkSegmentWriter(
+        chunk_seg_writer = d.ChunkSegmentWriter(
             outdir=outdir,
             segment_size=DEFAULT_EMBED_SEGMENT_SIZE,
             dtype=DEFAULT_EMBED_SEGMENT_DTYPE,
