@@ -258,6 +258,98 @@ litkit/
 └── frontload/          # (existing) Chunk capping
 ```
 
+---
+
+## Work Completed 2024-12-20 (Code Review Session)
+
+### External Code Review Assessment
+
+Received external code review critique. After careful analysis against actual implementation:
+
+#### Issues Reviewed
+
+| Claim | Verdict | Details |
+|-------|---------|---------|
+| **SAVEPOINT + COMMIT bug** | ❌ INVALID | Reviewer misunderstood SQLite semantics. `RELEASE SAVEPOINT` doesn't implicitly commit - it removes the savepoint marker. The `conn.commit()` calls in batch flushes are intentional and correct. |
+| **Checkpoint skip-by-count with parallel parsing** | ✅ VALID BUG | `parallel_iter_tar_articles()` was yielding in completion order but checkpoint assumes tar file order. Fixed below. |
+| **Producer DB merge path missing** | ❌ INVALID | Reviewer missed `run_consume_only_mode()` in `litkit/build/consume.py` which calls `db_merge_shard_databases()`. |
+| **FAISS IDMap consistency** | ❌ INVALID | Already handled - `load_or_create_*_index` returns IDMap2-wrapped indices. |
+| **seen_this_path expensive** | ⚠️ LOW PRIORITY | Valid concern but rare case. Acceptable for correctness. |
+| **SIGINT hard kill** | ❌ INVALID | Intentional design. Documented. Reconcile on restart handles it. |
+| **executemany batching** | ⚠️ DEFERRED | Valid efficiency suggestion for Phase 8 (Robustness). |
+| **Lustre stripe detection** | ⚠️ DEFERRED | Nice-to-have. Added developer docs. |
+
+### Bug Fix: Parallel Parsing Order for Checkpoint Safety
+
+**Commit `ba70219`:** `fix(ingest): add in-order yielding to parallel_iter_tar_articles for checkpoint safety`
+
+**The Bug:**
+`parallel_iter_tar_articles()` was yielding results in completion order, but the checkpoint system
+assumed tar file order for count-based resume. On restart, skipping N members would skip different
+members than before if completion order changed.
+
+**The Fix:**
+Added `yield_in_order=True` parameter (default) that uses a reorder buffer (heapq) to preserve
+tar order while still parsing in parallel.
+
+**Algorithm:**
+1. Assign monotonic sequence numbers on submission (tar file order)
+2. Buffer completed results in a min-heap keyed by sequence number
+3. Yield only when the next expected sequence is available
+4. Memory bounded: O(workers * 4) results buffered at most
+
+**Code changes:**
+```python
+def parallel_iter_tar_articles(
+    tar_path: str | Path,
+    workers: int = 8,
+    exts: Iterable[str] = _XML_EXTS,
+    yield_in_order: bool = True,  # NEW: default True for checkpoint safety
+) -> Iterator[tuple[TarMemberMeta, ArticleMeta]]:
+```
+
+### Developer Documentation Added
+
+**Also in commit `ba70219`:** Added two developer guide sections to README.md:
+
+1. **Tar Processing Efficiency** - Documents improvement areas:
+   - SQLite batching (`executemany()`)
+   - Uncompressed tar recommendation
+   - Pipeline overlap (future)
+   - FAISS training optimization
+
+2. **Lustre Filesystem Optimization** - Documents:
+   - Recommended stripe settings
+   - How to check stripe width (`lfs getstripe`)
+   - Example code for automatic stripe detection (future work)
+   - User remediation steps
+
+### Session Summary
+
+| Change | Description |
+|--------|-------------|
+| `parallel_iter_tar_articles()` | Added in-order yielding mode (default) |
+| README.md | Added tar efficiency + Lustre stripe developer guides |
+
+**One real correctness bug fixed.** Other critique points were either invalid (misunderstood
+architecture) or deferred efficiency improvements.
+
+---
+
+## Next Steps (Resume Point)
+
+1. **Phase 6.2f: Extract tar processing loop** - The main `build_or_update_indices()` loop
+   is ~500 lines of complex tar scanning/ingestion. This is the "hardest 20%" and
+   has high coupling to DB/FAISS state.
+
+2. **Phase 8: Efficiency improvements** (deferred from code review):
+   - SQLite `executemany()` batching
+   - Lustre stripe detection/warning at startup
+
+3. **Optional: Wire get_chunks** - Low priority; only ~20 lines
+
+4. **Optional: Extract LLM code** - ~200 lines, diminishing returns
+
 ## Validation Checklist
 
 After each phase:
