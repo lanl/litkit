@@ -1344,9 +1344,155 @@ Estimated ~250-300 lines removable when fully wired.
 - Signal handlers (~30 lines)
 - LLM code (~200 lines) - diminishing returns
 
-### Next Steps
+---
 
-1. **Wire search_chunks_constrained** - Replace 200-line inline version
-2. **Remove dead inline helpers** - ~50 lines
-3. **Optional: Extract LLM** - ~200 lines (low priority)
-4. **Git tag** - "retrieval-modularized" milestone
+## Work Completed 2024-12-20 (Session 2 - Continued)
+
+### Wire search_chunks_constrained to Module
+
+**Commit `9c7a5b9`:** `refactor(cli): wire search_chunks_constrained to module (-234 lines)`
+
+Replaced ~230 lines of inline `search_chunks_constrained` implementation with thin wrapper:
+```python
+def search_chunks_constrained(...):
+    """Thin wrapper: delegates to litkit.retrieval.search_chunks_constrained."""
+    get_runtime()
+    enc = embedder or make_chunk_embedder()[0]
+    return retrieval_search_chunks_constrained(
+        question=question,
+        candidate_papers=candidate_papers,
+        k=k,
+        chunk_index_path=CHUNK_INDEX_PATH,
+        db_path=DB_PATH,
+        embedder=enc,
+        connect_db=db_connect_db,
+        ...
+    )
+```
+
+cli.py: 3200 → 2966 lines (-234 lines)
+
+### Add Developer Documentation
+
+**Commit `7424cfa`:** `docs(README): add developer guide for improving lexical search`
+
+Added comprehensive section to README.md covering:
+- Architecture overview (LexicalConfig, LexicalResult, LexicalBackend protocol)
+- Improvement areas: term extraction, scoring, backend swap
+- Code example: testing `find_rare_terms()` in isolation
+- Code example: implementing a custom FTS5 backend
+
+### Phase 6.2g: Remove Dead Inline Helpers (COMPLETE)
+
+**Commit `8732d41`:** `refactor(cli): remove dead inline helpers after search wiring`
+
+Removed ~223 lines of dead code that became unreachable after wiring:
+
+| Removed | Lines | Reason |
+|---------|-------|--------|
+| `_effective_nlist()` | ~13 | Moved to training.py module |
+| `_clear_chunk_trained_flag()` | ~7 | Moved to training.py module |
+| `_STOPWORDS` | ~40 | Only used by _query_terms |
+| `_query_terms()` | ~25 | No call sites remaining |
+| `_sqlite_norm_expr()` | ~18 | No call sites remaining |
+| `_escape_like()` | ~5 | No call sites remaining |
+| `_normalize_for_search_py()` | ~12 | No call sites remaining |
+| `_avg_chunks_for_papers()` | ~15 | No call sites remaining |
+| `_faiss_search()` | ~25 | No call sites remaining |
+| `_temporary_search_params()` | ~18 | Only used by dead _faiss_search |
+| `DISABLE_LEXICAL` | ~1 | Module has its own copy |
+| `_LEXICAL_WARN_ONCE` | ~1 | Module has its own copy |
+
+cli.py: 2966 → 2743 lines (-223 lines)
+
+### Session Summary
+
+| Commit | Description | Lines |
+|--------|-------------|-------|
+| `9c7a5b9` | Wire search_chunks_constrained | -234 |
+| `7424cfa` | Add developer guide to README | +87 |
+| `8732d41` | Remove dead inline helpers | -223 |
+
+**Session total:** -457 lines from cli.py
+
+---
+
+## Current Status
+
+**cli.py is now 2743 lines** (down from ~4723 at start of 2024-12-18 session, **~1980 lines / 42% reduction**)
+
+### Summary of All Reductions
+
+| Phase | Description | Lines Removed |
+|-------|-------------|---------------|
+| 2024-12-18 | FAISS, Progress, FileLock, Runtime extraction | ~664 |
+| 2024-12-18 | Dead code removal (_ingest_*, _add_ids_union_compat) | ~374 |
+| 2024-12-19 | Bug fixes + minor cleanup | ~23 |
+| 2024-12-19 | Phase 6.1 helpers + backfill extraction | ~127 |
+| 2024-12-19 | Phase 6.2a-b (BuildConfig, init_empty_indices) | ~43 |
+| 2024-12-19 | Phase 6.2c (run_consume_only_mode) | ~42 |
+| 2024-12-19 | Phase 6.2d (index load + IVF-PQ training) | ~287 |
+| 2024-12-20 | Phase 6.2e (retrieval module + lexical) | ~170 |
+| **2024-12-20** | **Phase 6.2g (dead helper removal)** | **~457** |
+
+### New Module Lines Created
+
+| Module | Lines | Purpose |
+|--------|-------|---------|
+| litkit/build/ | ~1480 | Build pipeline orchestration |
+| litkit/retrieval/ | ~820 | RAG retrieval + lexical |
+
+### What Remains in cli.py (~2743 lines)
+
+**Should stay (~800 lines):**
+- Argparse (~300 lines)
+- `main()` orchestration (~150 lines)  
+- Version/path reporting (~50 lines)
+- Writer guard logic (~80 lines)
+- Signal handlers (~30 lines)
+- LLM code (~200 lines) - diminishing returns to extract
+
+**Extraction candidates (~500+ lines):**
+- `build_or_update_indices()` tar loop (~500 lines) - Phase 6.2f
+- `get_chunks()` (~20 lines) - could wire to module
+
+### Next Steps (Resume Point)
+
+1. **Phase 6.2f: Extract tar processing loop** - The main `build_or_update_indices()` loop
+   is ~500 lines of complex tar scanning/ingestion. This is the "hardest 20%" and
+   has high coupling to DB/FAISS state.
+
+2. **Optional: Wire get_chunks** - Low priority; only ~20 lines
+
+3. **Optional: Extract LLM code** - ~200 lines, diminishing returns
+
+4. **Git tag** - Consider tagging "retrieval-modularized" milestone
+
+### Refactor Architecture (Complete)
+
+```
+src/litkit/
+├── cli.py              # 2743 lines (down from 4723, -42%)
+├── concurrent/         # Locking primitives
+├── config/             # WorkspacePaths
+├── db/                 # All SQLite operations
+├── index/              # All FAISS operations
+├── segments/           # Embedding segment I/O + checkpoints
+├── ingest/             # Tar/XML parsing
+├── pipeline/           # Build pipeline logic
+├── build/              # Build orchestration (~1480 lines) ← NEW
+│   ├── helpers.py      # Text chunking & deduplication
+│   ├── backfill.py     # FAISS/SQLite reconciliation
+│   ├── config.py       # BuildConfig dataclass
+│   ├── indices.py      # Index creation utilities
+│   ├── consume.py      # Consumer-only mode
+│   └── training.py     # IVF-PQ training
+├── retrieval/          # RAG retrieval (~820 lines) ← NEW
+│   ├── helpers.py      # query_terms, normalization
+│   ├── search.py       # faiss_search wrapper
+│   ├── stages.py       # shortlist_papers, search_chunks_constrained
+│   └── lexical.py      # Modular lexical front-loading
+├── embeddings/         # (existing) Embedding models
+├── formatting/         # (existing) Answer formatting
+└── frontload/          # (existing) Chunk capping
+```
