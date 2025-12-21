@@ -292,22 +292,48 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
                 info = Path(WRITER_GUARD).read_text().strip()
                 parts = info.split()
                 ts = 0
+                guard_pid = None
+                guard_host = None
+                if len(parts) >= 1 and parts[0].isdigit():
+                    guard_pid = int(parts[0])
+                if len(parts) >= 2:
+                    guard_host = parts[1]
                 if len(parts) >= 3:
                     try: ts = int(parts[2])
                     except ValueError: ts = 0
-                # Only attempt cleanup on first attempt and if guard is stale.
+                
                 # TTL ≤ 0 means "never consider guards stale" (manual cleanup required).
                 if ttl_sec > 0 and ts and (time.time() - ts) > ttl_sec and attempt == 0:
-                    _eprint(f"[writer] Guard appears stale (> {ttl_sec}s): {info}. Attempting exclusive cleanup.")
-                    try:
-                        stale = WRITER_GUARD.with_suffix(".guard.stale."+str(os.getpid()))
-                        # Atomic claim: if this replace fails, someone else is cleaning.
-                        os.replace(WRITER_GUARD, stale)
-                        stale.unlink(missing_ok=False)
-                        stale_cleaned = True  # retry once via continue
-                    except Exception as e:
-                        _eprint(f"[writer] ERROR: failed to remove guard: {e}.")
-                        sys.exit(2)
+                    # Guard appears stale by timestamp, but check PID liveness first
+                    # to avoid evicting long-running builds that exceed TTL.
+                    is_live = False
+                    if guard_host == socket.gethostname() and guard_pid is not None:
+                        # Same host: can check if PID is still alive
+                        try:
+                            os.kill(guard_pid, 0)  # Signal 0 = check existence
+                            is_live = True
+                            _eprint(f"[writer] Guard PID {guard_pid} is still alive (long build?). Not evicting.")
+                        except OSError as e:
+                            # ESRCH (no such process) or EPERM (exists but we can't signal)
+                            if e.errno == errno.ESRCH:
+                                is_live = False  # Process dead, safe to evict
+                            elif e.errno == errno.EPERM:
+                                is_live = True  # Process exists but we can't signal it
+                            else:
+                                is_live = True  # Unknown error, be conservative
+                    # Different host: cannot check PID, use timestamp-based staleness
+                    
+                    if not is_live:
+                        _eprint(f"[writer] Guard appears stale (> {ttl_sec}s, process dead): {info}. Attempting exclusive cleanup.")
+                        try:
+                            stale = WRITER_GUARD.with_suffix(".guard.stale."+str(os.getpid()))
+                            # Atomic claim: if this replace fails, someone else is cleaning.
+                            os.replace(WRITER_GUARD, stale)
+                            stale.unlink(missing_ok=False)
+                            stale_cleaned = True  # retry once via continue
+                        except Exception as e:
+                            _eprint(f"[writer] ERROR: failed to remove guard: {e}.")
+                            sys.exit(2)
             except Exception:
                 pass
             
@@ -1454,15 +1480,68 @@ def build_or_update_indices(args):
                         persisted_count = processed_count
                         _render(force=True)
 
-        # End of this tar: final commit + checkpoint
+        # End of this tar: force flush remainder buffers (producer mode) + checkpoint
         _render(force=True)
         _progress_newline(sys.stderr)
+        
+        # PRODUCER MODE: Force segment flush at tar boundary BEFORE commit/checkpoint.
+        # Without this, we could commit DB rows (files table) for members whose segments
+        # were never written, then checkpoint to persisted_count < processed_count.
+        # On restart, db_already_processed() returns True for those members → skip → data loss.
+        if args.embed_producer:
+            if paper_ids_buf:
+                try:
+                    u_ids, u_texts, u_doc_ids = dedupe_papers_with_doc_ids(
+                        paper_ids_buf, paper_texts_buf, paper_doc_ids_buf
+                    )
+                    Xp = paper_embedder.encode(
+                        u_texts,
+                        progress_label=f"Embedding papers (producer tar-boundary, {len(u_texts)})",
+                        batch_size=args.paper_embed_bs,
+                        progress_done_summary=False,
+                    )
+                    paper_seg_writer.write(doc_ids=u_doc_ids, vecs=Xp)
+                    papers_added_total += len(u_ids)
+                    paper_ids_buf.clear()
+                    paper_texts_buf.clear()
+                    paper_doc_ids_buf.clear()
+                except Exception as e:
+                    conn.rollback()
+                    _eprint(f"[flush] FATAL: paper segment tar-boundary flush failed: {e.__class__.__name__}: {e}")
+                    raise
+            
+            if chunk_ids_buf:
+                try:
+                    u_ids, u_texts, u_paper_doc_ids, u_ords = dedupe_chunks_with_doc_ids(
+                        chunk_ids_buf, chunk_texts_buf, chunk_paper_doc_ids_buf, chunk_ords_buf
+                    )
+                    Xc = chunk_embedder.encode(
+                        u_texts,
+                        progress_label=f"Embedding chunks (producer tar-boundary, {len(u_texts)})",
+                        batch_size=args.chunk_embed_bs,
+                        progress_done_summary=False,
+                    )
+                    chunk_seg_writer.write(
+                        paper_doc_ids=u_paper_doc_ids, ords=u_ords, vecs=Xc
+                    )
+                    chunks_added_total += len(u_ids)
+                    chunk_ids_buf.clear()
+                    chunk_texts_buf.clear()
+                    chunk_paper_doc_ids_buf.clear()
+                    chunk_ords_buf.clear()
+                except Exception as e:
+                    conn.rollback()
+                    _eprint(f"[flush] FATAL: chunk segment tar-boundary flush failed: {e.__class__.__name__}: {e}")
+                    raise
+            
+            # After successful tar-boundary flush, persisted_count can advance to processed_count
+            persisted_count = processed_count
+        
         conn.commit()
         
-        # PRODUCER MODE: Only checkpoint up to persisted_count (last segment-flushed boundary).
-        # The remainder buffers haven't been flushed to segments yet, so we can't checkpoint
-        # past the durable segment flush point. Otherwise, crash before final flush → data loss.
-        # WRITER MODE: OK to checkpoint processed_count (reconcile+backfill repairs any gaps).
+        # Checkpoint: now safe for both modes
+        # Producer: persisted_count == processed_count (tar-boundary flush ensured durability)
+        # Writer: processed_count (reconcile+backfill repairs any gaps)
         if args.embed_producer:
             ckpt_stream[str(tpath)] = persisted_count
         else:
