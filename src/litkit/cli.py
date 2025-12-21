@@ -1716,12 +1716,13 @@ def answer_with_llm(
                 return text.strip()
 
         except Exception as e:
-            # Broader overflow detection across providers/SDKs
+            # Overflow detection via message matching only (not exception type)
+            # BadRequestError is too broad - also covers "unknown model", "invalid request", etc.
+            # We only want to retry-with-trimming for actual context/token overflow errors.
             msg = (str(e) or "").lower()
 
             is_overflow = (
-                isinstance(e, getattr(openai, "BadRequestError", tuple()))
-                or "context length" in msg
+                "context length" in msg
                 or "maximum context length" in msg
                 or "exceeds context window" in msg
                 or "token limit" in msg
@@ -1731,7 +1732,7 @@ def answer_with_llm(
                 or "prompt too long" in msg
                 or "input too long" in msg
                 or "payload too large" in msg
-                or "413" in msg
+                or "413" in msg  # HTTP 413 Payload Too Large
             )
 
             if is_overflow and attempt < 3:
