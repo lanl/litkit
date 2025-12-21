@@ -534,11 +534,11 @@ OPENAI_TIMEOUT_SEC = int(os.environ.get("LITKIT_OPENAI_TIMEOUT_SEC", "15"))
 
 
 def _default_base_url_for(model: str) -> str:
-    m = model.lower()
-    if m.startswith("gpt-oss"):
-        return os.environ.get("OPENAI_BASE_URL", "http://localhost:1234/v1")
-    if m.startswith("o3"):
-        return os.environ.get("OPENAI_BASE_URL", "http://localhost:1234/v1")
+    """Default base URL for OpenAI-compatible endpoints.
+    
+    All models currently use the same default; the parameter is retained
+    for future model-specific routing if needed.
+    """
     return os.environ.get("OPENAI_BASE_URL", "http://localhost:1234/v1")
 
 def _default_api_key_for(model: str) -> str:
@@ -2139,7 +2139,17 @@ def main():
         if needs_corpus:
             _report_paths(args.tar_dir, WORKSPACE, args.tar_manifest, args.tar_dir_origin)
         else:
-            _eprint(f"[paths] skipping tar shards: existing vector store found")
+            # Report the specific reason why tar shards are being skipped
+            if args.reconcile_only:
+                _eprint("[paths] skipping tar shards: --reconcile-only mode")
+            elif args.consume_only:
+                _eprint("[paths] skipping tar shards: --consume-only mode")
+            elif args.init_indices_only:
+                _eprint("[paths] skipping tar shards: --init-indices-only mode")
+            elif _vector_store_exists():
+                _eprint("[paths] skipping tar shards: existing vector store found")
+            else:
+                _eprint("[paths] skipping tar shards: no build action requested")
             _eprint(f"[paths] using {WORKSPACE} as writable directory for job artifacts/outputs")
 
     # Wire CLI --quiet into the early env-based guard for the rest of the run
