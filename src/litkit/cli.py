@@ -148,14 +148,20 @@ def _load_heavy_deps() -> None:
         
         # Set deterministic FAISS seed (moved from _init_runtime for conceptual purity)
         # _init_runtime() is now purely filesystem/env; faiss belongs with heavy deps
+        #
+        # IMPORTANT: Only catch ImportError (missing faiss), NOT other exceptions.
+        # A broken faiss install should fail fast, not be silently ignored.
+        has_faiss = False
         try:
             import faiss
+            has_faiss = True
             faiss.cvar.seed = int(os.environ.get("LITKIT_FAISS_SEED", "123456"))
-        except Exception:
-            pass
+        except ImportError:
+            pass  # faiss is optional for query-only flows with --no-llm
         
         # Consolidate all imports into a single namespace
         _deps = SimpleNamespace(
+            has_faiss=has_faiss,
             # Embeddings
             configure_threads=configure_threads,
             detect_device=detect_device,
@@ -195,6 +201,22 @@ def _load_heavy_deps() -> None:
 
 
 # logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+
+
+def _require_faiss(context: str = "this operation") -> None:
+    """Fail fast if FAISS is not available.
+    
+    Call this at the start of any code path that requires FAISS (build/write flows).
+    Query-only flows with --no-llm may work without FAISS.
+    """
+    _load_heavy_deps()
+    if not _deps.has_faiss:
+        raise SystemExit(
+            f"[error] FAISS is required for {context}.\n"
+            "Install faiss-cpu or faiss-gpu:\n"
+            "  pip install faiss-cpu    # CPU-only\n"
+            "  pip install faiss-gpu    # CUDA-enabled"
+        )
 
 
 def _maybe_cleanup_own_stale_guard():
@@ -865,6 +887,7 @@ def build_or_update_indices(args):
     populate SQLite rows and commit; they do not mutate FAISS indices.
     """
     _load_heavy_deps()  # ensure db_*, seg_*, make_* etc. are available
+    _require_faiss("building/updating indices")
     # Lazy imports to defer faiss/numpy loading until actually needed
     from litkit.build import (
         BuildConfig,
