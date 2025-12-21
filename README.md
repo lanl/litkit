@@ -228,6 +228,118 @@ backend = MyFTS5Backend(db_conn)
 lexical_result = backend.search(rare_terms, candidate_scope, lexical_config)
 ```
 
+## Developer Guide: High-ROI Efficiency Improvements
+
+These are the highest-impact optimizations identified during code review, ordered by
+expected ROI for large corpus builds.
+
+### 1. Time-Gated FAISS Saves (High Impact)
+
+**Problem:** `faiss_save()` rewrites the entire index file. Doing this per 20K vectors
+is expensive on Lustre/NFS, and the I/O can dominate GPU embedding time.
+
+**Current:** Saves after every batch flush (every ~20K vectors).
+
+**Recommendation:** Save at most once every 2-5 minutes, plus a final save at end:
+```python
+_SAVE_MIN_SEC = 120  # Already defined but unused
+_last_save_ts = {"papers": 0.0, "chunks": 0.0}
+
+def throttled_faiss_save(index, path, key: str) -> bool:
+    now = time.time()
+    if now - _last_save_ts[key] < _SAVE_MIN_SEC:
+        return False  # Skip save, reconcile+backfill will repair
+    _last_save_ts[key] = now
+    return faiss_save(index, path)
+```
+
+Since reconcile+backfill repairs any missing vectors on restart, frequent saves are
+unnecessary for correctness—only for reducing rework after crashes.
+
+### 2. Embedding Cache by Content Hash (Medium-High Impact)
+
+**Problem:** Titles/abstracts repeat across corpora. Chunk boilerplate (references,
+acknowledgments) repeats. Rebuilds recompute identical embeddings.
+
+**Recommendation:** On-disk cache with `sha1(text) → vector`:
+```python
+import hashlib
+import numpy as np
+
+class EmbeddingCache:
+    def __init__(self, cache_dir: Path, dtype="fp16"):
+        self.cache_dir = cache_dir
+        self.dtype = np.float16 if dtype == "fp16" else np.float32
+    
+    def _key(self, text: str) -> str:
+        return hashlib.sha1(text.encode()).hexdigest()
+    
+    def get(self, text: str) -> np.ndarray | None:
+        path = self.cache_dir / self._key(text)
+        if path.exists():
+            return np.fromfile(path, dtype=self.dtype)
+        return None
+    
+    def put(self, text: str, vec: np.ndarray):
+        path = self.cache_dir / self._key(text)
+        vec.astype(self.dtype).tofile(path)
+```
+
+**Usage:** Before embedding a batch, partition into cache hits and misses. Only embed
+misses, then merge results. Expected impact: 30-50% reduction in GPU time on rebuilds.
+
+### 3. Deterministic Vector IDs (Architectural Change)
+
+**Problem:** Current design requires SQLite `lastrowid` for each chunk before writing
+vectors. This forces row-by-row inserts and makes parallel ID assignment impossible.
+
+**Current:** `INSERT → lastrowid → add_with_ids()`
+
+**Recommendation:** Derive stable IDs from content:
+```python
+def chunk_vector_id(paper_id: int, ord: int) -> int:
+    """Pack (paper_id, ord) into a 64-bit ID for FAISS."""
+    return (paper_id << 16) | (ord & 0xFFFF)
+
+def paper_vector_id(doc_id: str) -> int:
+    """Hash doc_id to 64-bit ID for FAISS."""
+    return int(hashlib.sha1(doc_id.encode()).hexdigest()[:16], 16)
+```
+
+**Schema change:** Add `chunks.vector_id INTEGER UNIQUE` column (or use as PRIMARY KEY).
+Then `executemany()` all chunk inserts without per-row `lastrowid`.
+
+**Impact:** This is the single biggest structural win for multi-node scaling. Producers
+can generate IDs independently without coordination.
+
+### 4. Memmap-Friendly Segment Ingestion (Medium Impact)
+
+**Current:** Segment consumer iterates over files, calling `add_with_ids()` per segment.
+
+**Recommendation:** Memory-map vectors and batch adds in large contiguous slabs:
+```python
+def ingest_segments_batched(index, seg_dir: Path, batch_size: int = 100_000):
+    """Ingest all segments in one pass with large batch adds."""
+    all_ids, all_vecs = [], []
+    for seg_path in seg_dir.glob("*.seg"):
+        seg = load_segment(seg_path)  # Memory-mapped
+        all_ids.extend(seg.ids)
+        all_vecs.append(seg.vecs)
+        
+        if len(all_ids) >= batch_size:
+            stacked = np.vstack(all_vecs)
+            index.add_with_ids(stacked, np.array(all_ids))
+            all_ids, all_vecs = [], []
+    
+    # Final flush
+    if all_ids:
+        index.add_with_ids(np.vstack(all_vecs), np.array(all_ids))
+```
+
+Expected impact: 2-3x faster segment ingestion vs. many small adds.
+
+---
+
 ## Developer Guide: Improving Tar Processing Efficiency
 
 LitKit is designed to process the full PMC-OA corpus (~5M articles) in under 10 hours
