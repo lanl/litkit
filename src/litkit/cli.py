@@ -249,7 +249,10 @@ def _maybe_cleanup_own_stale_guard():
     get_runtime()  # ensure WRITER_GUARD is bound
     try:
         if WRITER_GUARD.exists():
-            pid, host, ts = (WRITER_GUARD.read_text().split() + ["", "", "0"])[:3]
+            # Parse guard file with explicit field extraction (avoids silent truncation)
+            parts = WRITER_GUARD.read_text().split()
+            pid = parts[0] if len(parts) >= 1 else ""
+            # host and ts unused here, but kept for clarity if parsing expands
             if pid.isdigit() and int(pid) == os.getpid():
                 WRITER_GUARD.unlink(missing_ok=True)
     except Exception:
@@ -320,7 +323,8 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
     max_attempts = 2  # initial try + one retry after stale cleanup
     for attempt in range(max_attempts):
         try:
-            fd = os.open(WRITER_GUARD, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            # Use os.fspath() for explicit Path→str conversion (consistent with other os.* calls)
+            fd = os.open(os.fspath(WRITER_GUARD), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.write(
                 fd, f"{os.getpid()} {socket.gethostname()} {int(time.time())}\n".encode()
             )
