@@ -2169,7 +2169,12 @@ def main():
         )
 
     # Make all later db_connect_db() calls honor the user's timeout setting
-    # by setting the env var that litkit.db.connection reads:
+    # by setting the env var that litkit.db.connection reads.
+    #
+    # NOTE: This works because litkit.db.connection reads the env var at CALL TIME
+    # (via _get_busy_timeout() inside connect_db()), not at import time. Importing
+    # the module just loads function definitions; the env var isn't read until
+    # connect_db() is actually invoked. Safe to set here after parse_args().
     os.environ["LITKIT_SQLITE_BUSY_TIMEOUT_MS"] = str(args.sqlite_busy_timeout_ms)
 
     # Do we need tar shards?
