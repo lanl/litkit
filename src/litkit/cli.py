@@ -770,10 +770,12 @@ def _resolve_question(args) -> str | None:
     """Resolve the effective question from one of:
     1) --question-file FILE (or '-' for stdin)
     2) Positional 'question' that is:
-        - '@path' shorthand (read from path)
-        - a path to an existing file (read from file)
+        - '@path' shorthand (explicit file read)
         - a literal string otherwise
     Returns the question text (stripped) or None.
+    
+    NOTE: Implicit file read (treating any existing file path as "read this file")
+    was removed as a footgun. Use '@path' or --question-file for file input.
     """
     # 1) explicit flag wins
     if args.question_file is not None:
@@ -785,18 +787,14 @@ def _resolve_question(args) -> str | None:
     if not q:
         return None
 
-    # 2a) '@file' shorthand
+    # 2a) '@file' shorthand - explicit opt-in to file read
     if q.startswith("@") and len(q) > 1:
         p = Path(q[1:])
         if p.is_file():
             return p.read_text(encoding="utf-8", errors="ignore").strip()
+        # '@path' was specified but file doesn't exist - treat as literal (user error)
 
-    # 2b) bare path to existing file (e.g., ./question.txt)
-    p = Path(q)
-    if p.is_file():
-        return p.read_text(encoding="utf-8", errors="ignore").strip()
-
-    # 2c) treat as literal question
+    # 2b) treat as literal question (no implicit file read)
     return q.strip()
 
 
@@ -1786,13 +1784,6 @@ def answer_with_llm(
 
 # -------------------- Citations: normalize + print only cited --------------------
 
-# Keep these for potential downstream uses (harmless if unused)
-_CITATION_BR = re.compile(
-    r"(\[(?:\s*\d+(?:\s*,\s*\d+)*\s*)\])"  # [1] or [1, 3]
-    r"|"
-    r"(【(?:\s*\d+(?:\s*[,、，]\s*\d+)*\s*)】)"  # 【2】 or 【1, 3】 (Chinese/JP commas allowed)
-)
-
 # We’ll normalize by extracting only the leading numeric list inside a bracket and
 # discarding any trailing “†L1–L8” or similar. Accept -, – or — in those tails.
 _CITATION_LINELOC = re.compile(r"([\[【]\s*\d+)\s*†L\d+(?:[–—-]\d+)?(\s*[】\]])")
@@ -1852,8 +1843,8 @@ def _normalize_and_strip_citations(text: str) -> str:
 
     return _CITATION_ANYBR.sub(_rebuild, s)
 
-# Back-compat for existing call sites that invoke _strip_citation_linelocs()
-def _strip_citation_linelocs(text: str) -> str:
+# Back-compat for existing call sites that invoke _normalize_citations()
+def _normalize_citations(text: str) -> str:
     return _normalize_and_strip_citations(text)
 
 
@@ -2623,7 +2614,7 @@ def main():
 
     if answer:
         # Normalize oddball citation shapes the model may emit
-        answer = _strip_citation_linelocs(answer)
+        answer = _normalize_citations(answer)
         # Collapse chunk-level citations to doc-level and render a clean bibliography
         # CRITICAL: Use final_chunks (what was actually sent after any overflow trimming),
         # not selected_chunks, to avoid citation/bibliography desync bugs.
