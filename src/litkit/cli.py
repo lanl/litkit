@@ -1501,24 +1501,33 @@ def answer_with_llm(
     is_o3 = m.startswith("o3")
 
     # Preflight check: local servers often support `models.list`.
-    # If it returns empty, surface a clear error before the main call.
+    # NOTE: Some OpenAI-compatible servers (vLLM, text-generation-inference, etc.)
+    # return empty from models.list() but still accept completions. We now treat
+    # empty results as a warning, not an error.
     try:
         models_resp = client.models.list()
         available = [
             getattr(x, "id", str(x)) for x in getattr(models_resp, "data", list(models_resp) or [])
         ]
         if ("localhost" in base_url or "127.0.0.1" in base_url) and not available:
-            raise RuntimeError("No models loaded. Please load an LLM.")
-        if (
+            # Some servers don't implement models.list properly - warn but continue
+            sys.stderr.write(
+                "[llm] WARNING: models.list() returned empty; proceeding anyway.\n"
+                "  (Some servers don't implement this endpoint but still accept completions.)\n"
+            )
+        elif (
             available
             and (model not in available)
             and ("localhost" in base_url or "127.0.0.1" in base_url)
         ):
-            raise RuntimeError(
-                f"Model {model!r} not found on the local endpoint. Available: {', '.join(available[:8])}{' …' if len(available) > 8 else ''}"
+            # Model not in list - warn but continue (server might accept it anyway)
+            sys.stderr.write(
+                f"[llm] WARNING: Model {model!r} not in models.list() response.\n"
+                f"  Available: {', '.join(available[:8])}{' …' if len(available) > 8 else ''}\n"
+                "  Proceeding anyway - server may still accept this model.\n"
             )
     except Exception:
-        # Not fatal: some providers don’t implement models.list; proceed to the main call.
+        # Not fatal: some providers don't implement models.list; proceed to the main call.
         pass
 
     # Default output budgets (conservative)
