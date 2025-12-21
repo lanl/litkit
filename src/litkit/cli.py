@@ -1576,6 +1576,9 @@ def build_or_update_indices(args):
 
             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
                 prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
+                # Remove existing IDs before add (mirrors mid-batch behavior)
+                sel = make_id_selector(u_ids)
+                safe_remove_ids(paper_index, sel)
                 added, ids_added = add_with_ids_dedup(paper_index, u_ids, Xp)
                 if added:
                     if prior_ntotal == 0:
@@ -1608,6 +1611,9 @@ def build_or_update_indices(args):
 
             with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
                 prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
+                # Remove existing IDs before add (mirrors mid-batch behavior)
+                sel = make_id_selector(u_ids)
+                safe_remove_ids(chunk_index, sel)
                 added, ids_added = add_with_ids_dedup(chunk_index, u_ids, Xc)
                 if added:
                     if prior_ntotal == 0:
