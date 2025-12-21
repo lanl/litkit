@@ -1881,6 +1881,41 @@ for tpath in tar_paths:
 2. **LLM code extraction** - Diminishing returns (~200 lines)
 3. **P2 architectural issues** - Require completing refactor
 
+---
+
+## Work Completed 2024-12-21 (Red Team Code Review Session)
+
+### Critical Fixes
+
+| Commit | Issue | Description |
+|--------|-------|-------------|
+| `f63745c` | **TOKEN BUDGET** | `BUDGET_TOKENS_OSS20B` was 3000 (far too small for 8k context models). Increased to 8000. Added safety clamp: if `max_out_tokens >= budget`, clamp `max_out` to 25% of budget to avoid 0 input budget. |
+| `5345cc1` | **FAISS GUARD** | Added `_require_faiss()` calls to `shortlist_papers()` and `search_chunks_constrained()` wrappers. Previously, calling these without FAISS installed gave cryptic errors instead of clear "install faiss-cpu" message. |
+| `7ac6014` | **MALFORMED GUARD** | When guard file is corrupt (can't parse PID/host), now gives targeted error message explaining the guard is corrupt instead of confusing "another writer appears active". |
+| `9032e18` | **PID REUSE** | `_maybe_cleanup_own_stale_guard()` now requires ALL THREE conditions to match (PID, host, timestamp within 7 days). Previously only checked PID, vulnerable to PID reuse on busy HPC clusters. |
+
+### Maintainability Improvements
+
+| Commit | Issue | Description |
+|--------|-------|-------------|
+| `3a65d13` | **BUILD_FLAGS** | Replaced fragile inverted early-exit logic (`if not need and not flag1 and not flag2...`) with explicit `BUILD_FLAGS` tuple enumeration. Adding new maintenance modes now requires adding to one place. |
+| `aa9990d` | **SIGNAL DOCS** | Documented signal handler behavior in `--faiss-writer` help text. Users now see that writer sessions use hard-exit on SIGINT/SIGTERM when running `--help`. |
+| `2c3d0de` | **NAMESPACE COLLISION** | Added collision detection to `_load_heavy_deps()`. If `_load_internal_modules()` exports a reserved key (like `faiss_available`), raises RuntimeError instead of silently overriding. |
+
+### Notes on Deferred Items
+
+Per user feedback, these are noted for future work but not blocking:
+
+- **Citation regex unit tests** - `_CITATION_ANYBR` traverses lots of bracketed text; should add tests for `[Figure 2]`, `[p < 0.05]`, nested brackets
+- **Optional tiktoken** - `len(s)//4` heuristic is acceptable for safety but tiktoken would give better token counting for OpenAI cloud runs
+- **models.list() handling** - Already conservative (warning not error for empty response) - keep this policy
+
+---
+
+## Current Status
+
+**cli.py is now ~2300 lines** (down from 4723 at start, **~51% reduction**)
+
 ### Refactor Architecture (Complete)
 
 ```
