@@ -2282,7 +2282,12 @@ def main():
             return PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists() and DB_PATH.exists()
         except OSError as e:
             # Permission denied, path too long, etc. - fail fast with clear message
-            _eprint(f"[error] cannot access vector store paths: {e.__class__.__name__}: {e}")
+            _eprint(
+                f"[error] cannot access vector store paths: {e.__class__.__name__}: {e}\n"
+                f"  DB_PATH: {DB_PATH}\n"
+                f"  PAPER_INDEX_PATH: {PAPER_INDEX_PATH}\n"
+                f"  CHUNK_INDEX_PATH: {CHUNK_INDEX_PATH}"
+            )
             raise SystemExit(2)
 
     # Early guard for --consume-only with missing indices
