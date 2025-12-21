@@ -1946,54 +1946,8 @@ def main():
     seen_flags = {s.split("=", 1)[0] for s in sys.argv}
     args._ivf_nlist_forced = ("--ivf-nlist" in seen_flags)
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # LAZY IMPORTS: Heavy dependencies loaded here (after argparse)
-    # ═══════════════════════════════════════════════════════════════════════════
-    # These imports pull in faiss, numpy, torch, lxml, transformers.
-    # By importing here (not at module level), we ensure --help/--version work
-    # even if these dependencies are missing or broken.
-    global configure_threads, detect_device, make_paper_embedder, make_chunk_embedder
-    global normalize_answer_and_build_refs, render_references
-    global iter_tar_paths, iter_tar_xml_streams, parallel_iter_tar_articles, parse_xml_fileobj
-    global is_uncompressed_tar, shard_filter
-    global db_init_db, db_init_shard_db, db_connect_db, db_shard_db_path
-    global db_chunk_ids_to_paper_ids, db_flush_pending_marks, db_load_temp_candidates
-    global seg_validate_shard_consistency, seg_write_build_meta, seg_read_build_meta
-    global seg_has_segment_files, SegmentWriter, ChunkSegmentWriter
-    global SegProducerCoordinator, SegConsumerCoordinator
-    global seg_ingest_paper_segments, seg_ingest_chunk_segments
-    
-    from litkit.embeddings.devices import configure_threads, detect_device
-    from litkit.embeddings.factory import make_chunk_embedder, make_paper_embedder
-    from litkit.formatting.answers import normalize_answer_and_build_refs, render_references
-    from litkit.ingest.ingest import (
-        iter_tar_paths,
-        iter_tar_xml_streams,
-        parallel_iter_tar_articles,
-        parse_xml_fileobj,
-    )
-    from litkit.ingest import is_uncompressed_tar, shard_filter
-    from litkit.db import (
-        init_db as db_init_db,
-        init_shard_db as db_init_shard_db,
-        connect_db as db_connect_db,
-        shard_db_path as db_shard_db_path,
-        chunk_ids_to_paper_ids as db_chunk_ids_to_paper_ids,
-        flush_pending_marks as db_flush_pending_marks,
-        load_temp_candidates as db_load_temp_candidates,
-    )
-    from litkit.segments import (
-        validate_shard_consistency as seg_validate_shard_consistency,
-        write_build_meta as seg_write_build_meta,
-        read_build_meta as seg_read_build_meta,
-        has_segment_files as seg_has_segment_files,
-        SegmentWriter,
-        ChunkSegmentWriter,
-        ProducerCoordinator as SegProducerCoordinator,
-        ConsumerCoordinator as SegConsumerCoordinator,
-        ingest_paper_segments as seg_ingest_paper_segments,
-        ingest_chunk_segments as seg_ingest_chunk_segments,
-    )
+    # Load heavy dependencies (idempotent - delegates to _load_heavy_deps())
+    _load_heavy_deps()
     
     # logging + device threads
     logging.basicConfig(
