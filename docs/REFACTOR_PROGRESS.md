@@ -1657,6 +1657,64 @@ cli.py wrappers bridge the gap by passing globals to module functions.
 This is orthogonal to line count - it's about eliminating implicit coupling so
 functions are self-contained and testable.
 
+#### Concurrency Safety Not Airtight (P2)
+
+**Problem:** The current concurrency model mixes several mechanisms without clear guarantees:
+1. SQLite busy timeout + implicit DB concurrency
+2. Explicit file locks (`FileLock`) for "DB+FAISS" operations
+3. External writer guard file with TTL-based eviction
+
+**Weak points identified:**
+
+1. **`--rebuild` doesn't enforce exclusive access:**
+   - Requires `--faiss-writer` (enforced)
+   - But doesn't verify no producers/consumers are running
+   - A user could start `--rebuild` while stale producers are still active
+   - Risk: corrupt indices or data loss from concurrent writes
+
+2. **Cross-host TTL eviction is dangerous:**
+   - On same host: checks PID liveness via `os.kill(pid, 0)` before evicting
+   - On different host: can't check PID, relies solely on timestamp
+   - Risk: a legitimate 25-hour build gets evicted at 24h TTL (documented but not production-friendly)
+
+**Potential fixes:**
+
+1. **Heartbeat-based guard (Option A):**
+   ```python
+   # Writer periodically touches guard file
+   def _update_guard_heartbeat():
+       while running:
+           WRITER_GUARD.touch()  # updates mtime
+           time.sleep(60)
+   
+   # Staleness check looks at mtime, not creation time
+   if (time.time() - guard_mtime) > TTL_SEC:
+       # Guard is stale (no heartbeat for TTL_SEC)
+   ```
+   **Pro:** Long builds survive automatically.  
+   **Con:** Requires background thread, more complexity.
+
+2. **Default TTL off (Option B):**
+   ```python
+   # LITKIT_WRITER_GUARD_TTL=0 (or unset) → never auto-evict
+   # Require manual cleanup: rm .writer_guard
+   ```
+   **Pro:** Simple, safe.  
+   **Con:** Manual cleanup burden on users.
+
+3. **Exclusive maintenance lock for `--rebuild`:**
+   - Verify no `.shard_XX_complete` markers present (no active producers)
+   - Verify no other `.writer_guard` (already enforced)
+   - Maybe: check SQLite WAL locks or recent connection activity
+   - Block until exclusive access confirmed
+
+**Current mitigation:** TTL eviction documented as a known limitation. Users can
+set `LITKIT_WRITER_GUARD_TTL=0` to disable auto-eviction entirely (requires manual
+guard cleanup after crashes).
+
+**Note:** This requires careful design and testing. The heartbeat approach is the
+most robust but adds complexity. Recommend prototyping before committing.
+
 ### Refactor Architecture (Complete)
 
 ```
