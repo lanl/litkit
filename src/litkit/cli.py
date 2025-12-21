@@ -365,8 +365,28 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
                     #
                     # The invariant: reconcile+backfill ALWAYS runs before any new work.
                     # See build_or_update_indices() near the faiss_writer block.
-                    signal.signal(signal.SIGINT,  lambda *_: (_cleanup_guard(), os._exit(1)))
-                    signal.signal(signal.SIGTERM, lambda *_: (_cleanup_guard(), os._exit(1)))
+                    #
+                    # NOTE: Signal handlers are installed AFTER guard creation and fsync,
+                    # so we cannot exit mid-guard-write. Logging is explicit and flushed
+                    # before os._exit() per red team feedback.
+                    
+                    def _signal_exit_handler(signum, frame):
+                        """Hard exit handler with explicit logging before os._exit(1)."""
+                        import signal as sig_mod  # local import to get signal names
+                        sig_name = sig_mod.Signals(signum).name if hasattr(sig_mod, 'Signals') else f"signal {signum}"
+                        # Write to stderr and flush immediately before hard exit
+                        msg = f"\n[signal] Received {sig_name}; cleaning up guard and exiting (hard exit).\n"
+                        msg += "[signal] NOTE: reconcile+backfill will repair any partial state on next startup.\n"
+                        try:
+                            sys.stderr.write(msg)
+                            sys.stderr.flush()
+                        except Exception:
+                            pass  # best effort - don't let logging failure block cleanup
+                        _cleanup_guard()
+                        os._exit(1)
+                    
+                    signal.signal(signal.SIGINT, _signal_exit_handler)
+                    signal.signal(signal.SIGTERM, _signal_exit_handler)
             except Exception:
                 pass
             return  # Success - guard created
