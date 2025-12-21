@@ -1277,6 +1277,12 @@ def build_or_update_indices(args):
             # tried to RELEASE or ROLLBACK after the commit.
             # ═══════════════════════════════════════════════════════════════════════
             
+            # Increment processed_count BEFORE flush blocks so checkpoint reflects
+            # "members fully handled" not "one behind". This avoids unnecessary
+            # reprocessing and duplicate segment production on restart.
+            if handled_ok:
+                processed_count += 1
+            
             if handled_ok and len(paper_ids_buf) >= PAPER_BATCH:
                 u_ids, u_texts, u_doc_ids = dedupe_papers_with_doc_ids(
                     paper_ids_buf, paper_texts_buf, paper_doc_ids_buf
@@ -1425,7 +1431,7 @@ def build_or_update_indices(args):
 
             # Update progress & checkpoint only after a successful handle
             if handled_ok:
-                processed_count += 1
+                # Note: processed_count already incremented above (before flush blocks)
                 _render()
 
                 # Persist every CKPT_EVERY handled members (commit + checkpoint)
@@ -1448,11 +1454,19 @@ def build_or_update_indices(args):
                         persisted_count = processed_count
                         _render(force=True)
 
-        # End of this tar: final commit + checkpoint at the *processed* count
+        # End of this tar: final commit + checkpoint
         _render(force=True)
         _progress_newline(sys.stderr)
         conn.commit()
-        ckpt_stream[str(tpath)] = processed_count
+        
+        # PRODUCER MODE: Only checkpoint up to persisted_count (last segment-flushed boundary).
+        # The remainder buffers haven't been flushed to segments yet, so we can't checkpoint
+        # past the durable segment flush point. Otherwise, crash before final flush → data loss.
+        # WRITER MODE: OK to checkpoint processed_count (reconcile+backfill repairs any gaps).
+        if args.embed_producer:
+            ckpt_stream[str(tpath)] = persisted_count
+        else:
+            ckpt_stream[str(tpath)] = processed_count
         ckpt["build_stream"] = ckpt_stream
         seg_save_checkpoint(ckpt, CKPT_PATH, CKPT_LOCK, shard_id=ckpt_shard_id)
 
