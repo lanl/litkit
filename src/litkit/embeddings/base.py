@@ -139,8 +139,10 @@ def progress_write(s: str, stream) -> None:
             stream.flush()
             _PROGRESS_LAST_LEN = 0
         else:
-            pad = max(0, _PROGRESS_LAST_LEN - len(s))
-            stream.write("\r" + s + (" " * pad))
+            # Use ANSI escape code to clear to end of line instead of space padding.
+            # This is more robust when multiple concurrent progress writers exist,
+            # as space padding relies on tracking the previous line length globally.
+            stream.write("\r" + s + "\033[K")
             stream.flush()
             _PROGRESS_LAST_LEN = len(s)
 
@@ -180,8 +182,8 @@ def inline_progress_renderer(label: str, total: int, stream=None, done_summary: 
                     )
                     stream.flush()
             else:
-                pad = max(0, prev_len - len(s))
-                stream.write("\r" + s + (" " * pad))
+                # Use ANSI escape code to clear to end of line (more robust)
+                stream.write("\r" + s + "\033[K")
                 stream.flush()
                 prev_len = len(s)
                 if final:

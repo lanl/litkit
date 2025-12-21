@@ -55,6 +55,7 @@ Example
 from __future__ import annotations
 
 import os
+import sys
 
 
 def configure_threads(default: str | None = None) -> dict[str, str]:
@@ -62,9 +63,17 @@ def configure_threads(default: str | None = None) -> dict[str, str]:
     Respect the setting for LITKIT_THREADS if available.
     Return a dict of values.
     NB: This function must be called before importing faiss.
+    
+    Platform-specific behavior:
+    - macOS: Forces FAISS_NUM_THREADS=1 and OMP_NUM_THREADS=1 by default
+      to prevent segfaults from FAISS + MPS threading conflicts.
+    - Linux/HPC: Uses CPU-count based heuristics for reasonable parallelism.
+    
+    Users can override with LITKIT_THREADS env var.
     """
     val = default or os.environ.get("LITKIT_THREADS", "").strip()
     if val:
+        # Explicit override - respect user's choice
         for k in (
             "VECLIB_MAXIMUM_THREADS",
             "OMP_NUM_THREADS",
@@ -74,7 +83,21 @@ def configure_threads(default: str | None = None) -> dict[str, str]:
             "FAISS_NUM_THREADS",
         ):
             os.environ.setdefault(k, val)
+    elif sys.platform == "darwin":
+        # macOS: FAISS + MPS threading causes segfaults
+        # Force single-threaded operation by default
+        os.environ.setdefault("FAISS_NUM_THREADS", "1")
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        # Other thread vars can remain at reasonable defaults
+        for k in (
+            "OPENBLAS_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "BLIS_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+        ):
+            os.environ.setdefault(k, "4")
     else:
+        # Linux/HPC: use CPU-count based heuristics
         cpu = os.cpu_count() or 32  # size to the node
         polite = str(min(32, cpu))
         faiss_polite = str(min(16, max(4, cpu // 2)))
