@@ -1283,15 +1283,28 @@ def build_or_update_indices(args):
                 )
 
                 if paper_seg_writer is not None:
-                    Xp = paper_embedder.encode(
-                        u_texts,
-                        progress_label=f"Embedding papers (producer, {len(u_texts)})",
-                        batch_size=args.paper_embed_bs,
-                        progress_done_summary=False,
-                    )
-                    paper_seg_writer.write(doc_ids=u_doc_ids, vecs=Xp)
-                    conn.commit()
-                    papers_added_total += len(u_ids)
+                    # Producer mode: embed and write segments with fail-fast behavior
+                    try:
+                        Xp = paper_embedder.encode(
+                            u_texts,
+                            progress_label=f"Embedding papers (producer, {len(u_texts)})",
+                            batch_size=args.paper_embed_bs,
+                            progress_done_summary=False,
+                        )
+                        paper_seg_writer.write(doc_ids=u_doc_ids, vecs=Xp)
+                        conn.commit()
+                        papers_added_total += len(u_ids)
+                        
+                        # PRODUCER CHECKPOINT: Only checkpoint after successful segment flush.
+                        # This ensures we don't skip work on restart that was never written to segments.
+                        ckpt_stream[str(tpath)] = processed_count
+                        ckpt["build_stream"] = ckpt_stream
+                        seg_save_checkpoint(ckpt, CKPT_PATH, CKPT_LOCK, shard_id=ckpt_shard_id)
+                        persisted_count = processed_count
+                    except Exception as e:
+                        conn.rollback()
+                        _eprint(f"[flush] FATAL: paper segment flush failed: {e.__class__.__name__}: {e}")
+                        raise  # Fail fast; scheduler will restart from last checkpoint
 
                 elif args.faiss_writer:
                     Xp = paper_embedder.encode(
@@ -1335,17 +1348,30 @@ def build_or_update_indices(args):
                 )
 
                 if chunk_seg_writer is not None:
-                    Xc = chunk_embedder.encode(
-                        u_texts,
-                        progress_label=f"Embedding chunks (producer, {len(u_texts)})",
-                        batch_size=args.chunk_embed_bs,
-                        progress_done_summary=False,
-                    )
-                    chunk_seg_writer.write(
-                        paper_doc_ids=u_paper_doc_ids, ords=u_ords, vecs=Xc
-                    )
-                    conn.commit()
-                    chunks_added_total += len(u_ids)
+                    # Producer mode: embed and write segments with fail-fast behavior
+                    try:
+                        Xc = chunk_embedder.encode(
+                            u_texts,
+                            progress_label=f"Embedding chunks (producer, {len(u_texts)})",
+                            batch_size=args.chunk_embed_bs,
+                            progress_done_summary=False,
+                        )
+                        chunk_seg_writer.write(
+                            paper_doc_ids=u_paper_doc_ids, ords=u_ords, vecs=Xc
+                        )
+                        conn.commit()
+                        chunks_added_total += len(u_ids)
+                        
+                        # PRODUCER CHECKPOINT: Only checkpoint after successful segment flush.
+                        # This ensures we don't skip work on restart that was never written to segments.
+                        ckpt_stream[str(tpath)] = processed_count
+                        ckpt["build_stream"] = ckpt_stream
+                        seg_save_checkpoint(ckpt, CKPT_PATH, CKPT_LOCK, shard_id=ckpt_shard_id)
+                        persisted_count = processed_count
+                    except Exception as e:
+                        conn.rollback()
+                        _eprint(f"[flush] FATAL: chunk segment flush failed: {e.__class__.__name__}: {e}")
+                        raise  # Fail fast; scheduler will restart from last checkpoint
 
                 elif args.faiss_writer:
                     Xc = chunk_embedder.encode(
@@ -1391,13 +1417,24 @@ def build_or_update_indices(args):
                 _render()
 
                 # Persist every CKPT_EVERY handled members (commit + checkpoint)
+                # IMPORTANT: In producer mode, DO NOT checkpoint on CKPT_EVERY.
+                # Producer checkpoint must be gated by successful segment flush,
+                # not just DB rows inserted. Otherwise, on restart we'd skip
+                # members whose segments were never written → unrecoverable data loss.
                 if (processed_count - persisted_count) >= CKPT_EVERY:
-                    conn.commit()
-                    ckpt_stream[str(tpath)] = processed_count
-                    ckpt["build_stream"] = ckpt_stream
-                    seg_save_checkpoint(ckpt, CKPT_PATH, CKPT_LOCK, shard_id=ckpt_shard_id)
-                    persisted_count = processed_count
-                    _render(force=True)
+                    if args.embed_producer:
+                        # Producer mode: skip checkpointing here.
+                        # Checkpoint happens only after successful segment flush below.
+                        pass
+                    else:
+                        # Writer/consumer mode: checkpoint on CKPT_EVERY is safe
+                        # because reconcile+backfill will fix any missing vectors.
+                        conn.commit()
+                        ckpt_stream[str(tpath)] = processed_count
+                        ckpt["build_stream"] = ckpt_stream
+                        seg_save_checkpoint(ckpt, CKPT_PATH, CKPT_LOCK, shard_id=ckpt_shard_id)
+                        persisted_count = processed_count
+                        _render(force=True)
 
         # End of this tar: final commit + checkpoint at the *processed* count
         _render(force=True)
