@@ -1629,6 +1629,28 @@ is deferred, not the heavy imports or side effects on attribute access.
 This is orthogonal to line count reduction - it's about achieving true import purity
 so `from litkit.cli import X` doesn't have side effects.
 
+#### Import-Time Heavy Dependencies (P2)
+
+**Problem:** cli.py imports `faiss`, `numpy`, and ~15 litkit.* modules at the module
+level. This means:
+- `python -m litkit --help` fails if FAISS isn't installed
+- `python -m litkit --version` fails if FAISS isn't installed
+- Import takes 2-5 seconds even for simple operations
+
+**Impact:** Users without FAISS can't even get help text. Breaks tooling that
+parses `--help` output.
+
+**Fix complexity:** HIGH - requires:
+1. Move all heavy imports inside functions (~30+ imports)
+2. Use `TYPE_CHECKING` for type hints with string annotations
+3. Create import helper functions for deferred loading
+4. Risk of subtle bugs from import order changes
+
+**Workaround:** Install `faiss-cpu` as intended (required dependency anyway).
+
+**Decision:** Deferred to separate ticket. Low user impact on HPC clusters (always
+have FAISS). High implementation risk relative to benefit.
+
 #### Global Mutable State Leaks Across Modes (P2)
 
 **Problem:** cli.py has module-level mutable globals that are only initialized in `main()`:
