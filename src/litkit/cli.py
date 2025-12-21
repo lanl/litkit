@@ -457,6 +457,19 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
                     try: ts = int(parts[2])
                     except ValueError: ts = 0
                 
+                # Explicit malformed guard detection: if we couldn't parse PID or host,
+                # the guard file is corrupt (not just "another writer active").
+                # Give a targeted message instead of the confusing generic error.
+                if guard_pid is None or not guard_host:
+                    sys.stderr.write(
+                        f"[writer] Guard file appears corrupt (expected: 'PID HOST TIMESTAMP'):\n"
+                        f"         File: {WRITER_GUARD}\n"
+                        f"         Contents: {info!r}\n"
+                        "         If you are CERTAIN no writer is running, remove it:\n"
+                        f"           rm {WRITER_GUARD}\n"
+                    )
+                    sys.exit(2)
+                
                 # TTL ≤ 0 means "never consider guards stale" (manual cleanup required).
                 if ttl_sec > 0 and ts and (time.time() - ts) > ttl_sec and attempt == 0:
                     # Guard appears stale by timestamp, but check PID liveness first
