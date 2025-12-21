@@ -37,8 +37,6 @@ from litkit.segments.ingest import (
     ingest_paper_segments,
     ingest_chunk_segments,
     SegmentIngestConfig,
-    get_pending_marks as ingest_get_pending_marks,
-    clear_pending_marks as ingest_clear_pending_marks,
 )
 
 __all__ = [
@@ -66,6 +64,4 @@ __all__ = [
     "ingest_paper_segments",
     "ingest_chunk_segments",
     "SegmentIngestConfig",
-    "ingest_get_pending_marks",
-    "ingest_clear_pending_marks",
 ]

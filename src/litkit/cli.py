@@ -945,9 +945,18 @@ def build_or_update_indices(args):
         if CKPT_PATH.exists():
             CKPT_PATH.unlink()
 
-        # wipe tables
-        cur.executescript("DELETE FROM chunks; DELETE FROM papers; DELETE FROM files; VACUUM;")
+        # wipe tables (DELETE in transaction, VACUUM outside)
+        cur.executescript("DELETE FROM chunks; DELETE FROM papers; DELETE FROM files;")
         conn.commit()
+        
+        # VACUUM must run outside any transaction (autocommit mode)
+        # Without this, sqlite3.OperationalError: cannot VACUUM from within a transaction
+        old_isolation = conn.isolation_level
+        conn.isolation_level = None  # autocommit
+        try:
+            conn.execute("VACUUM")
+        finally:
+            conn.isolation_level = old_isolation  # restore
         _eprint("[rebuild] done")
 
     # PAPER index (load existing or create new)

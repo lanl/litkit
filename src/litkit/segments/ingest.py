@@ -13,7 +13,6 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -30,11 +29,6 @@ if TYPE_CHECKING:
     from litkit.config.paths import WorkspacePaths
 
 
-# ---------------------------------------------------------------------------
-# Module-level pending marks buffer (used by segment ingestion)
-# ---------------------------------------------------------------------------
-
-_PENDING_MARKS: dict[str, list[int]] = defaultdict(list)
 
 
 def _eprint(msg: str = "", *, end: str = "\n") -> None:
@@ -216,6 +210,10 @@ def ingest_paper_segments(
             added, ids_added, saved = 0, [], False
             
             with FileLock(faiss_lock_path):
+                # Remove existing IDs to allow re-embedding (mirrors chunk behavior)
+                sel = make_id_selector(ids)
+                safe_remove_ids(paper_index, sel)
+                
                 added, ids_added = add_with_ids_dedup(paper_index, ids, X)
                 if added:
                     # Force save on first vectors, throttled save otherwise
@@ -224,7 +222,7 @@ def ingest_paper_segments(
             
             if added:
                 if saved:
-                    from litkit.db.indexing import mark_in_index, flush_pending_marks
+                    from litkit.db.indexing import mark_in_index
                     if db_lock_path:
                         with FileLock(db_lock_path):
                             if len(ids_added) > 0:
@@ -234,9 +232,7 @@ def ingest_paper_segments(
                         if len(ids_added) > 0:
                             mark_in_index(cur, "papers", [int(i) for i in ids_added])
                         conn.commit()
-                else:
-                    if len(ids_added) > 0:
-                        _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
+                # else: save failed, reconcile+backfill will repair
             
             added_total += int(added or 0)
             batch_counter += 1
@@ -434,7 +430,7 @@ def ingest_chunk_segments(
             
             if added:
                 if saved:
-                    from litkit.db.indexing import mark_in_index, flush_pending_marks
+                    from litkit.db.indexing import mark_in_index
                     if db_lock_path:
                         with FileLock(db_lock_path):
                             if len(ids_added) > 0:
@@ -444,9 +440,7 @@ def ingest_chunk_segments(
                         if len(ids_added) > 0:
                             mark_in_index(cur, "chunks", [int(i) for i in ids_added])
                         conn.commit()
-                else:
-                    if len(ids_added) > 0:
-                        _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
+                # else: save failed, reconcile+backfill will repair
             
             added_total += int(added)
             batch_counter += 1
@@ -476,17 +470,3 @@ def ingest_chunk_segments(
             _eprint(f"[segments] ERROR ingesting {p.name}: {e.__class__.__name__}: {e}")
     
     return chunk_index, added_total
-
-
-def get_pending_marks() -> dict[str, list[int]]:
-    """Get the pending marks buffer for segment ingestion.
-    
-    Returns:
-        Dictionary mapping table names to lists of pending IDs
-    """
-    return _PENDING_MARKS
-
-
-def clear_pending_marks() -> None:
-    """Clear all pending marks."""
-    _PENDING_MARKS.clear()
