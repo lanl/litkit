@@ -24,8 +24,7 @@ from . import __version__ as LITKIT_VERSION
 # Set LITKIT_QUIET=1 to squelch startup banners that print before args are parsed.
 # NOTE: Do not use a frozen QUIET variable here - use is_quiet() from progress.py
 # which checks os.environ on each call for consistent behavior after --quiet is parsed.
-# Suppress early banners for --version/--help
-_SUPPRESS_EARLY = any(x in sys.argv for x in ("--version", "-h", "--help"))
+# For --version/--help, argparse exits before any printing, so no special handling needed.
 
 
 def _version_banner() -> str:
