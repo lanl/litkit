@@ -93,10 +93,11 @@ if TYPE_CHECKING:
 # are deferred via _load_heavy_deps(). This function is idempotent and must be
 # called at the top of any function that uses these dependencies.
 
+_heavy_lock = threading.Lock()
 _heavy_loaded = False
 
 def _load_heavy_deps() -> None:
-    """Idempotent loader for heavy dependencies.
+    """Idempotent, thread-safe loader for heavy dependencies.
     
     Must be called at the top of any function that uses:
     - litkit.embeddings.* (torch, transformers)
@@ -105,57 +106,61 @@ def _load_heavy_deps() -> None:
     - litkit.ingest.* (lxml)
     - litkit.formatting.* (answer rendering)
     
-    Safe to call multiple times; only loads once.
+    Safe to call multiple times from multiple threads; only loads once.
+    Uses double-checked locking to avoid races while minimizing lock contention.
     """
     global _heavy_loaded
     if _heavy_loaded:
         return
-    
-    # Declare all globals we're about to bind
-    global configure_threads, detect_device, make_paper_embedder, make_chunk_embedder
-    global normalize_answer_and_build_refs, render_references
-    global iter_tar_paths, iter_tar_xml_streams, parallel_iter_tar_articles, parse_xml_fileobj
-    global is_uncompressed_tar, shard_filter
-    global db_init_db, db_init_shard_db, db_connect_db, db_shard_db_path
-    global db_chunk_ids_to_paper_ids, db_flush_pending_marks, db_load_temp_candidates
-    global seg_validate_shard_consistency, seg_write_build_meta, seg_read_build_meta
-    global seg_has_segment_files, SegmentWriter, ChunkSegmentWriter
-    global SegProducerCoordinator, SegConsumerCoordinator
-    global seg_ingest_paper_segments, seg_ingest_chunk_segments
-    
-    from litkit.embeddings.devices import configure_threads, detect_device
-    from litkit.embeddings.factory import make_chunk_embedder, make_paper_embedder
-    from litkit.formatting.answers import normalize_answer_and_build_refs, render_references
-    from litkit.ingest.ingest import (
-        iter_tar_paths,
-        iter_tar_xml_streams,
-        parallel_iter_tar_articles,
-        parse_xml_fileobj,
-    )
-    from litkit.ingest import is_uncompressed_tar, shard_filter
-    from litkit.db import (
-        init_db as db_init_db,
-        init_shard_db as db_init_shard_db,
-        connect_db as db_connect_db,
-        shard_db_path as db_shard_db_path,
-        chunk_ids_to_paper_ids as db_chunk_ids_to_paper_ids,
-        flush_pending_marks as db_flush_pending_marks,
-        load_temp_candidates as db_load_temp_candidates,
-    )
-    from litkit.segments import (
-        validate_shard_consistency as seg_validate_shard_consistency,
-        write_build_meta as seg_write_build_meta,
-        read_build_meta as seg_read_build_meta,
-        has_segment_files as seg_has_segment_files,
-        SegmentWriter,
-        ChunkSegmentWriter,
-        ProducerCoordinator as SegProducerCoordinator,
-        ConsumerCoordinator as SegConsumerCoordinator,
-        ingest_paper_segments as seg_ingest_paper_segments,
-        ingest_chunk_segments as seg_ingest_chunk_segments,
-    )
-    
-    _heavy_loaded = True
+    with _heavy_lock:
+        if _heavy_loaded:  # Double-check inside lock
+            return
+        
+        # Declare all globals we're about to bind (inside lock)
+        global configure_threads, detect_device, make_paper_embedder, make_chunk_embedder
+        global normalize_answer_and_build_refs, render_references
+        global iter_tar_paths, iter_tar_xml_streams, parallel_iter_tar_articles, parse_xml_fileobj
+        global is_uncompressed_tar, shard_filter
+        global db_init_db, db_init_shard_db, db_connect_db, db_shard_db_path
+        global db_chunk_ids_to_paper_ids, db_flush_pending_marks, db_load_temp_candidates
+        global seg_validate_shard_consistency, seg_write_build_meta, seg_read_build_meta
+        global seg_has_segment_files, SegmentWriter, ChunkSegmentWriter
+        global SegProducerCoordinator, SegConsumerCoordinator
+        global seg_ingest_paper_segments, seg_ingest_chunk_segments
+        
+        from litkit.embeddings.devices import configure_threads, detect_device
+        from litkit.embeddings.factory import make_chunk_embedder, make_paper_embedder
+        from litkit.formatting.answers import normalize_answer_and_build_refs, render_references
+        from litkit.ingest.ingest import (
+            iter_tar_paths,
+            iter_tar_xml_streams,
+            parallel_iter_tar_articles,
+            parse_xml_fileobj,
+        )
+        from litkit.ingest import is_uncompressed_tar, shard_filter
+        from litkit.db import (
+            init_db as db_init_db,
+            init_shard_db as db_init_shard_db,
+            connect_db as db_connect_db,
+            shard_db_path as db_shard_db_path,
+            chunk_ids_to_paper_ids as db_chunk_ids_to_paper_ids,
+            flush_pending_marks as db_flush_pending_marks,
+            load_temp_candidates as db_load_temp_candidates,
+        )
+        from litkit.segments import (
+            validate_shard_consistency as seg_validate_shard_consistency,
+            write_build_meta as seg_write_build_meta,
+            read_build_meta as seg_read_build_meta,
+            has_segment_files as seg_has_segment_files,
+            SegmentWriter,
+            ChunkSegmentWriter,
+            ProducerCoordinator as SegProducerCoordinator,
+            ConsumerCoordinator as SegConsumerCoordinator,
+            ingest_paper_segments as seg_ingest_paper_segments,
+            ingest_chunk_segments as seg_ingest_chunk_segments,
+        )
+        
+        _heavy_loaded = True
 
 
 
