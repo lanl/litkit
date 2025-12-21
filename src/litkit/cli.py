@@ -1450,6 +1450,7 @@ def shortlist_papers(
     embedder: "Embedder | None" = None,
 ) -> list[int]:
     """Thin wrapper: delegates to litkit.retrieval.shortlist_papers."""
+    _require_faiss("retrieval")  # fail fast if FAISS missing (even if called directly)
     d = deps()  # ensures loaded + returns namespace (consistent pattern)
     from litkit.retrieval import shortlist_papers as retrieval_shortlist_papers
     get_runtime()
@@ -1476,6 +1477,7 @@ def search_chunks_constrained(
     per_paper_cap: int = 0,
 ) -> tuple[list[int], dict[str, int]]:
     """Thin wrapper: delegates to litkit.retrieval.search_chunks_constrained."""
+    _require_faiss("retrieval")  # fail fast if FAISS missing (even if called directly)
     d = deps()  # ensures loaded + returns namespace (consistent pattern)
     from litkit.retrieval import search_chunks_constrained as retrieval_search_chunks_constrained
     get_runtime()
