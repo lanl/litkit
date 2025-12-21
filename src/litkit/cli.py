@@ -167,6 +167,18 @@ from litkit.build import (
     load_or_create_chunk_index as build_load_or_create_chunk_index,
     train_ivfpq_index as build_train_ivfpq_index,
 )
+from litkit.retrieval import (
+    shortlist_papers as retrieval_shortlist_papers,
+    search_chunks_constrained as retrieval_search_chunks_constrained,
+    get_chunks as retrieval_get_chunks,
+    faiss_search as retrieval_faiss_search,
+    temporary_search_params as retrieval_temporary_search_params,
+    query_terms as retrieval_query_terms,
+    sqlite_norm_expr as retrieval_sqlite_norm_expr,
+    escape_like as retrieval_escape_like,
+    normalize_for_search_py as retrieval_normalize_for_search_py,
+    avg_chunks_for_papers as retrieval_avg_chunks_for_papers,
+)
 from litkit.db import (
     init_db as db_init_db,
     init_shard_db as db_init_shard_db,
