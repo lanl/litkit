@@ -1285,6 +1285,30 @@ def build_or_update_indices(args):
                     f"[segments] ingested {p_added} paper vectors and {c_added} chunk vectors from segments"
                 )
 
+        # ═══════════════════════════════════════════════════════════════════════════
+        # SAFETY INVARIANT: reconcile+backfill runs on EVERY faiss_writer startup
+        # ═══════════════════════════════════════════════════════════════════════════
+        # This is the critical repair step that makes os._exit(1) in signal handlers
+        # safe (see _create_writer_guard_or_exit). No matter how the previous run
+        # terminated (normal exit, SIGINT, SIGTERM, crash, OOM kill), this sequence:
+        #
+        #   1. reconcile_sqlite_flags_with_faiss() - finds rows with in_index=1 that
+        #      are NOT in FAISS (e.g., DB committed but FAISS not saved before kill)
+        #      and resets their flags to in_index=0
+        #
+        #   2. backfill_unindexed_vectors() - re-embeds and re-adds any rows with
+        #      in_index=0 to FAISS, then marks them in_index=1
+        #
+        # guarantees the vector store is consistent before any new work begins.
+        #
+        # This runs in ALL relevant modes:
+        #   - --faiss-writer (normal build): here
+        #   - --reconcile-only: explicitly runs reconcile+backfill, then exits
+        #   - --consume-only: calls run_consume_only_mode() which has its own guards
+        #
+        # Producers (--embed-producer) don't touch FAISS, so no reconcile needed.
+        # ═══════════════════════════════════════════════════════════════════════════
+        
         # Reset any rows marked in_index=1 that are missing from FAISS
         p_reset, c_reset = reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index)
         if p_reset or c_reset:
