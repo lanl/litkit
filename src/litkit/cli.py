@@ -318,16 +318,16 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
     
     DESIGN DECISIONS (cross-host TTL eviction & signal handling):
     
-    1. Cross-host TTL eviction:
+    1. Cross-host guard handling:
        - On same host: we check PID liveness via os.kill(pid, 0) before evicting
-       - On different host: we cannot check PID liveness, so TTL expiry alone triggers eviction
-       - Risk: a long-running build on another host could be evicted if TTL is enabled
-       - Mitigations:
-         * Default TTL is 0 (DISABLED) for safety in multi-host HPC environments
-         * Same-host PID check still works regardless of TTL setting
-         * Set LITKIT_WRITER_GUARD_TTL=86400 to enable 24h auto-eviction if desired
-         * Users can manually remove stale guards: rm .writer_guard
-       - Rationale: >24h HPC jobs are common; false eviction is catastrophic
+       - On different host: we REFUSE to auto-evict (cannot verify PID liveness)
+         * Exit with instructions to manually remove the guard: rm .writer_guard
+         * This prevents data corruption from evicting a legitimately running build
+       - TTL only applies to same-host scenarios where we can verify PID is dead
+       - Mitigations for stale cross-host guards:
+         * SLURM scripts should include `rm -f $WORKSPACE/.writer_guard` at job start
+         * Users can manually remove stale guards if certain the other job is dead
+       - Rationale: false eviction is catastrophic; manual intervention is safer
     
     2. Signal handler uses os._exit(1):
        - On SIGINT/SIGTERM, we clean up the guard file then os._exit(1)
