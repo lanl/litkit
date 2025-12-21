@@ -336,8 +336,9 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
             sys.exit(2)
 
 # -- Paths / offline env --
-# Path discovery and workspace configuration now delegated to litkit.config.paths
-from litkit.config.paths import WorkspacePaths
+# Path discovery and workspace configuration delegated to litkit.config.paths
+# WorkspacePaths import is deferred to _init_runtime() for future-proofing:
+# if someone later adds numpy/torch to paths.py, --help/--version still work.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -358,11 +359,11 @@ from litkit.config.paths import WorkspacePaths
 # Access any path constant (e.g., SQLITE_DIR) to trigger initialization.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_runtime: WorkspacePaths | None = None
+_runtime: "WorkspacePaths | None" = None  # String annotation - import deferred
 _runtime_lock = threading.Lock()
 
 
-def get_runtime() -> WorkspacePaths:
+def get_runtime() -> "WorkspacePaths":
     """Thread-safe lazy initialization of runtime paths and directories.
     
     Side effects (first call only):
@@ -386,8 +387,9 @@ def get_runtime() -> WorkspacePaths:
         return _runtime
 
 
-def _init_runtime() -> WorkspacePaths:
+def _init_runtime() -> "WorkspacePaths":
     """Perform all one-time initialization. Called only by get_runtime()."""
+    from litkit.config.paths import WorkspacePaths  # deferred for future-proofing
     paths = WorkspacePaths.from_env_or_default()
     
     # Set environment variables (safe defaults for HPC/offline use)
