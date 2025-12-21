@@ -892,21 +892,21 @@ def iter_tar_articles(
         - member_meta has .name, .size, .mtime attributes
         - article_meta is the parsed ArticleMeta dict
     """
-    _load_heavy_deps()  # ensure iter_tar_xml_streams, etc. are available
-    use_parallel = parse_workers > 1 and _deps.is_uncompressed_tar(tar_path)
+    d = deps()  # ensures loaded + returns namespace (consistent pattern)
+    use_parallel = parse_workers > 1 and d.is_uncompressed_tar(tar_path)
     
     if use_parallel:
         # Parallel path for uncompressed tars
         from litkit.progress import is_quiet
         if not is_quiet():
             _eprint(f"[scan] using parallel XML parsing ({parse_workers} workers) for {tar_path.name}")
-        for member_meta, article_meta in _deps.parallel_iter_tar_articles(tar_path, workers=parse_workers):
+        for member_meta, article_meta in d.parallel_iter_tar_articles(tar_path, workers=parse_workers):
             yield member_meta, article_meta
     else:
         # Sequential path for compressed tars (or when parallel disabled)
-        for tarinfo, fobj in _deps.iter_tar_xml_streams(tar_path):
+        for tarinfo, fobj in d.iter_tar_xml_streams(tar_path):
             try:
-                article_meta = _deps.parse_xml_fileobj(fobj)
+                article_meta = d.parse_xml_fileobj(fobj)
                 if article_meta is not None:
                     # Wrap TarInfo in SimpleNamespace for consistent interface
                     member_meta = SimpleNamespace(
@@ -1381,10 +1381,10 @@ def shortlist_papers(
     embedder: "Embedder | None" = None,
 ) -> list[int]:
     """Thin wrapper: delegates to litkit.retrieval.shortlist_papers."""
-    _load_heavy_deps()  # ensure make_paper_embedder is available
+    d = deps()  # ensures loaded + returns namespace (consistent pattern)
     from litkit.retrieval import shortlist_papers as retrieval_shortlist_papers
     get_runtime()
-    enc = embedder or _deps.make_paper_embedder()[0]
+    enc = embedder or d.make_paper_embedder()[0]
     return retrieval_shortlist_papers(
         question, k,
         paper_index_path=PAPER_INDEX_PATH,
@@ -1407,10 +1407,10 @@ def search_chunks_constrained(
     per_paper_cap: int = 0,
 ) -> tuple[list[int], dict[str, int]]:
     """Thin wrapper: delegates to litkit.retrieval.search_chunks_constrained."""
-    _load_heavy_deps()  # ensure db_*, make_chunk_embedder are available
+    d = deps()  # ensures loaded + returns namespace (consistent pattern)
     from litkit.retrieval import search_chunks_constrained as retrieval_search_chunks_constrained
     get_runtime()
-    enc = embedder or _deps.make_chunk_embedder()[0]
+    enc = embedder or d.make_chunk_embedder()[0]
     return retrieval_search_chunks_constrained(
         question=question,
         candidate_papers=candidate_papers,
@@ -1418,9 +1418,9 @@ def search_chunks_constrained(
         chunk_index_path=CHUNK_INDEX_PATH,
         db_path=DB_PATH,
         embedder=enc,
-        connect_db=_deps.db_connect_db,
-        load_temp_candidates=_deps.db_load_temp_candidates,
-        chunk_ids_to_paper_ids=_deps.db_chunk_ids_to_paper_ids,
+        connect_db=d.db_connect_db,
+        load_temp_candidates=d.db_load_temp_candidates,
+        chunk_ids_to_paper_ids=d.db_chunk_ids_to_paper_ids,
         overshoot=overshoot,
         nprobe=nprobe,
         min_chunks_per_paper=min_chunks_per_paper,
