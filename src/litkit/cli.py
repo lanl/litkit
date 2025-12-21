@@ -2205,7 +2205,9 @@ def main():
     ap.add_argument(
         "--faiss-writer",
         action="store_true",
-        help="This process is allowed to mutate and save FAISS indices.",
+        help="This process is allowed to mutate and save FAISS indices. "
+        "NOTE: Writer sessions use hard-exit (os._exit) on SIGINT/SIGTERM to avoid "
+        "deadlocks; partial state is repaired by reconcile+backfill on next startup.",
     )
     ap.add_argument(
         "--embed-producer",
