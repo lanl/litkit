@@ -390,6 +390,15 @@ PYEOF
   '
 fi
 
+### ----- CLEAN STALE WRITER GUARD (SLURM RESTART SAFE) ------------------------
+# If a prior job crashed on a different node, the guard file may persist.
+# Cross-host auto-eviction is disabled for safety (we can't verify remote PID).
+# This unconditional cleanup is safe BECAUSE:
+#   1. This runs at job START (no concurrent writer for this workspace)
+#   2. Any prior writer is dead (SLURM guarantees our allocation is exclusive)
+# WARNING: Do NOT add this mid-job or if running concurrent writers.
+rm -f "${WORKSPACE:-$LITKIT_WORKSPACE}/.writer_guard" 2>/dev/null || true
+
 ### ----- RUN BUILD ------------------------------------------------------------
 echo "[info] Starting build in Charliecloud..."
 "${CHR[@]}" "$IMG" -- litkit "${LITKIT_ARGS[@]}"

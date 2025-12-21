@@ -75,6 +75,15 @@ n_shards=$(find "$SEG_DIR" -name '*.npz' -exec basename {} \; 2>/dev/null \
 [[ "$n_shards" -ge 1 ]] || n_shards=2
 echo "[resume] Detected $n_shards shard(s) from segment filenames"
 
+### ----- CLEAN STALE WRITER GUARD (SLURM RESTART SAFE) ------------------------
+# If a prior job crashed on a different node, the guard file may persist.
+# Cross-host auto-eviction is disabled for safety (we can't verify remote PID).
+# This unconditional cleanup is safe BECAUSE:
+#   1. This runs at job START (no concurrent writer for this workspace)
+#   2. Any prior writer is dead (SLURM guarantees our allocation is exclusive)
+# WARNING: Do NOT add this mid-job or if running concurrent writers.
+rm -f "${LITKIT_WORKSPACE}/.writer_guard" 2>/dev/null || true
+
 # Create fake completion markers so consume-only doesn't wait
 echo "[resume] Creating producer completion markers..."
 for ((i=0; i<n_shards; i++)); do
