@@ -1065,58 +1065,19 @@ def build_or_update_indices(args):
         conn.commit()
         _eprint("[rebuild] done")
 
-    # PAPER index
-    if PAPER_INDEX_PATH.exists():
-        paper_index = faiss_load(PAPER_INDEX_PATH)
-
-        # --- Verify papers index family/metric (kind-aware; tolerate FlatIP) ---
-        kind, core, _ = unwrap_core_and_kind(paper_index)
-        mt = getattr(core, "metric_type", None)
-        if kind == "hnsw":
-            if mt != faiss.METRIC_INNER_PRODUCT:
-                raise RuntimeError(
-                    "Papers HNSW index is L2; IP required for cosine-equivalent retrieval."
-                )
-        elif kind == "flat":
-            # Accept FlatIP; reject FlatL2 wheels explicitly
-            if core.__class__.__name__.lower().endswith("flatl2"):
-                raise RuntimeError("Papers FLAT index is L2; IP required.")
-        else:
-            # IVF not expected for papers; leave as-is (no-op)
-            pass
-
-        # Ensure IDMap2 wrapper even for legacy files
-        if not isinstance(paper_index, faiss.IndexIDMap2):
-            paper_index = faiss.IndexIDMap2(paper_index)
-            if args.faiss_writer:
-                with FileLock(FAISS_LOCK):
-                    faiss_save(paper_index, PAPER_INDEX_PATH)
-    else:
-        # Create base (HNSW or FLAT) and wrap in IDMap2
-        if args.papers_index == "flat":
-            base = flat_ip_index(paper_dim)
-        else:
-            base = hnsw_index(
-                paper_dim,
-                M=args.hnsw_m,
-                ef_construction=args.efconstruction,
-                ef_search=args.efsearch,
-            )
-            # Minimal, stable start signal for HNSW (one line; not a live progress bar)
-            _eprint(
-                f"[progress] Building HNSW (papers): started  M={args.hnsw_m}  "
-                f"efConstruction={args.efconstruction}  efSearch={args.efsearch}"
-            )
-
-        paper_index = faiss.IndexIDMap2(base)
-        ensure_parent(PAPER_INDEX_PATH)
-        if args.faiss_writer:
-            with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                faiss_save(paper_index, PAPER_INDEX_PATH)
-        else:
-            raise RuntimeError(
-                "PAPER index does not exist. Start a writer with --faiss-writer or precreate the index."
-            )
+    # PAPER index (load existing or create new)
+    paper_index = build_load_or_create_paper_index(
+        paper_index_path=PAPER_INDEX_PATH,
+        faiss_lock_path=FAISS_LOCK,
+        db_lock_path=DB_LOCK,
+        FileLock=FileLock,
+        paper_dim=paper_dim,
+        papers_index=args.papers_index,
+        hnsw_m=args.hnsw_m,
+        efconstruction=args.efconstruction,
+        efsearch=args.efsearch,
+        is_faiss_writer=args.faiss_writer,
+    )
 
     # CHUNK index
     if CHUNK_INDEX_PATH.exists():
