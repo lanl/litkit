@@ -203,14 +203,29 @@ def _load_heavy_deps() -> None:
 # logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
 
+def deps() -> SimpleNamespace:
+    """Load heavy dependencies (idempotent) and return the deps namespace.
+    
+    Use this instead of accessing _deps directly to ensure deps are loaded
+    and avoid NoneType crashes if someone forgets _load_heavy_deps().
+    
+    Example:
+        d = deps()
+        conn = d.db_connect_db(...)
+    """
+    _load_heavy_deps()
+    assert _deps is not None, "_load_heavy_deps() failed to populate _deps"
+    return _deps
+
+
 def _require_faiss(context: str = "this operation") -> None:
     """Fail fast if FAISS is not available.
     
     Call this at the start of any code path that requires FAISS (build/write flows).
     Query-only flows with --no-llm may work without FAISS.
     """
-    _load_heavy_deps()
-    if not _deps.has_faiss:
+    d = deps()
+    if not d.has_faiss:
         raise SystemExit(
             f"[error] FAISS is required for {context}.\n"
             "Install faiss-cpu or faiss-gpu:\n"
