@@ -1051,6 +1051,44 @@ def build_or_update_indices(args):
 
     # Prepare / open FAISS indices
     if args.rebuild:
+        # Guard: --rebuild with unconsumed segments or active producers can corrupt data
+        # This check is here (not in main()) because it requires heavy deps for segment functions
+        if not getattr(args, "force_rebuild", False):
+            seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
+            conflict_reasons = []
+            
+            # Check for unconsumed segment files
+            if _deps.seg_has_segment_files(seg_dir):
+                conflict_reasons.append(f"Segment directory {seg_dir} contains unconsumed segment files")
+            
+            # Check for producer completion markers (indicates multi-node run)
+            # Use shard count from build_meta.json (if exists) to correctly interpret markers.
+            meta = _deps.seg_read_build_meta(seg_dir)
+            effective_num_shards = meta.get("num_shards", args.num_shards) if meta else args.num_shards
+            
+            coordinator = _deps.SegConsumerCoordinator(seg_dir, effective_num_shards)
+            completed = coordinator.completed_shards()
+            if completed:
+                if len(completed) < effective_num_shards:
+                    conflict_reasons.append(
+                        f"Prior multi-node run (incomplete): {len(completed)}/{effective_num_shards} producer shards marked done"
+                    )
+                else:
+                    conflict_reasons.append(
+                        f"Prior multi-node run (not consumed): all {effective_num_shards} producer shards done"
+                    )
+            
+            if conflict_reasons:
+                reasons_str = "\n  • ".join(conflict_reasons)
+                raise SystemExit(
+                    f"[rebuild] BLOCKED: Unconsumed multi-node artifacts detected:\n  • {reasons_str}\n\n"
+                    "A rebuild would discard these pending segments/markers.\n"
+                    "Options:\n"
+                    "  • First consume pending segments: --faiss-writer --consume-only\n"
+                    f"  • Or clean up manually: rm -rf {seg_dir}/*\n"
+                    "  • Or force (DATA LOSS WARNING): --force-rebuild"
+                )
+        
         # Confirm before destructive actions
         _confirm_rebuild(conn)
         _eprint(
@@ -2086,21 +2124,17 @@ def main():
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-    # Load heavy dependencies (idempotent - delegates to _load_heavy_deps())
-    _load_heavy_deps()
-    
-    # logging + device threads (import deferred to minimize module-level side effects)
-    import logging
-    logging.basicConfig(
-        level=(logging.ERROR if args.quiet else logging.WARNING),
-        format="%(levelname)s %(name)s: %(message)s",
-        force=True,
-    )
-    _deps.configure_threads()
-    device = _deps.detect_device()
-    if not (args.quiet or _SUPPRESS_EARLY):
-        _eprint(f"[version] {_version_banner()}")
-        _eprint(f"[device] using {device}")
+    # ═══════════════════════════════════════════════════════════════════════════
+    # DEFERRED HEAVY IMPORTS: _load_heavy_deps() is NOT called here!
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Heavy dependencies (faiss, torch, transformers) are loaded ONLY when needed:
+    # - build_or_update_indices() calls _load_heavy_deps() internally
+    # - --reconcile-only calls _require_faiss() which loads deps
+    # - Retrieval pipeline calls _require_faiss() which loads deps
+    #
+    # This ensures fast exits for validation errors (missing tar shards, flag
+    # conflicts, etc.) without paying the 2-5 second import penalty.
+    # ═══════════════════════════════════════════════════════════════════════════
 
     # Trigger lazy runtime initialization - populates path globals like WORKSPACE, DB_PATH, etc.
     # This must happen before any code that uses path globals (e.g., _vector_store_exists).
@@ -2316,45 +2350,9 @@ def main():
             "  • Only a writer can create/save FAISS index files."
         )
 
-    # Guard: --rebuild with unconsumed segments or active producers can corrupt data
-    # Check BEFORE writer guard so user sees this error first
-    if args.rebuild and not args.force_rebuild:
-        seg_dir = Path(args.embed_outdir) if args.embed_outdir else EMBED_SEGMENTS_DIR
-        conflict_reasons = []
-        
-        # Check for unconsumed segment files
-        if _deps.seg_has_segment_files(seg_dir):
-            conflict_reasons.append(f"Segment directory {seg_dir} contains unconsumed segment files")
-        
-        # Check for producer completion markers (indicates multi-node run)
-        # Use shard count from build_meta.json (if exists) to correctly interpret markers.
-        # Without this, CLI --num-shards can mismatch the actual build config and cause
-        # misdiagnosis (e.g., "3/4 incomplete" when the build was actually 3-shard and complete).
-        meta = _deps.seg_read_build_meta(seg_dir)
-        effective_num_shards = meta.get("num_shards", args.num_shards) if meta else args.num_shards
-        
-        coordinator = _deps.SegConsumerCoordinator(seg_dir, effective_num_shards)
-        completed = coordinator.completed_shards()
-        if completed:
-            if len(completed) < effective_num_shards:
-                conflict_reasons.append(
-                    f"Prior multi-node run (incomplete): {len(completed)}/{effective_num_shards} producer shards marked done"
-                )
-            else:
-                conflict_reasons.append(
-                    f"Prior multi-node run (not consumed): all {effective_num_shards} producer shards done"
-                )
-        
-        if conflict_reasons:
-            reasons_str = "\n  • ".join(conflict_reasons)
-            raise SystemExit(
-                f"[rebuild] BLOCKED: Unconsumed multi-node artifacts detected:\n  • {reasons_str}\n\n"
-                "A rebuild would discard these pending segments/markers.\n"
-                "Options:\n"
-                "  • First consume pending segments: --faiss-writer --consume-only\n"
-                f"  • Or clean up manually: rm -rf {seg_dir}/*\n"
-                "  • Or force (DATA LOSS WARNING): --force-rebuild"
-            )
+    # NOTE: Segment conflict check for --rebuild moved to build_or_update_indices()
+    # where _load_heavy_deps() is already called. This allows fast exits for other
+    # validation errors without paying the import penalty.
 
     _create_writer_guard_or_exit(args)
 
