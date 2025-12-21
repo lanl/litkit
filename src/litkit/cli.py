@@ -242,6 +242,29 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
     """Create a writer guard file or exit if another writer is active.
     
     Uses a bounded retry loop (max 2 attempts) to handle stale guard cleanup.
+    
+    DESIGN DECISIONS (cross-host TTL eviction & signal handling):
+    
+    1. Cross-host TTL eviction:
+       - On same host: we check PID liveness via os.kill(pid, 0) before evicting
+       - On different host: we cannot check PID liveness, so TTL expiry alone triggers eviction
+       - Risk: a long-running build on another host may be evicted if it exceeds TTL
+       - Mitigations:
+         * Default TTL is 24h (86400s), sufficient for most HPC batch jobs
+         * Set LITKIT_WRITER_GUARD_TTL=0 to disable TTL-based eviction entirely
+         * Users can manually remove stale guards if needed
+       - Accepted tradeoff: rare edge case vs. simpler implementation
+    
+    2. Signal handler uses os._exit(1):
+       - On SIGINT/SIGTERM, we clean up the guard file then os._exit(1)
+       - This bypasses normal Python shutdown (atexit, finally, destructors)
+       - Risk: FAISS indices and SQLite may have unflushed data
+       - Why this is safe:
+         * reconcile_sqlite_flags_with_faiss() runs on EVERY faiss_writer startup
+         * backfill_unindexed_vectors() repairs any missing vectors
+         * Guard cleanup is CRITICAL: a leftover guard blocks all future runs
+         * Normal shutdown can deadlock if interrupted during a lock hold
+       - Accepted tradeoff: rely on reconcile+backfill vs. risk deadlock/blocked runs
     """
     get_runtime()  # ensure WRITER_GUARD is bound
     _maybe_cleanup_own_stale_guard()
@@ -277,9 +300,20 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
             try:
                 if threading.current_thread() is threading.main_thread():
                     # HARD KILL on SIGINT/SIGTERM: clean up guard file, then os._exit(1).
-                    # This bypasses pending DB commits and atexit handlers to avoid
-                    # corrupt partial writes. FAISS indices may have unflushed data,
-                    # but the guard file removal allows a clean restart.
+                    #
+                    # WHY os._exit(1) instead of sys.exit():
+                    # 1. Avoids deadlock if interrupted while holding FileLock (flock is not reentrant)
+                    # 2. Avoids partial writes from half-executed finally/atexit handlers
+                    # 3. Guard cleanup is CRITICAL: leftover guard blocks ALL future runs
+                    #
+                    # WHY this is SAFE despite bypassing normal shutdown:
+                    # 1. reconcile_sqlite_flags_with_faiss() runs on EVERY faiss_writer start
+                    # 2. backfill_unindexed_vectors() re-embeds any missing vectors
+                    # 3. Producer mode: segments are durable (written before checkpoint advance)
+                    # 4. Writer mode: FAISS saves are checkpointed; partial batches are re-embedded
+                    #
+                    # The invariant: reconcile+backfill ALWAYS runs before any new work.
+                    # See build_or_update_indices() near the faiss_writer block.
                     signal.signal(signal.SIGINT,  lambda *_: (_cleanup_guard(), os._exit(1)))
                     signal.signal(signal.SIGTERM, lambda *_: (_cleanup_guard(), os._exit(1)))
             except Exception:
