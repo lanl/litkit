@@ -1381,7 +1381,7 @@ def answer_with_llm(
 
     # Up to 4 tries: progressively trim the number of chunks *and* reduce max_out
     for attempt in range(4):
-        ctx_text, _used_idxs = pack_context(working_chunks, question, model, sys_prompt=sys_prompt)
+        ctx_text, _used_idxs = pack_context(working_chunks, question, model, sys_prompt=sys_prompt, max_out_tokens=max_out)
         sys_msg = sys_prompt
 
         try:
@@ -2276,7 +2276,7 @@ def main():
 
     # If the user asked for retrieval only, print the context and exit
     if args.no_llm:
-        ctx_text, used_idx = pack_context(chunks, question, args.llm_model)
+        ctx_text, used_idx = pack_context(chunks, question, args.llm_model, max_out_tokens=args.max_out_tokens)
         print("CONTEXT")
         print("=" * 80)
         print(ctx_text)
@@ -2300,7 +2300,7 @@ def main():
     # base_url = args.openai_base_url or _default_base_url_for(args.llm_model)
     # api_key = args.openai_api_key or _default_api_key_for(args.llm_model)
 
-    ctx_text, used_idx = pack_context(chunks, question, args.llm_model)
+    ctx_text, used_idx = pack_context(chunks, question, args.llm_model, max_out_tokens=args.max_out_tokens)
     selected_chunks = [chunks[i - 1] for i in used_idx]  # 0-based indexing
     try:
         answer = answer_with_llm(
