@@ -42,11 +42,8 @@ from __future__ import annotations
 
 import io
 import logging
-import os
-import sys
 import tarfile
 import threading
-import time
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack, contextmanager
@@ -505,14 +502,7 @@ def _parse_xml_bytes(data: bytes, member_name: str = "") -> tuple[ArticleMeta | 
     
     Returns (result, thread_id) for utilization tracking.
     """
-    debug = os.environ.get("LITKIT_DEBUG", "").strip() == "1"
     tid = threading.get_ident()
-    
-    if debug:
-        t0 = time.time()
-        kb = len(data) / 1024
-        sys.stderr.write(f"[debug:xml:tid{tid}] START member={member_name} bytes={kb:.1f}KB\n")
-        sys.stderr.flush()
     
     try:
         parser = etree.XMLParser(
@@ -528,12 +518,7 @@ def _parse_xml_bytes(data: bytes, member_name: str = "") -> tuple[ArticleMeta | 
     except Exception:
         result = None
     
-    if debug:
-        elapsed = time.time() - t0
-        sys.stderr.write(f"[debug:xml:tid{tid}] DONE member={member_name} elapsed={elapsed:.3f}s\n")
-        sys.stderr.flush()
-    
-    # Track thread utilization
+    # Track thread utilization (silent - summary printed at end)
     with _xml_thread_stats_lock:
         _xml_thread_stats[tid] = _xml_thread_stats.get(tid, 0) + 1
     

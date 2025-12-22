@@ -11,19 +11,11 @@ from __future__ import annotations
 
 import atexit
 import multiprocessing as mp
-import os
 import signal
-import sys
 import threading
-import time
 from pathlib import Path
 
 import numpy as np
-
-
-def _is_debug() -> bool:
-    """Check if LITKIT_DEBUG=1 is set."""
-    return os.environ.get("LITKIT_DEBUG", "").strip() == "1"
 
 
 class EmbeddingPool:
@@ -90,7 +82,6 @@ class EmbeddingPool:
         # Import inside worker to avoid CUDA init in parent.
         from sentence_transformers import SentenceTransformer
 
-        debug = os.environ.get("LITKIT_DEBUG", "").strip() == "1"
         model = SentenceTransformer(model_path, device=device)
         
         while True:
@@ -99,11 +90,6 @@ class EmbeddingPool:
                 break
             task_id, texts, bs = task
             try:
-                if debug:
-                    t0 = time.time()
-                    sys.stderr.write(f"[debug:gpu:{device}] START batch_id={task_id} texts={len(texts)}\n")
-                    sys.stderr.flush()
-                
                 arr = model.encode(
                     texts,
                     batch_size=bs,
@@ -112,12 +98,7 @@ class EmbeddingPool:
                     normalize_embeddings=True,
                 ).astype("float32")
                 
-                if debug:
-                    elapsed = time.time() - t0
-                    sys.stderr.write(f"[debug:gpu:{device}] DONE batch_id={task_id} texts={len(texts)} elapsed={elapsed:.2f}s\n")
-                    sys.stderr.flush()
-                
-                # Return device info for utilization tracking
+                # Return device info for utilization tracking (silent)
                 q_out.put((task_id, arr, device))
             except Exception as e:
                 q_out.put((task_id, e, device))
