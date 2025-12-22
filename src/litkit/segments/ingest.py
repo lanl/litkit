@@ -62,19 +62,23 @@ def _glob_segment_files(outdir: Path, kind: str) -> list[Path]:
     cand = []
     
     if kind == "papers":
-        # New style: papers_*.npz
+        # Current style: paper_seg_*.npz (matches PAPER_SEGMENT_PREFIX from constants.py)
+        cand.extend(outdir.glob("paper_seg_*.npz"))
+        # Legacy styles for backward compatibility
         cand.extend(outdir.glob("papers_*.npz"))
-        # Old style: papers.seg.*.npz
         cand.extend(outdir.glob("papers.seg.*.npz"))
         # In-progress files from previous interrupted runs
+        cand.extend(outdir.glob("paper_seg_*.npz.ingesting"))
         cand.extend(outdir.glob("papers_*.npz.ingesting"))
         cand.extend(outdir.glob("papers.seg.*.npz.ingesting"))
     else:  # chunks
-        # New style: chunks_*.npz
+        # Current style: chunk_seg_*.npz (matches CHUNK_SEGMENT_PREFIX from constants.py)
+        cand.extend(outdir.glob("chunk_seg_*.npz"))
+        # Legacy styles for backward compatibility
         cand.extend(outdir.glob("chunks_*.npz"))
-        # Old style: chunks.seg.*.npz
         cand.extend(outdir.glob("chunks.seg.*.npz"))
         # In-progress files from previous interrupted runs
+        cand.extend(outdir.glob("chunk_seg_*.npz.ingesting"))
         cand.extend(outdir.glob("chunks_*.npz.ingesting"))
         cand.extend(outdir.glob("chunks.seg.*.npz.ingesting"))
     
