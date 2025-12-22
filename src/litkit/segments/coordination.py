@@ -103,16 +103,19 @@ class ConsumerCoordinator:
         self,
         timeout: float | None = None,
         progress_callback: callable = None,
+        poll_interval: float | None = None,
     ) -> bool:
         """Wait for all producers to complete.
         
         Args:
             timeout: Maximum seconds to wait (None = wait forever)
             progress_callback: Optional function called with (completed, total)
+            poll_interval: Seconds between checks (overrides instance default)
         
         Returns:
             True if all producers completed, False if timeout
         """
+        interval = poll_interval if poll_interval is not None else self.poll_interval
         start = time.time()
         
         while True:
@@ -136,9 +139,9 @@ class ConsumerCoordinator:
             
             _eprint(
                 f"[consumer] Waiting: {len(completed)}/{self.num_shards} "
-                f"producers complete, polling in {self.poll_interval}s"
+                f"producers complete, polling in {interval}s"
             )
-            time.sleep(self.poll_interval)
+            time.sleep(interval)
     
     def cleanup_done_files(self) -> int:
         """Remove all producer done files after ingestion.
