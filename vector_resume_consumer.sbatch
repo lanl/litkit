@@ -59,6 +59,9 @@ export HF_HOST="/path/to/hf_cache_persist"
 
 SEG_DIR="${LITKIT_WORKSPACE}/emb_segments"
 
+# Debug mode for parallelism verification (set to 0 for quiet production runs)
+export LITKIT_DEBUG="${LITKIT_DEBUG:-1}"
+
 # Count remaining segment files
 n_segs=$(find "$SEG_DIR" -name '*.npz' 2>/dev/null | wc -l)
 echo "[resume] Found $n_segs segment files to ingest"
@@ -122,6 +125,7 @@ echo ""
     --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
     --set-env="LITKIT_SQLITE_BUSY_TIMEOUT_MS=300000" \
     --set-env="LITKIT_SAVE_EVERY_SEC=300" \
+    --set-env="LITKIT_DEBUG=${LITKIT_DEBUG}" \
     "$IMG" -- \
     litkit \
         --faiss-writer \

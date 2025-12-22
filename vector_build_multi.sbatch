@@ -69,6 +69,9 @@ export HF_HOST="/path/to/hf_cache_persist"
 # Parallel parsing workers per producer (use available CPUs)
 export PARSE_WORKERS=16
 
+# Debug mode for parallelism verification (set to 0 for quiet production runs)
+export LITKIT_DEBUG="${LITKIT_DEBUG:-1}"
+
 # Ensure directories exist on Lustre
 mkdir -p "${LITKIT_WORKSPACE}/emb_segments"
 mkdir -p "${LITKIT_WORKSPACE}/sqlite"
@@ -129,6 +132,7 @@ run_producer() {
         --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
         --set-env="LITKIT_SQLITE_BUSY_TIMEOUT_MS=${LITKIT_SQLITE_BUSY_TIMEOUT_MS}" \
         --set-env="LITKIT_SAVE_EVERY_SEC=${LITKIT_SAVE_EVERY_SEC}" \
+        --set-env="LITKIT_DEBUG=${LITKIT_DEBUG}" \
         "$IMG" -- \
         litkit \
             --embed-producer \
@@ -176,6 +180,7 @@ srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
     --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
     --set-env="LITKIT_SQLITE_BUSY_TIMEOUT_MS=${LITKIT_SQLITE_BUSY_TIMEOUT_MS}" \
     --set-env="LITKIT_SAVE_EVERY_SEC=${LITKIT_SAVE_EVERY_SEC}" \
+    --set-env="LITKIT_DEBUG=${LITKIT_DEBUG}" \
     "$IMG" -- \
     litkit \
         --faiss-writer \
@@ -220,6 +225,7 @@ srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
     --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
     --set-env="LITKIT_SQLITE_BUSY_TIMEOUT_MS=${LITKIT_SQLITE_BUSY_TIMEOUT_MS}" \
     --set-env="LITKIT_SAVE_EVERY_SEC=${LITKIT_SAVE_EVERY_SEC}" \
+    --set-env="LITKIT_DEBUG=${LITKIT_DEBUG}" \
     "$IMG" -- \
     litkit \
         --faiss-writer \

@@ -83,6 +83,9 @@ fi
 : "${SQLITE_BUSY_TIMEOUT_MS:=120000}"
 : "${QUIET:=0}"
 
+# Debug mode for parallelism verification (set to 0 for quiet production runs)
+: "${LITKIT_DEBUG:=1}"
+
 # Role flags
 : "${FAISS_WRITER:=1}"
 : "${EMBED_PRODUCER:=0}"
@@ -249,6 +252,7 @@ CHR=(
   --set-env="LITKIT_WORKSPACE=/workspace"
   --set-env="HF_HOME=/app/hf_cache"
   --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1"
+  --set-env="LITKIT_DEBUG=${LITKIT_DEBUG}"
 )
 
 # Use manifest to find tar shards
