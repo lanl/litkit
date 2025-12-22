@@ -42,7 +42,11 @@ from __future__ import annotations
 
 import io
 import logging
+import os
+import sys
 import tarfile
+import threading
+import time
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack, contextmanager
@@ -478,8 +482,38 @@ def iter_tar_xml_streams(
 # -------------------------------
 # Parallel XML parsing
 # -------------------------------
-def _parse_xml_bytes(data: bytes) -> ArticleMeta | None:
-    """Parse XML from bytes. Thread-safe worker function."""
+# Thread-local storage for tracking which threads actually did work
+_xml_thread_stats: dict[int, int] = {}
+_xml_thread_stats_lock = threading.Lock()
+
+
+def get_xml_thread_stats() -> dict[int, int]:
+    """Get XML parsing thread utilization stats (thread_id -> file_count)."""
+    with _xml_thread_stats_lock:
+        return dict(_xml_thread_stats)
+
+
+def reset_xml_thread_stats() -> None:
+    """Reset XML parsing thread utilization stats."""
+    global _xml_thread_stats
+    with _xml_thread_stats_lock:
+        _xml_thread_stats = {}
+
+
+def _parse_xml_bytes(data: bytes, member_name: str = "") -> tuple[ArticleMeta | None, int]:
+    """Parse XML from bytes. Thread-safe worker function.
+    
+    Returns (result, thread_id) for utilization tracking.
+    """
+    debug = os.environ.get("LITKIT_DEBUG", "").strip() == "1"
+    tid = threading.get_ident()
+    
+    if debug:
+        t0 = time.time()
+        kb = len(data) / 1024
+        sys.stderr.write(f"[debug:xml:tid{tid}] START member={member_name} bytes={kb:.1f}KB\n")
+        sys.stderr.flush()
+    
     try:
         parser = etree.XMLParser(
             recover=True,
@@ -490,9 +524,20 @@ def _parse_xml_bytes(data: bytes) -> ArticleMeta | None:
             dtd_validation=False,
         )
         tree = etree.parse(io.BytesIO(data), parser=parser)
+        result = _parse_tree(tree)
     except Exception:
-        return None
-    return _parse_tree(tree)
+        result = None
+    
+    if debug:
+        elapsed = time.time() - t0
+        sys.stderr.write(f"[debug:xml:tid{tid}] DONE member={member_name} elapsed={elapsed:.3f}s\n")
+        sys.stderr.flush()
+    
+    # Track thread utilization
+    with _xml_thread_stats_lock:
+        _xml_thread_stats[tid] = _xml_thread_stats.get(tid, 0) + 1
+    
+    return result, tid
 
 
 class TarMemberMeta:
@@ -590,7 +635,7 @@ def parallel_iter_tar_articles(
                         size=int(getattr(m, "size", 0)),
                         mtime=float(getattr(m, "mtime", 0.0) or 0.0),
                     )
-                    fut = pool.submit(_parse_xml_bytes, data)
+                    fut = pool.submit(_parse_xml_bytes, data, m.name)
                     futures[fut] = (sequence, meta)
                     sequence += 1
                     pending_count += 1
@@ -618,7 +663,7 @@ def parallel_iter_tar_articles(
                     seq, meta = futures.pop(fut)
                     pending_count -= 1
                     try:
-                        result = fut.result()
+                        result, _tid = fut.result()
                         if result is not None:
                             if yield_in_order:
                                 # Buffer for in-order yielding
@@ -662,4 +707,7 @@ __all__ = [
     "count_tar_xml_members",
     "iter_tar_xml_streams",
     "parallel_iter_tar_articles",
+    # utilization stats
+    "get_xml_thread_stats",
+    "reset_xml_thread_stats",
 ]

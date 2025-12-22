@@ -29,6 +29,7 @@ __all__ = [
     "QUIET",
     "set_quiet",
     "is_quiet",
+    "print_parallelism_summary",
 ]
 
 
@@ -242,6 +243,69 @@ class Pulse:
                 f"[progress] {self.label}: training… {elapsed}s elapsed"
             )
             _progress_newline(self.stream)
+
+
+def print_parallelism_summary(
+    requested_gpu_devices: list[str] | None = None,
+    actual_gpu_stats: dict[str, int] | None = None,
+    requested_xml_workers: int | None = None,
+    actual_xml_stats: dict[int, int] | None = None,
+) -> None:
+    """Print parallelism utilization summary to stderr.
+    
+    This summary shows requested vs actual resource utilization for
+    debugging multi-GPU and multi-CPU configurations.
+    
+    Args:
+        requested_gpu_devices: List of GPU devices requested (e.g., ["cuda:0", "cuda:1"])
+        actual_gpu_stats: Dict of device -> batch_count from EmbeddingPool._devices_used
+        requested_xml_workers: Number of XML parse workers requested
+        actual_xml_stats: Dict of thread_id -> file_count from get_xml_thread_stats()
+    """
+    lines = ["", "=== PARALLELISM SUMMARY ==="]
+    
+    # GPU summary
+    if requested_gpu_devices is not None:
+        req_count = len(requested_gpu_devices)
+        if actual_gpu_stats:
+            actual_count = len(actual_gpu_stats)
+            details = ", ".join(
+                f"{dev}: {cnt} batches" 
+                for dev, cnt in sorted(actual_gpu_stats.items())
+            )
+            status = ""
+            if actual_count < req_count:
+                status = " ⚠️ UNDERUTILIZED"
+            lines.append(
+                f"[gpu] requested={req_count} devices, "
+                f"actual={actual_count} devices used [{details}]{status}"
+            )
+        else:
+            lines.append(f"[gpu] requested={req_count} devices, actual=0 (no batches processed)")
+    
+    # XML summary
+    if requested_xml_workers is not None:
+        if actual_xml_stats:
+            actual_count = len(actual_xml_stats)
+            # Shorten thread IDs for readability
+            details = ", ".join(
+                f"tid{tid % 10000}: {cnt} files"
+                for tid, cnt in sorted(actual_xml_stats.items())
+            )
+            status = ""
+            if actual_count < requested_xml_workers:
+                status = " ⚠️ UNDERUTILIZED"
+            lines.append(
+                f"[xml] requested={requested_xml_workers} workers, "
+                f"actual={actual_count} threads used [{details}]{status}"
+            )
+        else:
+            lines.append(f"[xml] requested={requested_xml_workers} workers, actual=0 (no files parsed)")
+    
+    # Only print if we have something to report
+    if len(lines) > 2:
+        for line in lines:
+            eprint(line)
 
 
 # Convenience aliases matching cli.py names (for easier migration)

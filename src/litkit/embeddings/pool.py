@@ -11,11 +11,19 @@ from __future__ import annotations
 
 import atexit
 import multiprocessing as mp
+import os
 import signal
+import sys
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
+
+
+def _is_debug() -> bool:
+    """Check if LITKIT_DEBUG=1 is set."""
+    return os.environ.get("LITKIT_DEBUG", "").strip() == "1"
 
 
 class EmbeddingPool:
@@ -54,6 +62,7 @@ class EmbeddingPool:
         self.workers: list[mp.Process] = []
         self._closed = False
         self._prev_signals: tuple | None = None
+        self._devices_used: dict[str, int] = {}  # Track actual device utilization
 
         for rank, dev in enumerate(self.devices):
             p = self.ctx.Process(
@@ -81,13 +90,20 @@ class EmbeddingPool:
         # Import inside worker to avoid CUDA init in parent.
         from sentence_transformers import SentenceTransformer
 
+        debug = os.environ.get("LITKIT_DEBUG", "").strip() == "1"
         model = SentenceTransformer(model_path, device=device)
+        
         while True:
             task = q_in.get()
             if task is None:
                 break
             task_id, texts, bs = task
             try:
+                if debug:
+                    t0 = time.time()
+                    sys.stderr.write(f"[debug:gpu:{device}] START batch_id={task_id} texts={len(texts)}\n")
+                    sys.stderr.flush()
+                
                 arr = model.encode(
                     texts,
                     batch_size=bs,
@@ -95,9 +111,16 @@ class EmbeddingPool:
                     convert_to_numpy=True,
                     normalize_embeddings=True,
                 ).astype("float32")
-                q_out.put((task_id, arr))
+                
+                if debug:
+                    elapsed = time.time() - t0
+                    sys.stderr.write(f"[debug:gpu:{device}] DONE batch_id={task_id} texts={len(texts)} elapsed={elapsed:.2f}s\n")
+                    sys.stderr.flush()
+                
+                # Return device info for utilization tracking
+                q_out.put((task_id, arr, device))
             except Exception as e:
-                q_out.put((task_id, e))
+                q_out.put((task_id, e, device))
 
         # best-effort cleanup
         try:
@@ -134,9 +157,18 @@ class EmbeddingPool:
             submitted.append(worker_id)
 
         results: dict[int, np.ndarray | Exception] = {}
+        devices_used: dict[str, int] = {}  # Track device utilization
+        
         for _ in submitted:
-            tid, payload = self.q_out.get()
+            tid, payload, device = self.q_out.get()
             results[tid] = payload
+            # Track which devices actually processed batches
+            if not isinstance(payload, Exception):
+                devices_used[device] = devices_used.get(device, 0) + 1
+
+        # Update instance-level utilization tracking
+        for dev, count in devices_used.items():
+            self._devices_used[dev] = self._devices_used.get(dev, 0) + count
 
         # propagate first error (after draining)
         for tid in submitted:
