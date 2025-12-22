@@ -114,6 +114,42 @@ srun --ntasks=N litkit --faiss-writer ...  # Race conditions!
 | `LITKIT_TAR_DIR` | Default tar shard directory |
 | `HF_HOME` | HuggingFace model cache location |
 | `HF_HUB_OFFLINE=1` | Force offline mode |
+| `LITKIT_DEBUG=1` | Enable verbose parallelism debugging (see below) |
+
+## Debugging Parallelism
+
+When multi-GPU or multi-CPU XML parsing isn't performing as expected, use `LITKIT_DEBUG=1`:
+
+```bash
+LITKIT_DEBUG=1 litkit --build-only --faiss-writer --tar-dir workspace/tar_shards
+```
+
+This enables per-worker logging that proves parallel execution:
+
+```
+[debug:gpu:cuda:0] START batch_id=0 texts=500
+[debug:gpu:cuda:1] START batch_id=1 texts=500    ← Different GPU before first finishes
+[debug:gpu:cuda:1] DONE batch_id=1 texts=500 elapsed=1.23s
+[debug:gpu:cuda:0] DONE batch_id=0 texts=500 elapsed=1.31s
+
+[debug:xml:tid12345] START member=PMC123456.xml bytes=45.2KB
+[debug:xml:tid12346] START member=PMC123457.xml bytes=52.1KB  ← Different thread
+```
+
+**Interpreting the output:**
+- **Healthy GPU parallelism:** Multiple `[debug:gpu:cuda:X]` START lines before any DONE
+- **Serialized (bad):** Same device completes before next device starts
+- **Healthy XML parallelism:** Multiple thread IDs (`tid*`) with interleaved START/DONE
+- **Serialized (bad):** Same thread ID for every file
+
+A parallelism summary is printed at the end of the build showing requested vs actual utilization:
+```
+=== PARALLELISM SUMMARY ===
+[gpu] requested=2 devices, actual=2 devices used [cuda:0: 250 batches, cuda:1: 250 batches]
+[xml] requested=16 workers, actual=8 threads used [tid1234: 172 files, tid1235: 168 files, ...]
+```
+
+If `actual < requested`, you'll see `⚠️ UNDERUTILIZED` indicating a configuration problem.
 
 ## Full Help
 
