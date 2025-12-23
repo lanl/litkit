@@ -289,15 +289,15 @@ EOF
             set -e
             echo "[Producer ${PRODUCER_NODE_ID}] litkit exit code: ${rc}"
 
-            # --- Sync back to NFS (SAFE: shard-specific destinations) ---
+            # --- Sync back to NFS (FLAT structure: filenames are shard-unique) ---
+            # SQLite: litkit_shard_XX.sqlite3 (consumer expects flat sqlite/)
+            # Segments: paper_seg_shardXX_*.npz, chunk_seg_shardXX_*.npz (consumer expects flat emb_segments/)
             if [[ "${ACTUAL_USE_LOCAL_STAGING}" == "1" ]]; then
                 if [[ "${rc}" -eq 0 ]]; then
-                    nfs_sqlite_dest="${LITKIT_WORKSPACE}/sqlite/shard_${PRODUCER_NODE_ID}/"
-                    nfs_segments_dest="${LITKIT_WORKSPACE}/emb_segments/shard_${PRODUCER_NODE_ID}/"
-                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] Syncing local outputs -> NFS"
-                    mkdir -p "${nfs_sqlite_dest}" "${nfs_segments_dest}"
-                    rsync -a --delay-updates "${PRODUCER_LOCAL_STAGE_HOST}/sqlite/" "${nfs_sqlite_dest}"
-                    rsync -a --delay-updates "${PRODUCER_LOCAL_STAGE_HOST}/emb_segments/" "${nfs_segments_dest}"
+                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] Syncing local outputs -> NFS (flat)"
+                    mkdir -p "${LITKIT_WORKSPACE}/sqlite" "${LITKIT_WORKSPACE}/emb_segments"
+                    rsync -a --delay-updates "${PRODUCER_LOCAL_STAGE_HOST}/sqlite/" "${LITKIT_WORKSPACE}/sqlite/"
+                    rsync -a --delay-updates "${PRODUCER_LOCAL_STAGE_HOST}/emb_segments/" "${LITKIT_WORKSPACE}/emb_segments/"
                     echo "[Producer ${PRODUCER_NODE_ID}] [staging] Cleanup local staging dir"
                     rm -rf "${PRODUCER_LOCAL_STAGE_HOST}"
                 else
@@ -384,9 +384,10 @@ done
 sleep 10
 
 # Run consumer on the last node (already set above in bootstrap)
-# NOTE: With local staging, producers rsync to shard-specific subdirs:
-#   emb_segments/shard_0/, emb_segments/shard_1/, etc.
-# Consumer must scan --embed-outdir recursively to find all .npz files.
+# NOTE: Producers rsync to FLAT directories (filenames are shard-unique):
+#   sqlite/litkit_shard_XX.sqlite3
+#   emb_segments/paper_seg_shardXX_*.npz, chunk_seg_shardXX_*.npz
+# Consumer's non-recursive glob finds all files directly in these directories.
 echo "Starting consumer on node: $CONSUMER_NODE"
 # --exclusive: prevent step resource overlap
 # --kill-on-bad-exit=1: terminate job if consumer fails
