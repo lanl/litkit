@@ -77,14 +77,17 @@ export PARSE_WORKERS=16
 # Debug mode for parallelism verification (set to 0 for quiet production runs)
 export LITKIT_DEBUG="${LITKIT_DEBUG:-1}"
 
-# Ensure directories exist on Lustre
+# Ensure directories exist on NFS
 mkdir -p "${LITKIT_WORKSPACE}/emb_segments"
 mkdir -p "${LITKIT_WORKSPACE}/sqlite"
 mkdir -p "${LITKIT_WORKSPACE}/indices"
 
-# Lustre-optimized settings
+# NFS-optimized settings (high timeout for distributed lock contention)
 export LITKIT_SQLITE_BUSY_TIMEOUT_MS=300000
 export LITKIT_SAVE_EVERY_SEC=300
+
+# Minimum free space required on LOCAL_SSD (GB) before staging is allowed
+export LOCAL_SSD_MIN_FREE_GB="${LOCAL_SSD_MIN_FREE_GB:-50}"
 
 # Threading clamps to prevent oversubscription (OMP, MKL, etc.)
 # With --parse-workers 16, hidden threading would oversubscribe the node
@@ -152,16 +155,41 @@ run_producer() {
     fi
 
     # Run on the target node. Everything needed is passed explicitly via --export.
+    # --kill-on-bad-exit=1: terminate job if step fails (don't burn GPU on dead job)
+    # --exclusive: prevent step resource overlap within allocation
     srun -N1 -n1 -w "${target_node}" \
         --cpus-per-task="${SLURM_CPUS_PER_TASK}" \
         --cpu-bind=cores \
-        --export=ALL,PRODUCER_NODE_ID="${node_id}",PRODUCER_NUM_SHARDS="${num_shards}",PRODUCER_LOCAL_STAGE_HOST="${local_stage_host}",PRODUCER_USE_LOCAL_STAGING="${USE_LOCAL_STAGING}",PRODUCER_MANIFEST_FILE="${MANIFEST_FILE}",PRODUCER_PARSE_WORKERS="${PARSE_WORKERS}",PRODUCER_JOB_ID="${SLURM_JOB_ID}",CHRUN="${CHRUN}",IMG="${IMG}",CDI_SPEC_DIR="${CDI_SPEC_DIR}",CUDA_LIBA="${CUDA_LIBA}",CUDA_LIBB="${CUDA_LIBB}",HF_HOST="${HF_HOST}",LITKIT_WORKSPACE="${LITKIT_WORKSPACE}",LITKIT_SQLITE_BUSY_TIMEOUT_MS="${LITKIT_SQLITE_BUSY_TIMEOUT_MS}",LITKIT_SAVE_EVERY_SEC="${LITKIT_SAVE_EVERY_SEC}",LITKIT_DEBUG="${LITKIT_DEBUG}" \
+        --exclusive \
+        --kill-on-bad-exit=1 \
+        --export=ALL,PRODUCER_NODE_ID="${node_id}",PRODUCER_NUM_SHARDS="${num_shards}",PRODUCER_LOCAL_STAGE_HOST="${local_stage_host}",PRODUCER_USE_LOCAL_STAGING="${USE_LOCAL_STAGING}",PRODUCER_MANIFEST_FILE="${MANIFEST_FILE}",PRODUCER_PARSE_WORKERS="${PARSE_WORKERS}",PRODUCER_JOB_ID="${SLURM_JOB_ID}",CHRUN="${CHRUN}",IMG="${IMG}",CDI_SPEC_DIR="${CDI_SPEC_DIR}",CUDA_LIBA="${CUDA_LIBA}",CUDA_LIBB="${CUDA_LIBB}",HF_HOST="${HF_HOST}",LITKIT_WORKSPACE="${LITKIT_WORKSPACE}",LITKIT_SQLITE_BUSY_TIMEOUT_MS="${LITKIT_SQLITE_BUSY_TIMEOUT_MS}",LITKIT_SAVE_EVERY_SEC="${LITKIT_SAVE_EVERY_SEC}",LITKIT_DEBUG="${LITKIT_DEBUG}",LOCAL_SSD="${LOCAL_SSD}",LOCAL_SSD_MIN_FREE_GB="${LOCAL_SSD_MIN_FREE_GB}" \
         bash -lc '
             set -euo pipefail
 
             # Decide container workspace and embed outdir
             CONTAINER_NFS_WS="/workspace"
-            if [[ "${PRODUCER_USE_LOCAL_STAGING}" == "1" ]]; then
+            ACTUAL_USE_LOCAL_STAGING="${PRODUCER_USE_LOCAL_STAGING}"
+            
+            # Validate LOCAL_SSD if staging is requested
+            if [[ "${ACTUAL_USE_LOCAL_STAGING}" == "1" ]]; then
+                if [[ ! -d "${LOCAL_SSD}" ]]; then
+                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] WARN: LOCAL_SSD ${LOCAL_SSD} not found, falling back to NFS" >&2
+                    ACTUAL_USE_LOCAL_STAGING="0"
+                elif ! touch "${LOCAL_SSD}/.litkit_probe_$$" 2>/dev/null; then
+                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] WARN: LOCAL_SSD ${LOCAL_SSD} not writable, falling back to NFS" >&2
+                    ACTUAL_USE_LOCAL_STAGING="0"
+                else
+                    rm -f "${LOCAL_SSD}/.litkit_probe_$$"
+                    free_gb=$(df -BG "${LOCAL_SSD}" 2>/dev/null | awk "NR==2{gsub(/G/,\"\",\$4); print \$4}" || echo "0")
+                    if [[ -z "${free_gb}" ]] || (( free_gb < LOCAL_SSD_MIN_FREE_GB )); then
+                        echo "[Producer ${PRODUCER_NODE_ID}] [staging] FATAL: LOCAL_SSD has only ${free_gb}GB free (need ${LOCAL_SSD_MIN_FREE_GB}GB min)" >&2
+                        exit 1
+                    fi
+                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] LOCAL_SSD validated: ${free_gb}GB free"
+                fi
+            fi
+            
+            if [[ "${ACTUAL_USE_LOCAL_STAGING}" == "1" ]]; then
                 CONTAINER_WS="/local_stage"
                 EMBED_OUTDIR="${CONTAINER_WS}/emb_segments"
             else
@@ -170,7 +198,7 @@ run_producer() {
             fi
 
             # Prep local staging (host FS) if enabled
-            if [[ "${PRODUCER_USE_LOCAL_STAGING}" == "1" ]]; then
+            if [[ "${ACTUAL_USE_LOCAL_STAGING}" == "1" ]]; then
                 echo "[Producer ${PRODUCER_NODE_ID}] [staging] Using node-local SSD: ${PRODUCER_LOCAL_STAGE_HOST}"
                 mkdir -p "${PRODUCER_LOCAL_STAGE_HOST}/sqlite" "${PRODUCER_LOCAL_STAGE_HOST}/emb_segments"
                 rm -f "${PRODUCER_LOCAL_STAGE_HOST}/.writer_guard" 2>/dev/null || true
@@ -248,7 +276,7 @@ EOF
 
             # Sync local results back to NFS only if litkit succeeded
             # Rsync to FLAT emb_segments dir (segment filenames are shard-unique)
-            if [[ "${PRODUCER_USE_LOCAL_STAGING}" == "1" ]]; then
+            if [[ "${ACTUAL_USE_LOCAL_STAGING}" == "1" ]]; then
                 if [[ "${rc}" -eq 0 ]]; then
                     echo "[Producer ${PRODUCER_NODE_ID}] [staging] Syncing local outputs -> NFS (atomic-ish via --delay-updates)"
                     mkdir -p "${LITKIT_WORKSPACE}/sqlite" "${LITKIT_WORKSPACE}/emb_segments"
@@ -280,10 +308,13 @@ echo "Running fast bootstrap on consumer node: $CONSUMER_NODE"
 echo "Using --chunks-index flat (no IVF-PQ training)"
 echo "This should complete in < 30 seconds..."
 
-# FIX: Request CPUs for srun step
+# --exclusive: prevent step resource overlap
+# --kill-on-bad-exit=1: terminate job if bootstrap fails
 srun -N1 -n1 -w "$CONSUMER_NODE" \
     --cpus-per-task="$SLURM_CPUS_PER_TASK" \
     --cpu-bind=cores \
+    --exclusive \
+    --kill-on-bad-exit=1 \
     --export=ALL \
     "$CHRUN" \
     --unset-env='*' \
@@ -337,13 +368,16 @@ done
 sleep 10
 
 # Run consumer on the last node (already set above in bootstrap)
-# NOTE: With local staging, segments are in /workspace/emb_segments/shard_X/
-# The consumer scans --embed-outdir recursively, so this still works.
+# NOTE: Producers rsync to FLAT emb_segments dir (shard-unique segment filenames)
+# No recursive scan needed - all .npz files appear directly in emb_segments/
 echo "Starting consumer on node: $CONSUMER_NODE"
-# FIX: Request CPUs for srun step
+# --exclusive: prevent step resource overlap
+# --kill-on-bad-exit=1: terminate job if consumer fails
 srun -N1 -n1 -w "$CONSUMER_NODE" \
     --cpus-per-task="$SLURM_CPUS_PER_TASK" \
     --cpu-bind=cores \
+    --exclusive \
+    --kill-on-bad-exit=1 \
     --export=ALL \
     "$CHRUN" \
     --unset-env='*' \
