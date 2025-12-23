@@ -152,18 +152,23 @@ run_producer() {
         --set-env="OPENBLAS_NUM_THREADS=1" \
         --set-env="TOKENIZERS_PARALLELISM=false" \
         "$IMG" -- \
-        litkit \
-            --embed-producer \
-            --build-only \
-            --shard-id $node_id \
-            --num-shards $((SLURM_NNODES - 1)) \
-            --embed-outdir "/workspace/emb_segments" \
-            --paper-embed-bs 16 \
-            --chunk-embed-bs 64 \
-            --embed-devices "cuda:0,cuda:1" \
-            --embed-workers 2 \
-            --parse-workers $PARSE_WORKERS \
-            --tar-manifest "/workspace/${MANIFEST_FILE}"
+        bash -c '
+            echo "[diag:producer] nproc=$(nproc)"
+            echo "[diag:producer] Cpus_allowed=$(grep Cpus_allowed_list /proc/self/status | cut -f2)"
+            echo "[diag:producer] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+            exec litkit \
+                --embed-producer \
+                --build-only \
+                --shard-id '"$node_id"' \
+                --num-shards '"$((SLURM_NNODES - 1))"' \
+                --embed-outdir "/workspace/emb_segments" \
+                --paper-embed-bs 16 \
+                --chunk-embed-bs 64 \
+                --embed-devices "cuda:0,cuda:1" \
+                --embed-workers 2 \
+                --parse-workers '"$PARSE_WORKERS"' \
+                --tar-manifest "/workspace/'"${MANIFEST_FILE}"'"
+        '
     
     echo "[Producer $node_id] Completed"
 }
@@ -209,11 +214,15 @@ srun -N1 -n1 -w "$CONSUMER_NODE" \
     --set-env="OPENBLAS_NUM_THREADS=1" \
     --set-env="TOKENIZERS_PARALLELISM=false" \
     "$IMG" -- \
-    litkit \
-        --faiss-writer \
-        --init-indices-only \
-        --papers-index hnsw \
-        --chunks-index flat
+    bash -c '
+        echo "[diag:bootstrap] nproc=$(nproc)"
+        echo "[diag:bootstrap] Cpus_allowed=$(grep Cpus_allowed_list /proc/self/status | cut -f2)"
+        exec litkit \
+            --faiss-writer \
+            --init-indices-only \
+            --papers-index hnsw \
+            --chunks-index flat
+    '
 
 echo "=== Bootstrap Complete (empty indices created) ==="
 echo ""
@@ -263,14 +272,18 @@ srun -N1 -n1 -w "$CONSUMER_NODE" \
     --set-env="OPENBLAS_NUM_THREADS=1" \
     --set-env="TOKENIZERS_PARALLELISM=false" \
     "$IMG" -- \
-    litkit \
-        --faiss-writer \
-        --consume-only \
-        --embed-outdir "/workspace/emb_segments" \
-        --tar-manifest "/workspace/${MANIFEST_FILE}" \
-        --papers-index hnsw \
-        --chunks-index flat \
-        --num-shards $((SLURM_NNODES - 1))
+    bash -c '
+        echo "[diag:consumer] nproc=$(nproc)"
+        echo "[diag:consumer] Cpus_allowed=$(grep Cpus_allowed_list /proc/self/status | cut -f2)"
+        exec litkit \
+            --faiss-writer \
+            --consume-only \
+            --embed-outdir "/workspace/emb_segments" \
+            --tar-manifest "/workspace/'"${MANIFEST_FILE}"'" \
+            --papers-index hnsw \
+            --chunks-index flat \
+            --num-shards '"$((SLURM_NNODES - 1))"'
+    '
 
 # Wait for all background jobs to finish
 echo "Waiting for all jobs to complete..."
