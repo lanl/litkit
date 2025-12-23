@@ -54,7 +54,7 @@ export LITKIT_WORKSPACE="${LITKIT_REPO}/workspace"  # Shared NFS workspace (cons
 # LOCAL STAGING: Use node-local SSD to avoid NFS metadata storm
 # Evidence: 47× faster for small-file creates (see BOTTLENECK.md)
 export LOCAL_SSD="/local/scratch"
-export USE_LOCAL_STAGING="${USE_LOCAL_STAGING:-1}"  # Set to 0 to disable
+export USE_LOCAL_STAGING="${USE_LOCAL_STAGING:-0}"  # Set to 1 to enable local SSD staging
 
 # MANIFEST selection (edit this ONE LINE to change which manifest is used):
 #   tiny_test.manifest    (~few MB, 5-10 min) - for debugging merge logic
@@ -156,13 +156,12 @@ run_producer() {
     fi
 
     # Run on target node. Everything needed is passed explicitly via --export.
-    # --gres=gpu:2: explicitly request GPUs for step (matches job-level allocation)
     # --kill-on-bad-exit=1: fail fast (don't burn GPUs on a dead run)
     # NOTE: --exclusive omitted for backgrounded producers to avoid step scheduling friction
+    # NOTE: GPUs inherited from job-level allocation (no step-level --gres to avoid conflicts)
     srun -N1 -n1 -w "${target_node}" \
         --cpus-per-task="${SLURM_CPUS_PER_TASK}" \
         --cpu-bind=cores \
-        --gres=gpu:2 \
         --kill-on-bad-exit=1 \
         --export=ALL,PRODUCER_NODE_ID="${node_id}",PRODUCER_NUM_SHARDS="${num_shards}",PRODUCER_LOCAL_STAGE_HOST="${local_stage_host}",PRODUCER_USE_LOCAL_STAGING="${USE_LOCAL_STAGING}",PRODUCER_MANIFEST_FILE="${MANIFEST_FILE}",PRODUCER_PARSE_WORKERS="${PARSE_WORKERS}",PRODUCER_JOB_ID="${SLURM_JOB_ID}",CHRUN="${CHRUN}",IMG="${IMG}",CDI_SPEC_DIR="${CDI_SPEC_DIR}",CUDA_LIBA="${CUDA_LIBA}",CUDA_LIBB="${CUDA_LIBB}",HF_HOST="${HF_HOST}",LITKIT_WORKSPACE="${LITKIT_WORKSPACE}",LITKIT_SQLITE_BUSY_TIMEOUT_MS="${LITKIT_SQLITE_BUSY_TIMEOUT_MS}",LITKIT_SAVE_EVERY_SEC="${LITKIT_SAVE_EVERY_SEC}",LITKIT_DEBUG="${LITKIT_DEBUG}",LOCAL_SSD="${LOCAL_SSD}",LOCAL_SSD_MIN_FREE_GB="${LOCAL_SSD_MIN_FREE_GB:-50}" \
         bash -lc '
@@ -326,13 +325,12 @@ echo "Using --chunks-index flat (no IVF-PQ training)"
 echo "This should complete in < 30 seconds..."
 
 # --exclusive: prevent step resource overlap (serial step, safe)
-# --gres=gpu:2: explicitly request GPUs for step
 # --kill-on-bad-exit=1: terminate job if bootstrap fails
+# NOTE: GPUs inherited from job-level allocation (no step-level --gres to avoid conflicts)
 srun -N1 -n1 -w "$CONSUMER_NODE" \
     --cpus-per-task="$SLURM_CPUS_PER_TASK" \
     --cpu-bind=cores \
     --exclusive \
-    --gres=gpu:2 \
     --kill-on-bad-exit=1 \
     --export=ALL \
     "$CHRUN" \
@@ -393,13 +391,12 @@ sleep 10
 # Consumer's non-recursive glob finds all files directly in these directories.
 echo "Starting consumer on node: $CONSUMER_NODE"
 # --exclusive: prevent step resource overlap (serial step, safe)
-# --gres=gpu:2: explicitly request GPUs for step
 # --kill-on-bad-exit=1: terminate job if consumer fails
+# NOTE: GPUs inherited from job-level allocation (no step-level --gres to avoid conflicts)
 srun -N1 -n1 -w "$CONSUMER_NODE" \
     --cpus-per-task="$SLURM_CPUS_PER_TASK" \
     --cpu-bind=cores \
     --exclusive \
-    --gres=gpu:2 \
     --kill-on-bad-exit=1 \
     --export=ALL \
     "$CHRUN" \
