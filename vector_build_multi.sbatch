@@ -81,6 +81,15 @@ mkdir -p "${LITKIT_WORKSPACE}/indices"
 export LITKIT_SQLITE_BUSY_TIMEOUT_MS=300000
 export LITKIT_SAVE_EVERY_SEC=300
 
+# Threading clamps to prevent oversubscription (OMP, MKL, etc.)
+# With --parse-workers 16, hidden threading would oversubscribe the node
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export TOKENIZERS_PARALLELISM=false
+
 # Fail-fast: Multi-node build requires at least 2 nodes (1 producer + 1 consumer)
 if [[ "$SLURM_NNODES" -lt 2 ]]; then
     echo "FATAL: vector_build_multi.sbatch requires at least 2 nodes (-N2 or higher)." >&2
@@ -115,7 +124,12 @@ run_producer() {
     local target_node=$2
     echo "[Producer $node_id] Starting on $target_node with $PARSE_WORKERS parse workers"
     
-    srun -N1 -n1 -w "$target_node" "$CHRUN" \
+    # FIX: Request CPUs for srun step (without this, step may get only 1 CPU!)
+    srun -N1 -n1 -w "$target_node" \
+        --cpus-per-task="$SLURM_CPUS_PER_TASK" \
+        --cpu-bind=cores \
+        --export=ALL \
+        "$CHRUN" \
         --unset-env='*' \
         --set-env=HOME=/root \
         --cdi-dirs="$CDI_SPEC_DIR" \
@@ -133,6 +147,10 @@ run_producer() {
         --set-env="LITKIT_SQLITE_BUSY_TIMEOUT_MS=${LITKIT_SQLITE_BUSY_TIMEOUT_MS}" \
         --set-env="LITKIT_SAVE_EVERY_SEC=${LITKIT_SAVE_EVERY_SEC}" \
         --set-env="LITKIT_DEBUG=${LITKIT_DEBUG}" \
+        --set-env="OMP_NUM_THREADS=1" \
+        --set-env="MKL_NUM_THREADS=1" \
+        --set-env="OPENBLAS_NUM_THREADS=1" \
+        --set-env="TOKENIZERS_PARALLELISM=false" \
         "$IMG" -- \
         litkit \
             --embed-producer \
@@ -163,7 +181,12 @@ echo "Running fast bootstrap on consumer node: $CONSUMER_NODE"
 echo "Using --chunks-index flat (no IVF-PQ training)"
 echo "This should complete in < 30 seconds..."
 
-srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
+# FIX: Request CPUs for srun step
+srun -N1 -n1 -w "$CONSUMER_NODE" \
+    --cpus-per-task="$SLURM_CPUS_PER_TASK" \
+    --cpu-bind=cores \
+    --export=ALL \
+    "$CHRUN" \
     --unset-env='*' \
     --set-env=HOME=/root \
     --cdi-dirs="$CDI_SPEC_DIR" \
@@ -181,6 +204,10 @@ srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
     --set-env="LITKIT_SQLITE_BUSY_TIMEOUT_MS=${LITKIT_SQLITE_BUSY_TIMEOUT_MS}" \
     --set-env="LITKIT_SAVE_EVERY_SEC=${LITKIT_SAVE_EVERY_SEC}" \
     --set-env="LITKIT_DEBUG=${LITKIT_DEBUG}" \
+    --set-env="OMP_NUM_THREADS=1" \
+    --set-env="MKL_NUM_THREADS=1" \
+    --set-env="OPENBLAS_NUM_THREADS=1" \
+    --set-env="TOKENIZERS_PARALLELISM=false" \
     "$IMG" -- \
     litkit \
         --faiss-writer \
@@ -208,7 +235,12 @@ sleep 10
 
 # Run consumer on the last node (already set above in bootstrap)
 echo "Starting consumer on node: $CONSUMER_NODE"
-srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
+# FIX: Request CPUs for srun step
+srun -N1 -n1 -w "$CONSUMER_NODE" \
+    --cpus-per-task="$SLURM_CPUS_PER_TASK" \
+    --cpu-bind=cores \
+    --export=ALL \
+    "$CHRUN" \
     --unset-env='*' \
     --set-env=HOME=/root \
     --cdi-dirs="$CDI_SPEC_DIR" \
@@ -226,6 +258,10 @@ srun -N1 -n1 -w "$CONSUMER_NODE" "$CHRUN" \
     --set-env="LITKIT_SQLITE_BUSY_TIMEOUT_MS=${LITKIT_SQLITE_BUSY_TIMEOUT_MS}" \
     --set-env="LITKIT_SAVE_EVERY_SEC=${LITKIT_SAVE_EVERY_SEC}" \
     --set-env="LITKIT_DEBUG=${LITKIT_DEBUG}" \
+    --set-env="OMP_NUM_THREADS=1" \
+    --set-env="MKL_NUM_THREADS=1" \
+    --set-env="OPENBLAS_NUM_THREADS=1" \
+    --set-env="TOKENIZERS_PARALLELISM=false" \
     "$IMG" -- \
     litkit \
         --faiss-writer \
