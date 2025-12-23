@@ -155,7 +155,7 @@ run_producer() {
         bash -c '
             echo "[diag:producer] Cpus_allowed=$(grep Cpus_allowed_list /proc/self/status | cut -f2)"
             python3 -c "import os; aff=os.sched_getaffinity(0); print(\"[diag:producer] affinity_cpus=\", len(aff))"
-            echo "[diag:producer] GPUs: $(nvidia-smi -L 2>/dev/null | head -2 || echo 'nvidia-smi not found')"
+            echo "[diag:producer] GPUs: $(nvidia-smi -L 2>/dev/null | head -2 || echo nvidia-smi-not-found)"
             exec litkit \
                 --embed-producer \
                 --build-only \
