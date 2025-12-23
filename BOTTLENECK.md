@@ -13,13 +13,14 @@
 | Phase 1: CPU Allocation | ✅ COMPLETE | `affinity_cpus=32` confirmed inside container |
 | Phase 1: GPU Access | ✅ COMPLETE | 2× V100 per producer confirmed via nvidia-smi |
 | Phase 2: Instrumentation | ✅ COMPLETE | Instantaneous rate + per-cycle timing added |
-| Phase 3: Output Staging | 🔲 NEXT | Stage SQLite + segments to local SSD |
-| Phase 4: Per-Tar Streaming | 🔲 TODO | Stage one tar at a time to local SSD |
+| Phase 3: Output Staging | ✅ COMPLETE | Stage SQLite + segments to local SSD |
+| Phase 4: Tar Input Staging | 🔲 NEXT | Stage tar files to local SSD for 2.8× read speedup |
 | Phase 5: Scale to Production | 🔲 TODO | 16+ producers on H100 nodes |
 
 **Commits:**
 - `c959c19` - Instantaneous scan rate display
 - `a0f40b1` - Per-cycle timing instrumentation
+- `0eb8dba` - Output staging to local SSD (flat rsync to NFS)
 
 ---
 
@@ -82,7 +83,7 @@ The new instrumentation shows:
 
 ---
 
-## Phase 3: Output Staging (NEXT)
+## Phase 3: Output Staging (COMPLETE)
 
 ### Problem
 
@@ -92,26 +93,19 @@ Every segment write and SQLite commit currently goes to NFS. With measured 47× 
 
 Stage all high-churn outputs to node-local SSD, rsync back at end.
 
-### Implementation (vector_build_multi.sbatch)
+### Implementation (vector_build_multi.sbatch) ✅
 
-```bash
-# --- LOCAL STAGING SETUP ---
-LOCAL_SSD="/local/scratch"
-LOCAL_STAGE="${LOCAL_SSD}/litkit_${SLURM_JOB_ID}_shard${shard_id}"
-mkdir -p "${LOCAL_STAGE}/sqlite" "${LOCAL_STAGE}/emb_segments"
+The sbatch script now:
+1. Validates LOCAL_SSD (exists, mountpoint, writable, ≥50GB free)
+2. Sets `LITKIT_WORKSPACE=/local_stage` inside container
+3. Rsyncs outputs to FLAT NFS directories after litkit completes
+4. Falls back to NFS if LOCAL_SSD unavailable
 
-# Producer runs with local workspace:
-export LITKIT_WORKSPACE="${LOCAL_STAGE}"
-litkit --embed-producer \
-    --tar-manifest "$NFS_TAR_MANIFEST" \
-    --embed-outdir "${LOCAL_STAGE}/emb_segments" \
-    ...
-
-# After producer completes (before marking done):
-rsync -a --inplace "${LOCAL_STAGE}/sqlite/" "${NFS_WORKSPACE}/sqlite/"
-rsync -a --inplace "${LOCAL_STAGE}/emb_segments/" "${NFS_WORKSPACE}/emb_segments/"
-rm -rf "${LOCAL_STAGE}"  # cleanup
-```
+**Key design choices:**
+- `--exclusive` omitted for backgrounded producers (avoids step scheduling friction)
+- `--gres=gpu:2` explicit on all srun steps
+- FLAT rsync destinations (consumer expects non-recursive globs)
+- Conditional rsync on success only (preserves staging dir on failure for debugging)
 
 ### Storage Budget
 
@@ -124,34 +118,81 @@ rm -rf "${LOCAL_STAGE}"  # cleanup
 
 ---
 
-## Phase 4: Per-Tar Streaming
+## Phase 4: Tar Input Staging (NEXT)
 
 ### Problem
 
-With 16 producers reading tars from NFS simultaneously, aggregate bandwidth demand may exceed NFS capacity. Measured NFS read: 124 MB/s vs local 350 MB/s.
+Producers still read tar files from NFS. With 16 producers reading simultaneously:
+- **NFS read bandwidth:** 124 MB/s per producer
+- **Local SSD read:** 350 MB/s (2.8× faster)
+- **Aggregate NFS demand:** 16 × 124 MB/s = 2 GB/s (exceeds typical NFS capacity)
+
+Output staging (Phase 3) helps metadata/write pain, but does NOT remove the read bottleneck at scale.
 
 ### Solution
 
-Stage one tar at a time to local SSD, process, delete, repeat.
+Stage each shard's tar files to local SSD, generate a per-shard local manifest, and point litkit at that manifest.
 
-### Implementation Concept
+### Implementation Algorithm
+
+**Insert this block inside the srun `bash -lc '...'` portion of run_producer(), AFTER staging validation:**
 
 ```bash
-# For each tar in this producer's shard:
-for tar_path in $(shard_tars); do
-    # Stage tar to local SSD (one-time cost ~5-6 min for 64GB)
-    local_tar="${LOCAL_SSD}/current_shard.tar"
-    cp "$tar_path" "$local_tar"
+# ---- Tar Input Staging ----
+HOST_CORPUS_ROOT="/path/to/PMC-OA"
+CONTAINER_CORPUS_ROOT="/path/to/PMC-OA"  # same due to bind
+HOST_STAGE_TAR_DIR="${PRODUCER_LOCAL_STAGE_HOST}/tars"
+CONTAINER_STAGE_TAR_DIR="/local_stage/tars"
+
+# Default: use NFS manifest
+MANIFEST_FOR_LITKIT="${CONTAINER_NFS_WS}/${PRODUCER_MANIFEST_FILE}"
+
+if [[ "${ACTUAL_USE_LOCAL_STAGING}" == "1" ]]; then
+    echo "[Producer ${PRODUCER_NODE_ID}] [tar-stage] Staging shard tar(s) to local SSD."
+    mkdir -p "${HOST_STAGE_TAR_DIR}"
     
-    # Create single-tar manifest
-    echo "$local_tar" > "${LOCAL_STAGE}/single.manifest"
+    # 1) Read NFS manifest
+    HOST_MANIFEST_PATH="${LITKIT_WORKSPACE}/${PRODUCER_MANIFEST_FILE}"
     
-    # Process from local
-    litkit --embed-producer --tar-manifest "${LOCAL_STAGE}/single.manifest" ...
+    # 2) Select tars for THIS shard using crc32(basename) % num_shards
+    # This matches litkit's internal sharding algorithm
+    pick_for_shard_py='
+import os, sys, zlib
+shard_id=int(sys.argv[1]); num=int(sys.argv[2])
+for line in sys.stdin:
+    p=line.strip()
+    if not p or p.startswith("#"): continue
+    if ".tar" in p:
+        b=os.path.basename(p.split()[0])
+        h=zlib.crc32(b.encode("utf-8")) & 0xffffffff
+        if (h % num) == shard_id:
+            print(p.split()[0])
+'
+    mapfile -t SHARD_TARS < <(cat "${HOST_MANIFEST_PATH}" | python3 -c "${pick_for_shard_py}" "${PRODUCER_NODE_ID}" "${PRODUCER_NUM_SHARDS}")
     
-    # Delete before staging next
-    rm "$local_tar"
-done
+    # 3) Stage selected tars to local SSD
+    for tar_path in "${SHARD_TARS[@]}"; do
+        [[ "${tar_path}" != /* ]] && tar_path="${HOST_CORPUS_ROOT}/${tar_path}"
+        [[ ! -f "${tar_path}" ]] && continue
+        dest="${HOST_STAGE_TAR_DIR}/$(basename "${tar_path}")"
+        if [[ ! -f "${dest}" ]]; then
+            echo "[tar-stage] Copy -> $(basename "${tar_path}")"
+            cp -p "${tar_path}" "${dest}"
+        fi
+    done
+    
+    # 4) Write local manifest with rewritten tar paths
+    CONTAINER_LOCAL_MANIFEST="/local_stage/manifest_shard_${PRODUCER_NODE_ID}.manifest"
+    for f in "${HOST_STAGE_TAR_DIR}"/*.tar; do
+        echo "${CONTAINER_STAGE_TAR_DIR}/$(basename "$f")"
+    done > "${PRODUCER_LOCAL_STAGE_HOST}/manifest_shard_${PRODUCER_NODE_ID}.manifest"
+    
+    MANIFEST_FOR_LITKIT="${CONTAINER_LOCAL_MANIFEST}"
+    echo "[tar-stage] Using local manifest: ${MANIFEST_FOR_LITKIT}"
+fi
+
+# Then in litkit_cmd, use:
+#   --tar-manifest "${MANIFEST_FOR_LITKIT}"
 ```
 
 ### Storage Budget
@@ -159,8 +200,22 @@ done
 | Item | Size | Notes |
 |------|------|-------|
 | Largest tar | ~64 GB | Uncompressed PMC-OA shard |
-| Local SSD | 447 GB | Plenty of headroom |
-| RAM tmpfs | 128 GB | **DO NOT USE** for tars (OOM risk) |
+| Tars per producer | ~100-200 GB | Depends on sharding |
+| Local SSD | 447 GB | Enough for tars + outputs |
+| RAM tmpfs | 128 GB | **DO NOT USE** (OOM risk) |
+
+### Expected Speedup
+
+| Operation | NFS | Local SSD | Ratio |
+|-----------|-----|-----------|-------|
+| Read 64GB tar | ~8.6 min | ~3.0 min | 2.8× |
+| Staging cost | - | ~5-6 min | one-time |
+
+For a multi-hour job, staging cost is amortized. Net gain is significant when multiple tars are processed per producer.
+
+### Deferred
+
+Tar staging adds ~100 lines of complexity. We will validate output staging (Phase 3) first before implementing this.
 
 ---
 

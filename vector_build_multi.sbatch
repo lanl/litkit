@@ -156,12 +156,13 @@ run_producer() {
     fi
 
     # Run on target node. Everything needed is passed explicitly via --export.
-    # --exclusive: avoid step overlap inside allocation
+    # --gres=gpu:2: explicitly request GPUs for step (matches job-level allocation)
     # --kill-on-bad-exit=1: fail fast (don't burn GPUs on a dead run)
+    # NOTE: --exclusive omitted for backgrounded producers to avoid step scheduling friction
     srun -N1 -n1 -w "${target_node}" \
         --cpus-per-task="${SLURM_CPUS_PER_TASK}" \
         --cpu-bind=cores \
-        --exclusive \
+        --gres=gpu:2 \
         --kill-on-bad-exit=1 \
         --export=ALL,PRODUCER_NODE_ID="${node_id}",PRODUCER_NUM_SHARDS="${num_shards}",PRODUCER_LOCAL_STAGE_HOST="${local_stage_host}",PRODUCER_USE_LOCAL_STAGING="${USE_LOCAL_STAGING}",PRODUCER_MANIFEST_FILE="${MANIFEST_FILE}",PRODUCER_PARSE_WORKERS="${PARSE_WORKERS}",PRODUCER_JOB_ID="${SLURM_JOB_ID}",CHRUN="${CHRUN}",IMG="${IMG}",CDI_SPEC_DIR="${CDI_SPEC_DIR}",CUDA_LIBA="${CUDA_LIBA}",CUDA_LIBB="${CUDA_LIBB}",HF_HOST="${HF_HOST}",LITKIT_WORKSPACE="${LITKIT_WORKSPACE}",LITKIT_SQLITE_BUSY_TIMEOUT_MS="${LITKIT_SQLITE_BUSY_TIMEOUT_MS}",LITKIT_SAVE_EVERY_SEC="${LITKIT_SAVE_EVERY_SEC}",LITKIT_DEBUG="${LITKIT_DEBUG}",LOCAL_SSD="${LOCAL_SSD}",LOCAL_SSD_MIN_FREE_GB="${LOCAL_SSD_MIN_FREE_GB:-50}" \
         bash -lc '
@@ -324,12 +325,14 @@ echo "Running fast bootstrap on consumer node: $CONSUMER_NODE"
 echo "Using --chunks-index flat (no IVF-PQ training)"
 echo "This should complete in < 30 seconds..."
 
-# --exclusive: prevent step resource overlap
+# --exclusive: prevent step resource overlap (serial step, safe)
+# --gres=gpu:2: explicitly request GPUs for step
 # --kill-on-bad-exit=1: terminate job if bootstrap fails
 srun -N1 -n1 -w "$CONSUMER_NODE" \
     --cpus-per-task="$SLURM_CPUS_PER_TASK" \
     --cpu-bind=cores \
     --exclusive \
+    --gres=gpu:2 \
     --kill-on-bad-exit=1 \
     --export=ALL \
     "$CHRUN" \
@@ -389,12 +392,14 @@ sleep 10
 #   emb_segments/paper_seg_shardXX_*.npz, chunk_seg_shardXX_*.npz
 # Consumer's non-recursive glob finds all files directly in these directories.
 echo "Starting consumer on node: $CONSUMER_NODE"
-# --exclusive: prevent step resource overlap
+# --exclusive: prevent step resource overlap (serial step, safe)
+# --gres=gpu:2: explicitly request GPUs for step
 # --kill-on-bad-exit=1: terminate job if consumer fails
 srun -N1 -n1 -w "$CONSUMER_NODE" \
     --cpus-per-task="$SLURM_CPUS_PER_TASK" \
     --cpu-bind=cores \
     --exclusive \
+    --gres=gpu:2 \
     --kill-on-bad-exit=1 \
     --export=ALL \
     "$CHRUN" \
