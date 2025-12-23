@@ -125,90 +125,83 @@ echo "======================================"
 
 # Function to run producer in Charliecloud container
 # If USE_LOCAL_STAGING=1, writes to node-local SSD then rsyncs to NFS
+#
+# Key design principles:
+#   - Race-safe: no shared global exports; everything passed via srun --export=...
+#   - Quoting-safe: no word-splitting of "--bind ..." strings
+#   - Explicit: no dependence on "host vars magically existing" inside srun shell
+#
 run_producer() {
-    local node_id=$1
-    local target_node=$2
-    local num_shards=$((SLURM_NNODES - 1))
-    
-    echo "[Producer $node_id] Starting on $target_node with $PARSE_WORKERS parse workers"
-    echo "[Producer $node_id] Local staging: USE_LOCAL_STAGING=${USE_LOCAL_STAGING}"
-    
-    # Compute paths OUTSIDE srun to avoid shell escaping issues
-    local LOCAL_STAGE_HOST=""
-    local BIND_LOCAL_ARG=""
-    local LITKIT_WS_CONTAINER="/workspace"
-    local EMBED_OUTDIR_CONTAINER="/workspace/emb_segments"
-    local NFS_SQLITE_DEST="${LITKIT_WORKSPACE}/sqlite"
-    local NFS_SEGMENTS_DEST="${LITKIT_WORKSPACE}/emb_segments"
-    
-    if [[ "$USE_LOCAL_STAGING" == "1" ]]; then
-        LOCAL_STAGE_HOST="${LOCAL_SSD}/litkit_${SLURM_JOB_ID}_shard${node_id}"
-        BIND_LOCAL_ARG="--bind ${LOCAL_STAGE_HOST}:/local_stage"
-        LITKIT_WS_CONTAINER="/local_stage"
-        EMBED_OUTDIR_CONTAINER="/local_stage/emb_segments"
-        # Use shard-specific NFS destinations to avoid collisions
-        NFS_SQLITE_DEST="${LITKIT_WORKSPACE}/sqlite/shard_${node_id}"
-        NFS_SEGMENTS_DEST="${LITKIT_WORKSPACE}/emb_segments/shard_${node_id}"
+    local node_id="$1"
+    local target_node="$2"
+    local num_shards="$((SLURM_NNODES - 1))"
+
+    echo "[Producer ${node_id}] Starting on ${target_node} with ${PARSE_WORKERS} parse workers"
+    echo "[Producer ${node_id}] Local staging: USE_LOCAL_STAGING=${USE_LOCAL_STAGING}"
+
+    # Host-side sanity checks (fail early, deterministically)
+    if [[ ! -f "${LITKIT_WORKSPACE}/${MANIFEST_FILE}" ]]; then
+        echo "FATAL: Manifest not found on host: ${LITKIT_WORKSPACE}/${MANIFEST_FILE}" >&2
+        return 1
     fi
-    
-    # Export variables for srun to propagate
-    export PRODUCER_NODE_ID="$node_id"
-    export PRODUCER_NUM_SHARDS="$num_shards"
-    export PRODUCER_LOCAL_STAGE="$LOCAL_STAGE_HOST"
-    export PRODUCER_BIND_LOCAL="$BIND_LOCAL_ARG"
-    export PRODUCER_LITKIT_WS="$LITKIT_WS_CONTAINER"
-    export PRODUCER_EMBED_OUTDIR="$EMBED_OUTDIR_CONTAINER"
-    export PRODUCER_NFS_SQLITE_DEST="$NFS_SQLITE_DEST"
-    export PRODUCER_NFS_SEGMENTS_DEST="$NFS_SEGMENTS_DEST"
-    
-    # FIX: Request CPUs for srun step
-    srun -N1 -n1 -w "$target_node" \
-        --cpus-per-task="$SLURM_CPUS_PER_TASK" \
+
+    # Compute local staging path (host path on the compute node)
+    local local_stage_host=""
+    if [[ "${USE_LOCAL_STAGING}" == "1" ]]; then
+        local_stage_host="${LOCAL_SSD}/litkit_${SLURM_JOB_ID}_shard${node_id}"
+    fi
+
+    # Run on the target node. Everything needed is passed explicitly via --export.
+    srun -N1 -n1 -w "${target_node}" \
+        --cpus-per-task="${SLURM_CPUS_PER_TASK}" \
         --cpu-bind=cores \
-        --export=ALL \
-        bash -c '
+        --export=ALL,PRODUCER_NODE_ID="${node_id}",PRODUCER_NUM_SHARDS="${num_shards}",PRODUCER_LOCAL_STAGE_HOST="${local_stage_host}",PRODUCER_USE_LOCAL_STAGING="${USE_LOCAL_STAGING}",PRODUCER_MANIFEST_FILE="${MANIFEST_FILE}",PRODUCER_PARSE_WORKERS="${PARSE_WORKERS}",PRODUCER_JOB_ID="${SLURM_JOB_ID}",CHRUN="${CHRUN}",IMG="${IMG}",CDI_SPEC_DIR="${CDI_SPEC_DIR}",CUDA_LIBA="${CUDA_LIBA}",CUDA_LIBB="${CUDA_LIBB}",HF_HOST="${HF_HOST}",LITKIT_WORKSPACE="${LITKIT_WORKSPACE}",LITKIT_SQLITE_BUSY_TIMEOUT_MS="${LITKIT_SQLITE_BUSY_TIMEOUT_MS}",LITKIT_SAVE_EVERY_SEC="${LITKIT_SAVE_EVERY_SEC}",LITKIT_DEBUG="${LITKIT_DEBUG}" \
+        bash -lc '
             set -euo pipefail
-            
-            # Setup local staging if enabled
-            if [[ -n "$PRODUCER_LOCAL_STAGE" ]]; then
-                echo "[staging] Using local SSD: $PRODUCER_LOCAL_STAGE"
-                mkdir -p "$PRODUCER_LOCAL_STAGE/sqlite" "$PRODUCER_LOCAL_STAGE/emb_segments"
-                # Clean any stale writer guard from prior failed runs
-                rm -f "$PRODUCER_LOCAL_STAGE/.writer_guard" 2>/dev/null || true
+
+            # Decide container workspace and embed outdir
+            CONTAINER_NFS_WS="/workspace"
+            if [[ "${PRODUCER_USE_LOCAL_STAGING}" == "1" ]]; then
+                CONTAINER_WS="/local_stage"
+                EMBED_OUTDIR="${CONTAINER_WS}/emb_segments"
             else
-                echo "[staging] Using NFS directly (no local staging)"
+                CONTAINER_WS="${CONTAINER_NFS_WS}"
+                EMBED_OUTDIR="${CONTAINER_NFS_WS}/emb_segments"
             fi
-            
-            # Validate manifest exists before running
-            if [[ ! -f "${LITKIT_WORKSPACE}/${MANIFEST_FILE}" ]]; then
-                echo "FATAL: Manifest not found: ${LITKIT_WORKSPACE}/${MANIFEST_FILE}" >&2
-                exit 1
+
+            # Prep local staging (host FS) if enabled
+            if [[ "${PRODUCER_USE_LOCAL_STAGING}" == "1" ]]; then
+                echo "[Producer ${PRODUCER_NODE_ID}] [staging] Using node-local SSD: ${PRODUCER_LOCAL_STAGE_HOST}"
+                mkdir -p "${PRODUCER_LOCAL_STAGE_HOST}/sqlite" "${PRODUCER_LOCAL_STAGE_HOST}/emb_segments"
+                rm -f "${PRODUCER_LOCAL_STAGE_HOST}/.writer_guard" 2>/dev/null || true
+            else
+                echo "[Producer ${PRODUCER_NODE_ID}] [staging] Using NFS directly (no local staging)"
             fi
-            
-            # Build ch-run command array to handle optional --bind correctly
-            CHRUN_ARGS=(
-                "$CHRUN"
+
+            # Build ch-run argv as a real array (no fragile word-splitting)
+            chrun_argv=(
+                "${CHRUN}"
                 --unset-env="*"
                 --set-env=HOME=/root
-                --cdi-dirs="$CDI_SPEC_DIR"
+                --cdi-dirs="${CDI_SPEC_DIR}"
                 --cdi=nvidia.com/gpu=all
-                --bind "$CUDA_LIBA:$CUDA_LIBA"
-                --bind "$CUDA_LIBB:$CUDA_LIBB"
+                --bind "${CUDA_LIBA}:${CUDA_LIBA}"
+                --bind "${CUDA_LIBB}:${CUDA_LIBB}"
                 --bind /path/to/PMC-OA:/path/to/PMC-OA
-                --bind "${LITKIT_WORKSPACE}:/workspace"
-                --bind "$HF_HOST:/app/hf_cache"
+                --bind "${LITKIT_WORKSPACE}:${CONTAINER_NFS_WS}"
+                --bind "${HF_HOST}:/app/hf_cache"
             )
-            
-            # Add local staging bind ONLY if staging is enabled
-            if [[ -n "$PRODUCER_BIND_LOCAL" ]]; then
-                # shellcheck disable=SC2206
-                CHRUN_ARGS+=($PRODUCER_BIND_LOCAL)
+
+            # Optional bind for local staging (host path -> /local_stage in container)
+            if [[ "${PRODUCER_USE_LOCAL_STAGING}" == "1" ]]; then
+                chrun_argv+=( --bind "${PRODUCER_LOCAL_STAGE_HOST}:/local_stage" )
             fi
-            
-            CHRUN_ARGS+=(
-                --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB"
+
+            # Environment + container entrypoint
+            chrun_argv+=(
+                --set-env="LD_LIBRARY_PATH=${CUDA_LIBA}:${CUDA_LIBB}"
                 --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-                --set-env="LITKIT_WORKSPACE=$PRODUCER_LITKIT_WS"
+                --set-env="LITKIT_WORKSPACE=${CONTAINER_WS}"
                 --set-env="HF_HOME=/app/hf_cache"
                 --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1"
                 --set-env="LITKIT_SQLITE_BUSY_TIMEOUT_MS=${LITKIT_SQLITE_BUSY_TIMEOUT_MS}"
@@ -218,51 +211,60 @@ run_producer() {
                 --set-env="MKL_NUM_THREADS=1"
                 --set-env="OPENBLAS_NUM_THREADS=1"
                 --set-env="TOKENIZERS_PARALLELISM=false"
-                "$IMG"
+                "${IMG}"
                 --
-                bash -c "
-                    echo \"[diag:producer] Cpus_allowed=\$(grep Cpus_allowed_list /proc/self/status | cut -f2)\"
-                    python3 -c \"import os; aff=os.sched_getaffinity(0); print(\\\"[diag:producer] affinity_cpus=\\\", len(aff))\"
-                    echo \"[diag:producer] GPUs: \$(nvidia-smi -L 2>/dev/null | head -2 || echo nvidia-smi-not-found)\"
-                    echo \"[diag:producer] LITKIT_WORKSPACE=\$LITKIT_WORKSPACE\"
-                    
-                    # Validate manifest inside container
-                    if [[ ! -f \"/workspace/${MANIFEST_FILE}\" ]]; then
-                        echo \"FATAL: Manifest not found inside container: /workspace/${MANIFEST_FILE}\" >&2
-                        exit 1
-                    fi
-                    
-                    exec litkit \\
-                        --embed-producer \\
-                        --build-only \\
-                        --shard-id ${PRODUCER_NODE_ID} \\
-                        --num-shards ${PRODUCER_NUM_SHARDS} \\
-                        --embed-outdir \"${PRODUCER_EMBED_OUTDIR}\" \\
-                        --paper-embed-bs 16 \\
-                        --chunk-embed-bs 64 \\
-                        --embed-devices \"cuda:0,cuda:1\" \\
-                        --embed-workers 2 \\
-                        --parse-workers ${PARSE_WORKERS} \\
-                        --tar-manifest \"/workspace/${MANIFEST_FILE}\"
-                "
+                bash -lc
             )
-            
-            # Execute ch-run
-            "${CHRUN_ARGS[@]}"
-            
-            # Rsync local results back to NFS (if staging was used)
-            if [[ -n "$PRODUCER_LOCAL_STAGE" ]]; then
-                echo "[staging] Syncing local outputs to NFS (shard-specific destinations)..."
-                mkdir -p "$PRODUCER_NFS_SQLITE_DEST" "$PRODUCER_NFS_SEGMENTS_DEST"
-                rsync -a --delay-updates "$PRODUCER_LOCAL_STAGE/sqlite/" "$PRODUCER_NFS_SQLITE_DEST/"
-                rsync -a --delay-updates "$PRODUCER_LOCAL_STAGE/emb_segments/" "$PRODUCER_NFS_SEGMENTS_DEST/"
-                echo "[staging] Cleaning up local staging dir..."
-                rm -rf "$PRODUCER_LOCAL_STAGE"
-                echo "[staging] Rsync complete for shard ${PRODUCER_NODE_ID}"
+
+            # Build litkit command (heredoc avoids nested quoting issues)
+            litkit_cmd=$(cat <<EOF
+echo "[diag:producer] host=\$(hostname)"
+echo "[diag:producer] Cpus_allowed=\$(grep Cpus_allowed_list /proc/self/status | cut -f2)"
+python3 -c "import os; aff=os.sched_getaffinity(0); print(\"[diag:producer] affinity_cpus=\", len(aff))"
+echo "[diag:producer] GPUs:"; (nvidia-smi -L 2>/dev/null | head -10) || true
+echo "[diag:producer] LITKIT_WORKSPACE=\$LITKIT_WORKSPACE"
+test -f "${CONTAINER_NFS_WS}/${PRODUCER_MANIFEST_FILE}" || { echo "FATAL: manifest missing in container: ${CONTAINER_NFS_WS}/${PRODUCER_MANIFEST_FILE}" >&2; exit 2; }
+
+exec litkit \
+  --embed-producer \
+  --build-only \
+  --shard-id "${PRODUCER_NODE_ID}" \
+  --num-shards "${PRODUCER_NUM_SHARDS}" \
+  --embed-outdir "${EMBED_OUTDIR}" \
+  --paper-embed-bs 16 \
+  --chunk-embed-bs 64 \
+  --embed-devices "cuda:0,cuda:1" \
+  --embed-workers 2 \
+  --parse-workers "${PRODUCER_PARSE_WORKERS}" \
+  --tar-manifest "${CONTAINER_NFS_WS}/${PRODUCER_MANIFEST_FILE}"
+EOF
+)
+
+            set +e
+            "${chrun_argv[@]}" "${litkit_cmd}"
+            rc=$?
+            set -e
+            echo "[Producer ${PRODUCER_NODE_ID}] litkit exit code: ${rc}"
+
+            # Sync local results back to NFS only if litkit succeeded
+            # Rsync to FLAT emb_segments dir (segment filenames are shard-unique)
+            if [[ "${PRODUCER_USE_LOCAL_STAGING}" == "1" ]]; then
+                if [[ "${rc}" -eq 0 ]]; then
+                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] Syncing local outputs -> NFS (atomic-ish via --delay-updates)"
+                    mkdir -p "${LITKIT_WORKSPACE}/sqlite" "${LITKIT_WORKSPACE}/emb_segments"
+                    rsync -a --delay-updates "${PRODUCER_LOCAL_STAGE_HOST}/sqlite/" "${LITKIT_WORKSPACE}/sqlite/"
+                    rsync -a --delay-updates "${PRODUCER_LOCAL_STAGE_HOST}/emb_segments/" "${LITKIT_WORKSPACE}/emb_segments/"
+                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] Cleanup local staging dir"
+                    rm -rf "${PRODUCER_LOCAL_STAGE_HOST}"
+                else
+                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] Not rsyncing (litkit failed). Preserving: ${PRODUCER_LOCAL_STAGE_HOST}" >&2
+                fi
             fi
+
+            exit "${rc}"
         '
-    
-    echo "[Producer $node_id] Completed"
+
+    echo "[Producer ${node_id}] Completed on ${target_node}"
 }
 
 
