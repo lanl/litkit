@@ -49,7 +49,12 @@ fi
 
 # HPC-specific paths
 export LITKIT_REPO="/path/to/litkit"
-export LITKIT_WORKSPACE="${LITKIT_REPO}/workspace"
+export LITKIT_WORKSPACE="${LITKIT_REPO}/workspace"  # Shared NFS workspace (consumer reads from here)
+
+# LOCAL STAGING: Use node-local SSD to avoid NFS metadata storm
+# Evidence: 47× faster for small-file creates (see BOTTLENECK.md)
+export LOCAL_SSD="/local/scratch"
+export USE_LOCAL_STAGING="${USE_LOCAL_STAGING:-1}"  # Set to 0 to disable
 
 # MANIFEST selection (edit this ONE LINE to change which manifest is used):
 #   tiny_test.manifest    (~few MB, 5-10 min) - for debugging merge logic
@@ -119,55 +124,96 @@ echo "Chunks index: flat (no IVF-PQ training)"
 echo "======================================"
 
 # Function to run producer in Charliecloud container
+# If USE_LOCAL_STAGING=1, writes to node-local SSD then rsyncs to NFS
 run_producer() {
     local node_id=$1
     local target_node=$2
     echo "[Producer $node_id] Starting on $target_node with $PARSE_WORKERS parse workers"
+    echo "[Producer $node_id] Local staging: USE_LOCAL_STAGING=${USE_LOCAL_STAGING}"
     
     # FIX: Request CPUs for srun step (without this, step may get only 1 CPU!)
     srun -N1 -n1 -w "$target_node" \
         --cpus-per-task="$SLURM_CPUS_PER_TASK" \
         --cpu-bind=cores \
         --export=ALL \
-        "$CHRUN" \
-        --unset-env='*' \
-        --set-env=HOME=/root \
-        --cdi-dirs="$CDI_SPEC_DIR" \
-        --cdi=nvidia.com/gpu=all \
-        --bind "$CUDA_LIBA:$CUDA_LIBA" \
-        --bind "$CUDA_LIBB:$CUDA_LIBB" \
-        --bind /path/to/PMC-OA:/path/to/PMC-OA \
-        --bind "${LITKIT_WORKSPACE}:/workspace" \
-        --bind "$HF_HOST:/app/hf_cache" \
-        --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
-        --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-        --set-env="LITKIT_WORKSPACE=/workspace" \
-        --set-env="HF_HOME=/app/hf_cache" \
-        --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
-        --set-env="LITKIT_SQLITE_BUSY_TIMEOUT_MS=${LITKIT_SQLITE_BUSY_TIMEOUT_MS}" \
-        --set-env="LITKIT_SAVE_EVERY_SEC=${LITKIT_SAVE_EVERY_SEC}" \
-        --set-env="LITKIT_DEBUG=${LITKIT_DEBUG}" \
-        --set-env="OMP_NUM_THREADS=1" \
-        --set-env="MKL_NUM_THREADS=1" \
-        --set-env="OPENBLAS_NUM_THREADS=1" \
-        --set-env="TOKENIZERS_PARALLELISM=false" \
-        "$IMG" -- \
         bash -c '
-            echo "[diag:producer] Cpus_allowed=$(grep Cpus_allowed_list /proc/self/status | cut -f2)"
-            python3 -c "import os; aff=os.sched_getaffinity(0); print(\"[diag:producer] affinity_cpus=\", len(aff))"
-            echo "[diag:producer] GPUs: $(nvidia-smi -L 2>/dev/null | head -2 || echo nvidia-smi-not-found)"
-            exec litkit \
-                --embed-producer \
-                --build-only \
-                --shard-id '"$node_id"' \
-                --num-shards '"$((SLURM_NNODES - 1))"' \
-                --embed-outdir "/workspace/emb_segments" \
-                --paper-embed-bs 16 \
-                --chunk-embed-bs 64 \
-                --embed-devices "cuda:0,cuda:1" \
-                --embed-workers 2 \
-                --parse-workers '"$PARSE_WORKERS"' \
-                --tar-manifest "/workspace/'"${MANIFEST_FILE}"'"
+            set -euo pipefail
+            node_id='"$node_id"'
+            num_shards='"$((SLURM_NNODES - 1))"'
+            
+            # Paths inside container
+            CONTAINER_WS="/workspace"           # NFS (shared, for manifest and consumer)
+            CONTAINER_LOCAL="/local_stage"      # Local SSD (producer output)
+            
+            # Determine staging strategy
+            if [[ "'"$USE_LOCAL_STAGING"'" == "1" ]]; then
+                LOCAL_STAGE_HOST="'"$LOCAL_SSD"'/litkit_'"$SLURM_JOB_ID"'_shard${node_id}"
+                echo "[staging] Using local SSD: $LOCAL_STAGE_HOST"
+                mkdir -p "$LOCAL_STAGE_HOST/sqlite" "$LOCAL_STAGE_HOST/emb_segments"
+                BIND_LOCAL="--bind $LOCAL_STAGE_HOST:$CONTAINER_LOCAL"
+                EMBED_OUTDIR="$CONTAINER_LOCAL/emb_segments"
+                LITKIT_WS="$CONTAINER_LOCAL"
+            else
+                echo "[staging] Using NFS directly (no local staging)"
+                BIND_LOCAL=""
+                EMBED_OUTDIR="$CONTAINER_WS/emb_segments"
+                LITKIT_WS="$CONTAINER_WS"
+                LOCAL_STAGE_HOST=""
+            fi
+            
+            # Run litkit in container
+            '"$CHRUN"' \
+                --unset-env="*" \
+                --set-env=HOME=/root \
+                --cdi-dirs="'"$CDI_SPEC_DIR"'" \
+                --cdi=nvidia.com/gpu=all \
+                --bind "'"$CUDA_LIBA"':'"$CUDA_LIBA"'" \
+                --bind "'"$CUDA_LIBB"':'"$CUDA_LIBB"'" \
+                --bind /path/to/PMC-OA:/path/to/PMC-OA \
+                --bind "'"${LITKIT_WORKSPACE}"':$CONTAINER_WS" \
+                $BIND_LOCAL \
+                --bind "'"$HF_HOST"':/app/hf_cache" \
+                --set-env="LD_LIBRARY_PATH='"$CUDA_LIBA"':'"$CUDA_LIBB"'" \
+                --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+                --set-env="LITKIT_WORKSPACE=$LITKIT_WS" \
+                --set-env="HF_HOME=/app/hf_cache" \
+                --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
+                --set-env="LITKIT_SQLITE_BUSY_TIMEOUT_MS='"${LITKIT_SQLITE_BUSY_TIMEOUT_MS}"'" \
+                --set-env="LITKIT_SAVE_EVERY_SEC='"${LITKIT_SAVE_EVERY_SEC}"'" \
+                --set-env="LITKIT_DEBUG='"${LITKIT_DEBUG}"'" \
+                --set-env="OMP_NUM_THREADS=1" \
+                --set-env="MKL_NUM_THREADS=1" \
+                --set-env="OPENBLAS_NUM_THREADS=1" \
+                --set-env="TOKENIZERS_PARALLELISM=false" \
+                "'"$IMG"'" -- \
+                bash -c '\''
+                    echo "[diag:producer] Cpus_allowed=$(grep Cpus_allowed_list /proc/self/status | cut -f2)"
+                    python3 -c "import os; aff=os.sched_getaffinity(0); print(\"[diag:producer] affinity_cpus=\", len(aff))"
+                    echo "[diag:producer] GPUs: $(nvidia-smi -L 2>/dev/null | head -2 || echo nvidia-smi-not-found)"
+                    echo "[diag:producer] LITKIT_WORKSPACE=$LITKIT_WORKSPACE"
+                    exec litkit \
+                        --embed-producer \
+                        --build-only \
+                        --shard-id '"'"'$node_id'"'"' \
+                        --num-shards '"'"'$num_shards'"'"' \
+                        --embed-outdir '"'"'$EMBED_OUTDIR'"'"' \
+                        --paper-embed-bs 16 \
+                        --chunk-embed-bs 64 \
+                        --embed-devices "cuda:0,cuda:1" \
+                        --embed-workers 2 \
+                        --parse-workers '"$PARSE_WORKERS"' \
+                        --tar-manifest "$CONTAINER_WS/'"${MANIFEST_FILE}"'"
+                '\''
+            
+            # Rsync local results back to NFS (if staging was used)
+            if [[ -n "$LOCAL_STAGE_HOST" ]]; then
+                echo "[staging] Syncing local outputs to NFS..."
+                rsync -a --inplace "$LOCAL_STAGE_HOST/sqlite/" "'"${LITKIT_WORKSPACE}"'/sqlite/"
+                rsync -a --inplace "$LOCAL_STAGE_HOST/emb_segments/" "'"${LITKIT_WORKSPACE}"'/emb_segments/"
+                echo "[staging] Cleaning up local staging dir..."
+                rm -rf "$LOCAL_STAGE_HOST"
+                echo "[staging] Rsync complete for shard ${node_id}"
+            fi
         '
     
     echo "[Producer $node_id] Completed"
