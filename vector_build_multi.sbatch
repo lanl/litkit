@@ -425,8 +425,9 @@ echo "[main] Watchdog started with PID $WATCHDOG_PID (polls every 15s)"
 # Consumer's non-recursive glob finds all files directly in these directories.
 echo "Starting consumer on node: $CONSUMER_NODE"
 # --exclusive: prevent step resource overlap (serial step, safe)
-# --kill-on-bad-exit=1: terminate job if consumer fails
 # NOTE: GPUs inherited from job-level allocation (no step-level --gres to avoid conflicts)
+# NOTE: Wrapped with set +e to ensure cleanup runs even on consumer failure
+set +e
 srun -N1 -n1 -w "$CONSUMER_NODE" \
     --cpus-per-task="$SLURM_CPUS_PER_TASK" \
     --cpu-bind=cores \
@@ -470,11 +471,24 @@ srun -N1 -n1 -w "$CONSUMER_NODE" \
             --chunks-index flat \
             --num-shards '"$((SLURM_NNODES - 1))"'
     '
+CONSUMER_RC=$?
+set -e
 
 # Stop watchdog (consumer finished, no longer needed)
 kill "$WATCHDOG_PID" 2>/dev/null || true
 wait "$WATCHDOG_PID" 2>/dev/null || true
 echo "[main] Watchdog stopped"
+
+# Handle consumer failure (after cleanup, before producer waits)
+if (( CONSUMER_RC != 0 )); then
+    echo "[main] FATAL: Consumer failed with exit code $CONSUMER_RC" >&2
+    # Kill any remaining producers to avoid burning GPU hours
+    for pid in "${PRODUCER_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    scancel "${SLURM_JOB_ID}" 2>/dev/null || true
+    exit "$CONSUMER_RC"
+fi
 
 # Wait for all background jobs (producers) and check return codes
 echo "Waiting for all producers to complete..."
