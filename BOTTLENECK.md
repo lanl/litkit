@@ -23,6 +23,7 @@
 - `0eb8dba` - Output staging to local SSD (flat rsync to NFS)
 - `935ef57` - Fix: Skip FAISS index loading for `--embed-producer` mode
 - `878001c` - Baseline config: `USE_LOCAL_STAGING=0`, no step-level `--gres`
+- `b77fe27` - Producer PID tracking and failure handling
 
 ---
 
@@ -357,23 +358,38 @@ With 4 GPUs/node and ~4× faster embedding, I/O becomes limiting factor sooner.
 | Consumer competing for GPUs | ⚠️ Minor | Consumer on dedicated node; job-level allocation is per-node |
 | `mountpoint -q` not portable | ✅ Acknowledged | HPC-specific, acceptable for now |
 
-### Background PID Tracking (Deferred)
+### Background PID Tracking (IMPLEMENTED - b77fe27)
 
-Current pattern:
+Previous pattern (problematic):
 ```bash
 for i in ...; do run_producer $i &; done
-wait  # waits for ALL, but runs AFTER consumer finishes
+wait  # waits for ALL, but runs AFTER consumer finishes (too late!)
 ```
 
-Better pattern (not yet implemented):
+**New pattern (implemented):**
 ```bash
-pids=()
-for i in ...; do run_producer $i & pids+=($!); done
-# Check each producer before starting consumer
-for pid in "${pids[@]}"; do wait $pid || exit 1; done
+# Capture PIDs at launch
+PRODUCER_PIDS=()
+for ((i=0; i<NUM_PRODUCERS; i++)); do
+    run_producer $i "${NODELIST[$i]}" &
+    PRODUCER_PIDS+=($!)
+done
+
+# After consumer completes, check each producer
+FAILED_PRODUCERS=()
+for ((i=0; i<NUM_PRODUCERS; i++)); do
+    if ! wait ${PRODUCER_PIDS[$i]}; then
+        FAILED_PRODUCERS+=($i)
+    fi
+done
+
+if [[ ${#FAILED_PRODUCERS[@]} -gt 0 ]]; then
+    echo "FATAL: ${#FAILED_PRODUCERS[@]} producer(s) failed"
+    exit 1
+fi
 ```
 
-This adds complexity and is deferred until baseline is validated.
+**Why this matters:** If a producer fails early, the script now reports which producer failed and exits with error code 1, preventing wasted GPU hours.
 
 ---
 
