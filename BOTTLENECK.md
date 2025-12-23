@@ -24,6 +24,7 @@
 - `935ef57` - Fix: Skip FAISS index loading for `--embed-producer` mode
 - `878001c` - Baseline config: `USE_LOCAL_STAGING=0`, no step-level `--gres`
 - `b77fe27` - Producer PID tracking and failure handling
+- `33360ba` - Watchdog to scancel job on early producer failure
 
 ---
 
@@ -390,6 +391,39 @@ fi
 ```
 
 **Why this matters:** If a producer fails early, the script now reports which producer failed and exits with error code 1, preventing wasted GPU hours.
+
+### Producer Watchdog (IMPLEMENTED - 33360ba)
+
+The PID tracking above only detects failures AFTER the consumer finishes. A producer failing at minute 5 could still let the consumer run for hours. The watchdog fixes this:
+
+```bash
+watch_producers() {
+    while true; do
+        for ((i=0; i<NUM_PRODUCERS; i++)); do
+            pid="${PRODUCER_PIDS[$i]}"
+            if ! kill -0 "$pid" 2>/dev/null; then
+                if ! wait "$pid" 2>/dev/null; then
+                    echo "[watchdog] FATAL: Producer $i failed; cancelling job" >&2
+                    scancel "${SLURM_JOB_ID}"
+                    return 1
+                fi
+            fi
+        done
+        sleep 15
+    done
+}
+
+watch_producers &
+WATCHDOG_PID=$!
+
+# ... run consumer ...
+
+# After consumer:
+kill "$WATCHDOG_PID" 2>/dev/null || true
+wait "$WATCHDOG_PID" 2>/dev/null || true
+```
+
+**Behavior:** Polls every 15s. If any producer dies with nonzero exit, calls `scancel` to terminate the entire job immediately.
 
 ---
 
