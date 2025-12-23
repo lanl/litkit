@@ -1269,33 +1269,46 @@ def build_or_update_indices(args):
             conn.isolation_level = old_isolation  # restore
         _eprint("[rebuild] done")
 
-    # PAPER index (load existing or create new)
-    paper_index = build_load_or_create_paper_index(
-        paper_index_path=PAPER_INDEX_PATH,
-        faiss_lock_path=FAISS_LOCK,
-        db_lock_path=DB_LOCK,
-        FileLock=FileLock,
-        paper_dim=paper_dim,
-        papers_index=args.papers_index,
-        hnsw_m=args.hnsw_m,
-        efconstruction=args.efconstruction,
-        efsearch=args.efsearch,
-        is_faiss_writer=args.faiss_writer,
-    )
+    # ═══════════════════════════════════════════════════════════════════════════
+    # FAISS INDEX LOADING: Skip for producers (they write segments, not FAISS)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Producers have LITKIT_WORKSPACE set to local SSD (/local_stage), so
+    # PAPER_INDEX_PATH and CHUNK_INDEX_PATH point to /local_stage/indices/*.
+    # But bootstrap created indices on NFS at /workspace/indices/.
+    # Producers don't need indices at all - they only write embedding segments.
+    # ═══════════════════════════════════════════════════════════════════════════
+    if args.embed_producer:
+        paper_index = None
+        chunk_index = None
+        needs_training = False
+    else:
+        # PAPER index (load existing or create new)
+        paper_index = build_load_or_create_paper_index(
+            paper_index_path=PAPER_INDEX_PATH,
+            faiss_lock_path=FAISS_LOCK,
+            db_lock_path=DB_LOCK,
+            FileLock=FileLock,
+            paper_dim=paper_dim,
+            papers_index=args.papers_index,
+            hnsw_m=args.hnsw_m,
+            efconstruction=args.efconstruction,
+            efsearch=args.efsearch,
+            is_faiss_writer=args.faiss_writer,
+        )
 
-    # CHUNK index - load existing or create new
-    chunk_index, needs_training = build_load_or_create_chunk_index(
-        chunk_index_path=CHUNK_INDEX_PATH,
-        chunk_trained_flag=CHUNK_TRAINED_FLAG,
-        faiss_lock_path=FAISS_LOCK,
-        db_lock_path=DB_LOCK,
-        FileLock=FileLock,
-        chunk_dim=chunk_dim,
-        chunks_index=args.chunks_index,
-        ivf_nlist=args.ivf_nlist,
-        pq_m=args.pq_m,
-        is_faiss_writer=args.faiss_writer,
-    )
+        # CHUNK index - load existing or create new
+        chunk_index, needs_training = build_load_or_create_chunk_index(
+            chunk_index_path=CHUNK_INDEX_PATH,
+            chunk_trained_flag=CHUNK_TRAINED_FLAG,
+            faiss_lock_path=FAISS_LOCK,
+            db_lock_path=DB_LOCK,
+            FileLock=FileLock,
+            chunk_dim=chunk_dim,
+            chunks_index=args.chunks_index,
+            ivf_nlist=args.ivf_nlist,
+            pq_m=args.pq_m,
+            is_faiss_writer=args.faiss_writer,
+        )
 
     # If IVF-PQ needs training, run training pass (one-time)
     if needs_training:
