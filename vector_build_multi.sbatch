@@ -388,6 +388,36 @@ done
 # Wait a bit for producers to start
 sleep 10
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# WATCHDOG: Kill job if any producer dies early (prevents wasted GPU hours)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Without this, a producer failure at minute 5 would let the consumer run for
+# hours waiting for segments that will never arrive. The watchdog polls every
+# 15 seconds and calls scancel if any producer exits with nonzero.
+watch_producers() {
+    while true; do
+        for ((i=0; i<NUM_PRODUCERS; i++)); do
+            pid="${PRODUCER_PIDS[$i]}"
+            if ! kill -0 "$pid" 2>/dev/null; then
+                # Producer exited; collect status
+                if wait "$pid" 2>/dev/null; then
+                    : # Producer exited successfully, continue watching others
+                else
+                    rc=$?
+                    echo "[watchdog] FATAL: Producer $i (PID $pid) failed with exit code $rc; cancelling job ${SLURM_JOB_ID}" >&2
+                    scancel "${SLURM_JOB_ID}" 2>/dev/null || true
+                    return 1
+                fi
+            fi
+        done
+        sleep 15
+    done
+}
+
+watch_producers &
+WATCHDOG_PID=$!
+echo "[main] Watchdog started with PID $WATCHDOG_PID (polls every 15s)"
+
 # Run consumer on the last node (already set above in bootstrap)
 # NOTE: Producers rsync to FLAT directories (filenames are shard-unique):
 #   sqlite/litkit_shard_XX.sqlite3
@@ -440,6 +470,11 @@ srun -N1 -n1 -w "$CONSUMER_NODE" \
             --chunks-index flat \
             --num-shards '"$((SLURM_NNODES - 1))"'
     '
+
+# Stop watchdog (consumer finished, no longer needed)
+kill "$WATCHDOG_PID" 2>/dev/null || true
+wait "$WATCHDOG_PID" 2>/dev/null || true
+echo "[main] Watchdog stopped"
 
 # Wait for all background jobs (producers) and check return codes
 echo "Waiting for all producers to complete..."
