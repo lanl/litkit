@@ -139,6 +139,9 @@ class Progress:
         self.emit_final_line = bool(emit_final_line)
         self.force_append = bool(force_append)
         self._last_len = 0
+        # For instantaneous rate calculation
+        self._last_count_for_rate = int(start)
+        self._last_ts_for_rate = time.time()
 
     def _write_line(self, s: str) -> None:
         if self.force_append:
@@ -150,14 +153,31 @@ class Progress:
             _progress_write(s, self.stream)
 
     def _fmt(self) -> str:
-        elapsed = max(1e-3, time.time() - self.start_ts)
-        rate = self.done / elapsed
+        now = time.time()
+        elapsed = max(1e-3, now - self.start_ts)
+        avg_rate = self.done / elapsed
+        
+        # Compute instantaneous rate from delta since last display
+        delta_time = now - self._last_ts_for_rate
+        delta_count = self.done - self._last_count_for_rate
+        if delta_time > 0.1 and delta_count >= 0:
+            inst_rate = delta_count / delta_time
+        else:
+            inst_rate = avg_rate  # Fall back to avg if no meaningful delta
+        
+        # Update tracking for next instantaneous calculation
+        self._last_count_for_rate = self.done
+        self._last_ts_for_rate = now
+        
         if self.total is None:
-            return f"[progress] {self.label}: {self.done}  ({rate:.1f}/s)"
+            return (
+                f"[progress] {self.label}: {self.done}  "
+                f"(now {inst_rate:.1f}/s, avg {avg_rate:.1f}/s)"
+            )
         pct = 100.0 * self.done / max(1, self.total)
         return (
             f"[progress] {self.label}: {self.done}/{self.total}"
-            f"  ({pct:.1f}%)  {rate:.1f}/s"
+            f"  ({pct:.1f}%)  {inst_rate:.1f}/s now, {avg_rate:.1f}/s avg"
         )
 
     def tick(self, inc: int = 1, force: bool = False) -> None:
