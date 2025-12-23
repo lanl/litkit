@@ -376,9 +376,13 @@ sleep 5
 NUM_PRODUCERS=$((SLURM_NNODES - 1))
 echo "Starting $NUM_PRODUCERS producers on nodes: ${NODELIST[@]:0:$NUM_PRODUCERS}"
 
+# Capture producer PIDs for failure tracking
+PRODUCER_PIDS=()
 for ((i=0; i<NUM_PRODUCERS; i++))
 do
     run_producer $i "${NODELIST[$i]}" &
+    PRODUCER_PIDS+=($!)
+    echo "[main] Producer $i started with PID ${PRODUCER_PIDS[$i]}"
 done
 
 # Wait a bit for producers to start
@@ -437,9 +441,26 @@ srun -N1 -n1 -w "$CONSUMER_NODE" \
             --num-shards '"$((SLURM_NNODES - 1))"'
     '
 
-# Wait for all background jobs to finish
-echo "Waiting for all jobs to complete..."
-wait
+# Wait for all background jobs (producers) and check return codes
+echo "Waiting for all producers to complete..."
+FAILED_PRODUCERS=()
+for ((i=0; i<NUM_PRODUCERS; i++))
+do
+    pid=${PRODUCER_PIDS[$i]}
+    if wait $pid; then
+        echo "[main] Producer $i (PID $pid) completed successfully"
+    else
+        rc=$?
+        echo "[main] ERROR: Producer $i (PID $pid) failed with exit code $rc" >&2
+        FAILED_PRODUCERS+=($i)
+    fi
+done
+
+if [[ ${#FAILED_PRODUCERS[@]} -gt 0 ]]; then
+    echo "[main] FATAL: ${#FAILED_PRODUCERS[@]} producer(s) failed: ${FAILED_PRODUCERS[*]}" >&2
+    echo "[main] Check individual producer logs for details." >&2
+    exit 1
+fi
 
 echo "=== Multi-Node Litkit Build Complete ==="
 echo "Check workspace: $LITKIT_WORKSPACE"
