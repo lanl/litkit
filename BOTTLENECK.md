@@ -1,172 +1,261 @@
-# Litkit Multi-Node Build Performance Bottleneck Analysis
+# Litkit Multi-Node Build Performance Optimization
 
-**Date:** 2025-12-23  
-**Issue:** Tar scan rate collapsed from ~29/s to ~0.5/s during multi-node build  
-**Cluster:** HPC (gpu-v100 partition, V100 nodes)
+**Date:** 2025-12-23 (Updated)  
+**Cluster:** HPC (gpu-v100 partition, V100 nodes for testing)  
+**Production Target:** H100 nodes with 4 GPUs each  
 
-## Symptoms
+---
 
-During `medium_test.manifest` processing (4 tar files, ~7GB total):
+## Current Status
 
-1. **Initial scan rate:** ~29 files/second (healthy)
-2. **After ~655 files:** Rate collapsed to ~4/s, then ~2.5/s, eventually ~0.5/s
-3. **Both producers slowed simultaneously** despite being on different nodes
-4. **Job timed out** at 10 hours with only 28% of the large tar processed
-5. **Producer 1 finished** (smaller shard) while Producer 0 was stuck
+| Phase | Status | Notes |
+|-------|--------|-------|
+| Phase 1: CPU Allocation | ✅ COMPLETE | `affinity_cpus=32` confirmed inside container |
+| Phase 1: GPU Access | ✅ COMPLETE | 2× V100 per producer confirmed via nvidia-smi |
+| Phase 2: Instrumentation | 🔲 NEXT | Per-cycle timers needed before further optimization |
+| Phase 3: Output Staging | 🔲 TODO | Stage SQLite + segments to node-local storage |
+| Phase 4: Per-Tar Streaming | 🔲 TODO | Stage one tar at a time to local, process, delete |
+| Phase 5: Scale to Production | 🔲 TODO | 16+ producers on H100 nodes |
 
-## Log Evidence
+**Current Test Job:** 16822214 (medium_test.manifest, 3 nodes, 2 producers)
+
+---
+
+## Confirmed Findings
+
+### CPU Allocation Works ✓
 
 ```
-# Healthy start:
-[progress] [scan] oa_noncomm_xml.PMC012xxxxxx.baseline.2025-06-26.tar: 147/62348  (0.2%)  29.2/s
-
-# Embedding starts, scan pauses:
-[progress] Embedding chunks (producer, 20031): 0/20031
-[consumer] Progress: 0/2 producers complete  ← 143 seconds of embedding...
-[consumer] Progress: 0/2 producers complete
-[consumer] Progress: 0/2 producers complete
-[consumer] Progress: 0/2 producers complete
-[done] Embedding chunks (producer, 20031): completed in 143s
-
-# Scan resumes at much lower rate:
-[progress] [scan] oa_noncomm_xml.PMC012xxxxxx.baseline.2025-06-26.tar: 700/11229  (6.2%)  4.0/s
+[diag:producer] Cpus_allowed=0-15,32-47
+[diag:producer] affinity_cpus= 32
+[diag:producer] GPUs: GPU 0: Tesla V100-PCIE-32GB
+                      GPU 1: Tesla V100-PCIE-32GB
 ```
 
-The displayed rate (4.0/s, 0.5/s) is **cumulative average** over total elapsed time, not instantaneous. But instantaneous rate also degraded: near the end, ~4 files per 30-second consumer poll = 0.13 files/s.
+The `--cpus-per-task` fix propagates correctly. All roles see 32 CPUs.
 
-## Root Causes (Priority Order)
+### Initial Scan Rate is Healthy ✓
 
-### 1. CPU Starvation (CRITICAL)
+- ~25-30 files/second at start
+- 16 parallel XML parse workers active
 
-**Problem:** The `srun` commands do NOT request CPUs for each step.
+### Architecture: Scan-Embed-Scan (By Design)
 
-```bash
-# Current (broken):
-srun -N1 -n1 -w "$target_node" "$CHRUN" ...
+The pipeline does NOT overlap scanning with embedding:
+1. Scan XML files, buffer chunks
+2. When buffer hits ~20K chunks: **STOP scanning**
+3. Embed batch on GPU (~140-155s on V100)
+4. Write segment file to NFS
+5. Commit SQLite
+6. **RESUME scanning**
 
-# The job requests --cpus-per-task=32, but srun steps don't inherit this!
-```
+This explains why cumulative rate drops after embedding phases. The instantaneous rate during active scanning remains healthy.
 
-On many Slurm configurations, this means each producer effectively gets **1 CPU**. With `--parse-workers 16`, you have 16 threads fighting over 1 core = instant contention + overhead collapse.
+---
 
-**Fix:**
-```bash
-srun -N1 -n1 -w "$target_node" \
-    --cpus-per-task="$SLURM_CPUS_PER_TASK" \
-    --cpu-bind=cores \
-    --export=ALL \
-    "$CHRUN" ...
-```
+## What We Don't Know Yet (Need Instrumentation)
 
-**Verification:** Inside container, check:
-```bash
-echo "nproc=$(nproc)"
-grep Cpus_allowed_list /proc/self/status
-```
-
-### 2. Hidden Threading Oversubscription (HIGH)
-
-Libraries like OpenMP, MKL, OpenBLAS spawn threads behind the scenes. With 16 parse workers already, these cause severe oversubscription.
-
-**Fix:** Set before ch-run:
-```bash
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export VECLIB_MAXIMUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
-export TOKENIZERS_PARALLELISM=false
-```
-
-Pass to container via `--set-env=OMP_NUM_THREADS=1` etc.
-
-### 3. NFS Bottleneck (MEDIUM)
-
-**Problem:** All I/O goes through NFS-mounted VAST storage:
-- Tar file reads (sequential but large: 5.8GB)
-- SQLite writes (frequent, small, IOPS-sensitive)
-- Embedding segment writes (.npz.pending files)
-
-NFS latency + lots of per-record writes + tar member reads is a punishing mix.
-
-**Fix:** Stage hot I/O to node-local storage:
-```bash
-# Node-local tmpfs (128GB ramdisk at /tmp or /ram)
-LOCAL_WS="/tmp/litkit_${SLURM_JOB_ID}_shard${shard_id}"
-mkdir -p "$LOCAL_WS/tars" "$LOCAL_WS/sqlite" "$LOCAL_WS/emb_segments"
-
-# Copy tar once up front
-cp /nfs/path/to/tar "$LOCAL_WS/tars/"
-
-# Run litkit with local workspace
-LITKIT_WORKSPACE="$LOCAL_WS" litkit ...
-
-# rsync results back to NFS at end
-rsync -a "$LOCAL_WS/sqlite/" /path/to/workspace/sqlite/
-rsync -a "$LOCAL_WS/emb_segments/" /path/to/workspace/emb_segments/
-```
-
-### 4. Scan Blocked During Embedding (EXPECTED)
-
-The scan loop does NOT overlap with embedding—it waits for each embedding batch to complete. This is by design (simplifies memory management), but it means:
-
-- 143 seconds of embedding = 143 seconds of zero scan progress
-- Cumulative average rate tanks even if scan is healthy when running
-
-**Not a bug.** But important to understand when interpreting rate numbers.
-
-## Infrastructure Details
-
-| Resource | HPC gpu-v100 |
+| Question | Why It Matters |
 |----------|----------------|
+| Time spent in scan/parse vs embedding? | Identifies true bottleneck |
+| Time spent writing segments to NFS? | If high, local staging helps |
+| Time spent in SQLite commits/fsync? | If high, local staging helps |
+| Chunks per document trend? | Chunk explosion = runaway embedding time |
+| Does scan rate degrade over hours? | Would indicate NFS degradation |
+
+**Cannot optimize without measurements.** Current logs show only cumulative progress.
+
+---
+
+## Optimization Plan
+
+### Phase 2: Add Per-Cycle Instrumentation (NEXT)
+
+Add timers to `process_tar_files()` in `src/litkit/build/ingest_loop.py`:
+
+```python
+# Per batch cycle:
+t_scan_parse   # Time spent iterating tar + parsing XML
+t_embed        # Time spent in GPU embedding
+t_segment_write # Time spent writing .npz.pending + fsync
+t_sqlite_commit # Time spent in DB commit
+
+# Trend tracking:
+chunks_per_doc  # Rolling average (detect chunk explosion)
+```
+
+**Output format:**
+```
+[cycle] scan=8.2s embed=142.3s seg_write=1.5s db_commit=0.3s | chunks/doc=32.1 avg
+```
+
+### Phase 3: Stage OUTPUTS to Node-Local Storage
+
+**Problem:** Every segment write and SQLite commit goes to NFS. On NFS, small writes + fsync is expensive due to metadata server round-trips.
+
+**Solution:** Write all outputs to node-local storage, rsync back at end.
+
+```bash
+# At producer start:
+LOCAL="$LOCAL_SCRATCH/litkit_${SLURM_JOB_ID}_shard${shard_id}"
+mkdir -p "$LOCAL/sqlite" "$LOCAL/emb_segments"
+
+# litkit writes to local:
+export LITKIT_WORKSPACE="$LOCAL"
+litkit --embed-producer ...
+
+# At producer completion:
+rsync -a "$LOCAL/sqlite/" "$NFS_WORKSPACE/sqlite/"
+rsync -a "$LOCAL/emb_segments/" "$NFS_WORKSPACE/emb_segments/"
+```
+
+**Storage requirements for outputs:**
+- SQLite shard DB: ~10-50 MB per producer
+- Embedding segments: ~100-500 MB per producer (depends on chunks)
+- Total: < 1 GB per producer (easily fits in /tmp)
+
+### Phase 4: Per-Tar Streaming (Stage Input)
+
+**Problem:** On H100 with faster GPUs, embedding time drops. Scan/parse + tar reads may become the bottleneck. With 16 producers hitting NFS simultaneously, per-node read rate could drop.
+
+**Solution:** Stream one tar at a time to local storage:
+
+```bash
+for tar_path in $(cat shard_tars.txt); do
+    # Stage one tar to local
+    rsync "$tar_path" "$LOCAL/current.tar"
+    
+    # Process from local
+    litkit --tar-manifest "$LOCAL/single.manifest" ...
+    
+    # Delete before staging next
+    rm "$LOCAL/current.tar"
+done
+```
+
+**Storage requirements:**
+- Largest uncompressed tar: ~64 GB
+- Need: /tmp or local NVMe with ≥70 GB free
+
+**⚠️ TODO:** Verify node-local storage on target nodes:
+- `/tmp` - tmpfs (RAM-backed) or SSD?
+- `/ram` - ramdisk available?
+- Local NVMe/SSD path and size?
+- H100 partition storage layout?
+
+### Phase 5: Scale to Production
+
+**Target:** Process full PMC-OA corpus (~185GB, 5M+ articles) on H100 nodes.
+
+**Prerequisites:**
+1. ✅ CPU allocation working
+2. 🔲 Instrumentation shows where time goes
+3. 🔲 Output staging validated
+4. 🔲 Per-tar streaming validated
+5. 🔲 End-of-job consumer merge timed
+
+**Expected challenges at 16 producers:**
+- Consumer may become bottleneck (single node merging segments)
+- NFS metadata ops scale poorly (many concurrent file creates)
+- End-of-job merge could dominate walltime
+
+---
+
+## Scaling Projections
+
+### On V100 (Current Test)
+
+| Producers | Est. Time (Medium Test) | Notes |
+|-----------|------------------------|-------|
+| 2 | ~6-7 hours | Current test |
+| 4 | ~3-4 hours | Limited by embedding |
+| 8 | ~2-3 hours | NFS contention likely |
+
+### On H100 (Production)
+
+With 4 GPUs/node, embedding is ~4× faster than V100. The pipeline becomes I/O bound sooner.
+
+| Producers | Est. Time (Full Corpus) | Notes |
+|-----------|------------------------|-------|
+| 4 | ~24 hours | Embedding dominated |
+| 8 | ~12 hours | Balanced |
+| 16 | ~6-8 hours | I/O + consumer may limit |
+| 16 + local staging | ~3-4 hours | Target |
+
+**Estimates are speculative without instrumentation data.**
+
+---
+
+## Infrastructure Reference
+
+### HPC gpu-v100 (V100)
+
+| Resource | Value |
+|----------|-------|
 | CPU per node | 32 cores |
 | RAM per node | 255 GB |
-| GPU | 2x V100 |
+| GPU | 2× V100-PCIE-32GB |
 | Ramdisk | 128 GB at `/ram` |
-| Local disk | 3.5 TB (on some nodes) |
-| Network FS | VAST via NFS (vers=3, 1MB blocks) |
+| Local disk | 3.5 TB (some nodes) |
+| Network FS | VAST via NFS |
 
-## Fix Implementation Plan
+### HPC H100 Partition (Production)
 
-### Phase 1: CPU Fixes (Immediate)
+| Resource | Value |
+|----------|-------|
+| CPU per node | TBD |
+| RAM per node | TBD |
+| GPU | 4× H100 |
+| Local storage | TBD - **VERIFY** |
 
-1. Add `--cpus-per-task=$SLURM_CPUS_PER_TASK --cpu-bind=cores --export=ALL` to every srun
-2. Add threading clamps (OMP_NUM_THREADS=1, etc.)
-3. Pass threading clamps to container via --set-env
-4. Add diagnostic output (nproc, Cpus_allowed_list) at start
+---
 
-**Expected outcome:** If CPU starvation was the main issue, scan rate should stay at 20-30/s throughout.
+## Files to Modify
 
-### Phase 2: Local Staging (If Still Slow)
+| File | Change |
+|------|--------|
+| `src/litkit/build/ingest_loop.py` | Add per-cycle timers |
+| `src/litkit/progress.py` | Already updated with instantaneous rate |
+| `vector_build_multi.sbatch` | Add local staging logic |
+| `BOTTLENECK.md` | This document |
 
-1. Stage tar files to /tmp before processing
-2. Write SQLite and segments to /tmp
-3. rsync results back to NFS at producer completion
-4. Modify manifest to point to local paths
-
-**Expected outcome:** Eliminates NFS from hot loop entirely.
-
-### Phase 3: Pathological XML Detection (If Still Slow)
-
-1. Add per-document timing instrumentation
-2. Log top-N slowest files by parse time
-3. Identify if specific XMLs dominate runtime
-4. Add `--max-xml-bytes` or `--skip-large-docs` flags
+---
 
 ## Testing Checklist
 
-- [ ] Phase 1: CPU fixes applied to vector_build_multi.sbatch
-- [ ] Phase 1: Test run shows nproc=32 inside container
-- [ ] Phase 1: Scan rate stays above 15/s throughout
-- [ ] Phase 2: If needed, implement /tmp staging
-- [ ] Phase 2: Verify rsync copies results correctly
-- [ ] Phase 3: If needed, add slow-doc logging
+### Phase 1 (Complete)
+- [x] CPU fixes applied to vector_build_multi.sbatch
+- [x] Test run shows affinity_cpus=32 inside container
+- [x] GPU access confirmed (nvidia-smi shows devices)
+- [x] Scan rate healthy at start (~25-30/s)
 
-## Files Modified
+### Phase 2 (Next)
+- [ ] Add per-cycle timers to ingest_loop.py
+- [ ] Rebuild container with instrumentation
+- [ ] Run test job and collect timing data
+- [ ] Analyze: what % of time is scan vs embed vs I/O?
 
-- `vector_build_multi.sbatch` — CPU allocation + threading clamps
-- `BOTTLENECK.md` — This document
+### Phase 3
+- [ ] Implement output staging in sbatch
+- [ ] Verify rsync correctly copies results
+- [ ] Compare total time with/without staging
+
+### Phase 4
+- [ ] Verify node-local storage availability
+- [ ] Implement per-tar streaming
+- [ ] Test with 64GB tar file
+- [ ] Compare scan rate with local vs NFS read
+
+### Phase 5
+- [ ] Test with 4 producers
+- [ ] Test with 8 producers
+- [ ] Test with 16 producers
+- [ ] Time end-of-job consumer merge
+- [ ] Identify final walltime limiter
+
+---
 
 ## References
 
 - Slurm CPU binding: https://slurm.schedmd.com/cpu_management.html
+- FAISS threading: https://github.com/facebookresearch/faiss/wiki/Threads-and-asynchronous-calls
