@@ -133,6 +133,7 @@ echo "======================================"
 #   - Race-safe: no shared global exports; everything passed via srun --export=...
 #   - Quoting-safe: no word-splitting of "--bind ..." strings
 #   - Explicit: no dependence on "host vars magically existing" inside srun shell
+#   - ACTUAL_USE_LOCAL_STAGING used consistently (fallback-aware)
 #
 run_producer() {
     local node_id="$1"
@@ -140,55 +141,70 @@ run_producer() {
     local num_shards="$((SLURM_NNODES - 1))"
 
     echo "[Producer ${node_id}] Starting on ${target_node} with ${PARSE_WORKERS} parse workers"
-    echo "[Producer ${node_id}] Local staging: USE_LOCAL_STAGING=${USE_LOCAL_STAGING}"
+    echo "[Producer ${node_id}] Requested local staging: USE_LOCAL_STAGING=${USE_LOCAL_STAGING}"
 
-    # Host-side sanity checks (fail early, deterministically)
+    # Host-side sanity check (fail early, deterministically)
     if [[ ! -f "${LITKIT_WORKSPACE}/${MANIFEST_FILE}" ]]; then
         echo "FATAL: Manifest not found on host: ${LITKIT_WORKSPACE}/${MANIFEST_FILE}" >&2
         return 1
     fi
 
-    # Compute local staging path (host path on the compute node)
+    # Per-producer node-local staging root (host path on compute node)
     local local_stage_host=""
     if [[ "${USE_LOCAL_STAGING}" == "1" ]]; then
         local_stage_host="${LOCAL_SSD}/litkit_${SLURM_JOB_ID}_shard${node_id}"
     fi
 
-    # Run on the target node. Everything needed is passed explicitly via --export.
-    # --kill-on-bad-exit=1: terminate job if step fails (don't burn GPU on dead job)
-    # --exclusive: prevent step resource overlap within allocation
+    # Run on target node. Everything needed is passed explicitly via --export.
+    # --exclusive: avoid step overlap inside allocation
+    # --kill-on-bad-exit=1: fail fast (don't burn GPUs on a dead run)
     srun -N1 -n1 -w "${target_node}" \
         --cpus-per-task="${SLURM_CPUS_PER_TASK}" \
         --cpu-bind=cores \
         --exclusive \
         --kill-on-bad-exit=1 \
-        --export=ALL,PRODUCER_NODE_ID="${node_id}",PRODUCER_NUM_SHARDS="${num_shards}",PRODUCER_LOCAL_STAGE_HOST="${local_stage_host}",PRODUCER_USE_LOCAL_STAGING="${USE_LOCAL_STAGING}",PRODUCER_MANIFEST_FILE="${MANIFEST_FILE}",PRODUCER_PARSE_WORKERS="${PARSE_WORKERS}",PRODUCER_JOB_ID="${SLURM_JOB_ID}",CHRUN="${CHRUN}",IMG="${IMG}",CDI_SPEC_DIR="${CDI_SPEC_DIR}",CUDA_LIBA="${CUDA_LIBA}",CUDA_LIBB="${CUDA_LIBB}",HF_HOST="${HF_HOST}",LITKIT_WORKSPACE="${LITKIT_WORKSPACE}",LITKIT_SQLITE_BUSY_TIMEOUT_MS="${LITKIT_SQLITE_BUSY_TIMEOUT_MS}",LITKIT_SAVE_EVERY_SEC="${LITKIT_SAVE_EVERY_SEC}",LITKIT_DEBUG="${LITKIT_DEBUG}",LOCAL_SSD="${LOCAL_SSD}",LOCAL_SSD_MIN_FREE_GB="${LOCAL_SSD_MIN_FREE_GB}" \
+        --export=ALL,PRODUCER_NODE_ID="${node_id}",PRODUCER_NUM_SHARDS="${num_shards}",PRODUCER_LOCAL_STAGE_HOST="${local_stage_host}",PRODUCER_USE_LOCAL_STAGING="${USE_LOCAL_STAGING}",PRODUCER_MANIFEST_FILE="${MANIFEST_FILE}",PRODUCER_PARSE_WORKERS="${PARSE_WORKERS}",PRODUCER_JOB_ID="${SLURM_JOB_ID}",CHRUN="${CHRUN}",IMG="${IMG}",CDI_SPEC_DIR="${CDI_SPEC_DIR}",CUDA_LIBA="${CUDA_LIBA}",CUDA_LIBB="${CUDA_LIBB}",HF_HOST="${HF_HOST}",LITKIT_WORKSPACE="${LITKIT_WORKSPACE}",LITKIT_SQLITE_BUSY_TIMEOUT_MS="${LITKIT_SQLITE_BUSY_TIMEOUT_MS}",LITKIT_SAVE_EVERY_SEC="${LITKIT_SAVE_EVERY_SEC}",LITKIT_DEBUG="${LITKIT_DEBUG}",LOCAL_SSD="${LOCAL_SSD}",LOCAL_SSD_MIN_FREE_GB="${LOCAL_SSD_MIN_FREE_GB:-50}" \
         bash -lc '
             set -euo pipefail
 
-            # Decide container workspace and embed outdir
             CONTAINER_NFS_WS="/workspace"
+
+            # --- Decide whether staging is ACTUALLY enabled on this node (may fallback) ---
             ACTUAL_USE_LOCAL_STAGING="${PRODUCER_USE_LOCAL_STAGING}"
-            
-            # Validate LOCAL_SSD if staging is requested
+
             if [[ "${ACTUAL_USE_LOCAL_STAGING}" == "1" ]]; then
+                # Validate LOCAL_SSD exists, is writable, and has enough free space
                 if [[ ! -d "${LOCAL_SSD}" ]]; then
-                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] WARN: LOCAL_SSD ${LOCAL_SSD} not found, falling back to NFS" >&2
+                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] WARN: LOCAL_SSD missing (${LOCAL_SSD}); falling back to NFS" >&2
                     ACTUAL_USE_LOCAL_STAGING="0"
-                elif ! touch "${LOCAL_SSD}/.litkit_probe_$$" 2>/dev/null; then
-                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] WARN: LOCAL_SSD ${LOCAL_SSD} not writable, falling back to NFS" >&2
+                elif ! mountpoint -q "${LOCAL_SSD}" 2>/dev/null; then
+                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] WARN: LOCAL_SSD not a mountpoint (${LOCAL_SSD}); falling back to NFS" >&2
                     ACTUAL_USE_LOCAL_STAGING="0"
                 else
-                    rm -f "${LOCAL_SSD}/.litkit_probe_$$"
-                    free_gb=$(df -BG "${LOCAL_SSD}" 2>/dev/null | awk "NR==2{gsub(/G/,\"\",\$4); print \$4}" || echo "0")
-                    if [[ -z "${free_gb}" ]] || (( free_gb < LOCAL_SSD_MIN_FREE_GB )); then
-                        echo "[Producer ${PRODUCER_NODE_ID}] [staging] FATAL: LOCAL_SSD has only ${free_gb}GB free (need ${LOCAL_SSD_MIN_FREE_GB}GB min)" >&2
-                        exit 1
+                    probe="$(mktemp -p "${LOCAL_SSD}" .litkit_probe.XXXXXX)" || probe=""
+                    if [[ -z "${probe}" ]]; then
+                        echo "[Producer ${PRODUCER_NODE_ID}] [staging] WARN: cannot mktemp on LOCAL_SSD (${LOCAL_SSD}); falling back to NFS" >&2
+                        ACTUAL_USE_LOCAL_STAGING="0"
+                    else
+                        rm -f "${probe}" || true
+
+                        min_gb="${LOCAL_SSD_MIN_FREE_GB:-50}"
+                        [[ "${min_gb}" =~ ^[0-9]+$ ]] || { echo "[Producer ${PRODUCER_NODE_ID}] FATAL: LOCAL_SSD_MIN_FREE_GB not an int: ${min_gb}" >&2; exit 2; }
+
+                        free_gb="$(df -BG "${LOCAL_SSD}" 2>/dev/null | awk "NR==2{gsub(/G/,\"\",\$4); print \$4}" || true)"
+                        [[ "${free_gb}" =~ ^[0-9]+$ ]] || free_gb=0
+
+                        if (( free_gb < min_gb )); then
+                            echo "[Producer ${PRODUCER_NODE_ID}] FATAL: LOCAL_SSD has ${free_gb}GB free (< ${min_gb}GB required)" >&2
+                            exit 2
+                        fi
+
+                        echo "[Producer ${PRODUCER_NODE_ID}] [staging] LOCAL_SSD validated: ${free_gb}GB free at ${LOCAL_SSD}"
                     fi
-                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] LOCAL_SSD validated: ${free_gb}GB free"
                 fi
             fi
-            
+
+            # --- Container workspace + embed outdir ---
             if [[ "${ACTUAL_USE_LOCAL_STAGING}" == "1" ]]; then
                 CONTAINER_WS="/local_stage"
                 EMBED_OUTDIR="${CONTAINER_WS}/emb_segments"
@@ -197,7 +213,7 @@ run_producer() {
                 EMBED_OUTDIR="${CONTAINER_NFS_WS}/emb_segments"
             fi
 
-            # Prep local staging (host FS) if enabled
+            # --- Prep node-local staging dirs (host FS) if enabled ---
             if [[ "${ACTUAL_USE_LOCAL_STAGING}" == "1" ]]; then
                 echo "[Producer ${PRODUCER_NODE_ID}] [staging] Using node-local SSD: ${PRODUCER_LOCAL_STAGE_HOST}"
                 mkdir -p "${PRODUCER_LOCAL_STAGE_HOST}/sqlite" "${PRODUCER_LOCAL_STAGE_HOST}/emb_segments"
@@ -206,7 +222,7 @@ run_producer() {
                 echo "[Producer ${PRODUCER_NODE_ID}] [staging] Using NFS directly (no local staging)"
             fi
 
-            # Build ch-run argv as a real array (no fragile word-splitting)
+            # --- Build ch-run argv (array; no word-splitting) ---
             chrun_argv=(
                 "${CHRUN}"
                 --unset-env="*"
@@ -220,12 +236,11 @@ run_producer() {
                 --bind "${HF_HOST}:/app/hf_cache"
             )
 
-            # Optional bind for local staging (host path -> /local_stage in container)
-            if [[ "${PRODUCER_USE_LOCAL_STAGING}" == "1" ]]; then
+            # Only bind /local_stage if staging is ACTUALLY enabled (critical)
+            if [[ "${ACTUAL_USE_LOCAL_STAGING}" == "1" ]]; then
                 chrun_argv+=( --bind "${PRODUCER_LOCAL_STAGE_HOST}:/local_stage" )
             fi
 
-            # Environment + container entrypoint
             chrun_argv+=(
                 --set-env="LD_LIBRARY_PATH=${CUDA_LIBA}:${CUDA_LIBB}"
                 --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -244,11 +259,11 @@ run_producer() {
                 bash -lc
             )
 
-            # Build litkit command (heredoc avoids nested quoting issues)
+            # --- Command run inside container ---
             litkit_cmd=$(cat <<EOF
 echo "[diag:producer] host=\$(hostname)"
 echo "[diag:producer] Cpus_allowed=\$(grep Cpus_allowed_list /proc/self/status | cut -f2)"
-python3 -c "import os; aff=os.sched_getaffinity(0); print(\"[diag:producer] affinity_cpus=\", len(aff))"
+python3 -c "import os; aff=os.sched_getaffinity(0); print(\\"[diag:producer] affinity_cpus=\\", len(aff))"
 echo "[diag:producer] GPUs:"; (nvidia-smi -L 2>/dev/null | head -10) || true
 echo "[diag:producer] LITKIT_WORKSPACE=\$LITKIT_WORKSPACE"
 test -f "${CONTAINER_NFS_WS}/${PRODUCER_MANIFEST_FILE}" || { echo "FATAL: manifest missing in container: ${CONTAINER_NFS_WS}/${PRODUCER_MANIFEST_FILE}" >&2; exit 2; }
@@ -274,14 +289,15 @@ EOF
             set -e
             echo "[Producer ${PRODUCER_NODE_ID}] litkit exit code: ${rc}"
 
-            # Sync local results back to NFS only if litkit succeeded
-            # Rsync to FLAT emb_segments dir (segment filenames are shard-unique)
+            # --- Sync back to NFS (SAFE: shard-specific destinations) ---
             if [[ "${ACTUAL_USE_LOCAL_STAGING}" == "1" ]]; then
                 if [[ "${rc}" -eq 0 ]]; then
-                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] Syncing local outputs -> NFS (atomic-ish via --delay-updates)"
-                    mkdir -p "${LITKIT_WORKSPACE}/sqlite" "${LITKIT_WORKSPACE}/emb_segments"
-                    rsync -a --delay-updates "${PRODUCER_LOCAL_STAGE_HOST}/sqlite/" "${LITKIT_WORKSPACE}/sqlite/"
-                    rsync -a --delay-updates "${PRODUCER_LOCAL_STAGE_HOST}/emb_segments/" "${LITKIT_WORKSPACE}/emb_segments/"
+                    nfs_sqlite_dest="${LITKIT_WORKSPACE}/sqlite/shard_${PRODUCER_NODE_ID}/"
+                    nfs_segments_dest="${LITKIT_WORKSPACE}/emb_segments/shard_${PRODUCER_NODE_ID}/"
+                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] Syncing local outputs -> NFS"
+                    mkdir -p "${nfs_sqlite_dest}" "${nfs_segments_dest}"
+                    rsync -a --delay-updates "${PRODUCER_LOCAL_STAGE_HOST}/sqlite/" "${nfs_sqlite_dest}"
+                    rsync -a --delay-updates "${PRODUCER_LOCAL_STAGE_HOST}/emb_segments/" "${nfs_segments_dest}"
                     echo "[Producer ${PRODUCER_NODE_ID}] [staging] Cleanup local staging dir"
                     rm -rf "${PRODUCER_LOCAL_STAGE_HOST}"
                 else
@@ -368,8 +384,9 @@ done
 sleep 10
 
 # Run consumer on the last node (already set above in bootstrap)
-# NOTE: Producers rsync to FLAT emb_segments dir (shard-unique segment filenames)
-# No recursive scan needed - all .npz files appear directly in emb_segments/
+# NOTE: With local staging, producers rsync to shard-specific subdirs:
+#   emb_segments/shard_0/, emb_segments/shard_1/, etc.
+# Consumer must scan --embed-outdir recursively to find all .npz files.
 echo "Starting consumer on node: $CONSUMER_NODE"
 # --exclusive: prevent step resource overlap
 # --kill-on-bad-exit=1: terminate job if consumer fails
