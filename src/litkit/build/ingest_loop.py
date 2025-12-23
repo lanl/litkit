@@ -211,6 +211,13 @@ def process_tar_files(
     papers_added_total = 0
     chunks_added_total = 0
     
+    # Per-cycle timing instrumentation
+    cycle_scan_start = time.time()  # Reset after each batch flush
+    cycle_docs = 0  # Docs processed since last flush
+    cycle_chunks = 0  # Chunks generated since last flush
+    total_docs_for_avg = 0  # Total docs (for chunks/doc rolling avg)
+    total_chunks_for_avg = 0  # Total chunks (for chunks/doc rolling avg)
+    
     for tpath in tar_paths:
         # Number of *persisted* members previously processed for this tar shard
         start_persisted = int(ckpt_stream.get(str(tpath), 0))
@@ -452,6 +459,9 @@ def process_tar_files(
                 
                 handled_ok = True
                 
+                # Track docs and chunks for cycle timing
+                cycle_docs += 1
+                
                 # Release savepoint on success
                 conn.execute("RELEASE SAVEPOINT member_sp")
             
@@ -569,6 +579,9 @@ def process_tar_files(
                 paper_doc_ids_buf.clear()
             
             if handled_ok and len(chunk_ids_buf) >= chunk_batch:
+                # --- CYCLE TIMING: capture scan phase duration ---
+                t_scan = time.time() - cycle_scan_start
+                
                 u_ids, u_texts, u_paper_doc_ids, u_ords = dedupe_chunks_with_doc_ids(
                     chunk_ids_buf, chunk_texts_buf, chunk_paper_doc_ids_buf, chunk_ords_buf
                 )
@@ -576,22 +589,49 @@ def process_tar_files(
                 if chunk_seg_writer is not None:
                     # Producer mode: embed and write segments
                     try:
+                        t_embed_start = time.time()
                         Xc = chunk_embedder.encode(
                             u_texts,
                             progress_label=f"Embedding chunks (producer, {len(u_texts)})",
                             batch_size=chunk_embed_bs,
                             progress_done_summary=False,
                         )
+                        t_embed = time.time() - t_embed_start
+                        
+                        t_seg_start = time.time()
                         chunk_seg_writer.write(
                             paper_doc_ids=u_paper_doc_ids, ords=u_ords, vecs=Xc
                         )
+                        t_seg = time.time() - t_seg_start
+                        
+                        t_db_start = time.time()
                         conn.commit()
+                        t_db = time.time() - t_db_start
+                        
                         chunks_added_total += len(u_ids)
                         
                         ckpt_stream[str(tpath)] = processed_count
                         ckpt["build_stream"] = ckpt_stream
                         seg_save_checkpoint(ckpt, ckpt_path, ckpt_lock, shard_id=ckpt_shard_id)
                         persisted_count = processed_count
+                        
+                        # --- CYCLE TIMING: emit summary ---
+                        total_docs_for_avg += cycle_docs
+                        total_chunks_for_avg += len(u_ids)
+                        if total_docs_for_avg > 0:
+                            avg_cpd = total_chunks_for_avg / total_docs_for_avg
+                        else:
+                            avg_cpd = 0.0
+                        _eprint(
+                            f"[cycle] docs={cycle_docs} chunks={len(u_ids)} | "
+                            f"scan={t_scan:.1f}s embed={t_embed:.1f}s "
+                            f"seg={t_seg:.2f}s db={t_db:.2f}s | "
+                            f"chunks/doc={avg_cpd:.1f}"
+                        )
+                        # Reset cycle tracking
+                        cycle_scan_start = time.time()
+                        cycle_docs = 0
+                        cycle_chunks = 0
                     except Exception as e:
                         conn.rollback()
                         _eprint(f"[flush] FATAL: chunk segment flush failed: {e.__class__.__name__}: {e}")
