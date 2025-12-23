@@ -21,6 +21,8 @@
 - `c959c19` - Instantaneous scan rate display
 - `a0f40b1` - Per-cycle timing instrumentation
 - `0eb8dba` - Output staging to local SSD (flat rsync to NFS)
+- `935ef57` - Fix: Skip FAISS index loading for `--embed-producer` mode
+- `878001c` - Baseline config: `USE_LOCAL_STAGING=0`, no step-level `--gres`
 
 ---
 
@@ -83,7 +85,7 @@ The new instrumentation shows:
 
 ---
 
-## Phase 3: Output Staging (COMPLETE)
+## Phase 3: Output Staging (IMPLEMENTED, TESTING)
 
 ### Problem
 
@@ -103,9 +105,39 @@ The sbatch script now:
 
 **Key design choices:**
 - `--exclusive` omitted for backgrounded producers (avoids step scheduling friction)
-- `--gres=gpu:2` explicit on all srun steps
+- GPUs inherited from job-level allocation (no step-level `--gres` to avoid conflicts)
 - FLAT rsync destinations (consumer expects non-recursive globs)
 - Conditional rsync on success only (preserves staging dir on failure for debugging)
+
+### Baseline vs Staging Mode
+
+For testing, we run baseline (no staging) first to establish a control:
+
+```bash
+# Baseline (default): all writes go to NFS
+sbatch vector_build_multi.sbatch
+
+# With local staging: writes to SSD, rsync at end
+USE_LOCAL_STAGING=1 sbatch vector_build_multi.sbatch
+```
+
+### Bug Fix: Producer FAISS Loading (935ef57)
+
+**Problem:** When `LITKIT_WORKSPACE=/local_stage`, producers looked for FAISS indices at `/local_stage/indices/`, but bootstrap created them on NFS at `/workspace/indices/`.
+
+**Root cause:** `cli.py` called `load_or_create_paper_index()` for all modes, including `--embed-producer`.
+
+**Fix:** Skip index loading when `args.embed_producer=True`. Producers don't need indices (they write segments, not FAISS).
+
+```python
+if args.embed_producer:
+    paper_index = None
+    chunk_index = None
+    needs_training = False
+else:
+    paper_index = build_load_or_create_paper_index(...)
+    chunk_index, needs_training = build_load_or_create_chunk_index(...)
+```
 
 ### Storage Budget
 
@@ -312,6 +344,39 @@ With 4 GPUs/node and ~4× faster embedding, I/O becomes limiting factor sooner.
 
 ---
 
+## Red Team Feedback (2025-12-23)
+
+### Issues Raised and Responses
+
+| Issue | Valid? | Response |
+|-------|--------|----------|
+| `USE_LOCAL_STAGING=1` changes baseline | ✅ Yes | Changed default to 0 (`878001c`) |
+| Step-level `--gres=gpu:2` conflicts with job-level | ⚠️ Site-specific | Removed step-level for simplicity (`878001c`) |
+| Background producers + `--kill-on-bad-exit` doesn't fail fast | ✅ Yes | Noted; single `wait` at end is too late. Deferred fix. |
+| Flat rsync unsafe if filenames not unique | ❌ Already handled | Filenames include shard_id: `litkit_shard_XX.sqlite3`, `paper_seg_shardXX_*.npz` |
+| Consumer competing for GPUs | ⚠️ Minor | Consumer on dedicated node; job-level allocation is per-node |
+| `mountpoint -q` not portable | ✅ Acknowledged | HPC-specific, acceptable for now |
+
+### Background PID Tracking (Deferred)
+
+Current pattern:
+```bash
+for i in ...; do run_producer $i &; done
+wait  # waits for ALL, but runs AFTER consumer finishes
+```
+
+Better pattern (not yet implemented):
+```bash
+pids=()
+for i in ...; do run_producer $i & pids+=($!); done
+# Check each producer before starting consumer
+for pid in "${pids[@]}"; do wait $pid || exit 1; done
+```
+
+This adds complexity and is deferred until baseline is validated.
+
+---
+
 ## Testing Checklist
 
 ### Phase 1 (Complete)
@@ -325,16 +390,19 @@ With 4 GPUs/node and ~4× faster embedding, I/O becomes limiting factor sooner.
 - [x] Add per-cycle timing to ingest_loop.py (a0f40b1)
 - [x] Measure storage performance (47× metadata slowdown)
 - [x] Identify staging target: `/local/scratch` (447G)
-- [ ] Rebuild container with instrumentation
+- [x] Rebuild container with instrumentation (in progress)
 - [ ] Collect timing data from test run
 
-### Phase 3 (Next)
-- [ ] Implement output staging in sbatch
-- [ ] Verify rsync correctly copies results
-- [ ] Compare cycle timing with/without staging
+### Phase 3 (In Progress)
+- [x] Implement output staging in sbatch (USE_LOCAL_STAGING=1)
+- [x] Fix producer FAISS loading bug (935ef57)
+- [x] Baseline config: USE_LOCAL_STAGING=0 (878001c)
+- [ ] Run baseline test (no staging)
+- [ ] Run staging test (USE_LOCAL_STAGING=1)
+- [ ] Compare `seg=` and `db=` timing between runs
 
-### Phase 4
-- [ ] Implement per-tar streaming
+### Phase 4 (Deferred)
+- [ ] Implement tar input staging
 - [ ] Test with 64GB tar file
 - [ ] Compare scan rate with local vs NFS read
 
