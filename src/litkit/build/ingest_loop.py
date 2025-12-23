@@ -236,8 +236,12 @@ def process_tar_files(
         render_pct_step = TAR_RENDER_PCT_STEP
         next_pct = 0.0  # next threshold to print (0, 1, 2, ... if step=1)
         
+        # For instantaneous rate calculation
+        last_render_count = start_persisted
+        last_render_ts = start_ts
+        
         def _render(force: bool = False):
-            nonlocal last_render, next_pct
+            nonlocal last_render, next_pct, last_render_count, last_render_ts
             now = time.time()
             done = processed_count
             
@@ -256,16 +260,31 @@ def process_tar_files(
                     next_pct += render_pct_step
             
             elapsed = max(1e-3, now - start_ts)
+            avg_rate = done / elapsed
+            
+            # Instantaneous rate from delta since last render
+            delta_time = now - last_render_ts
+            delta_count = done - last_render_count
+            if delta_time > 0.1 and delta_count >= 0:
+                inst_rate = delta_count / delta_time
+            else:
+                inst_rate = avg_rate  # Fall back if no meaningful delta
+            
             total_str = str(total_members) if total_members is not None else "?"
             pct_str = f"  ({100.0*done/total_members:.1f}%)" if total_members else ""
             msg = (
-                f"[progress] [scan] {tpath.name}: {done}/{total_str}{pct_str}  {done/elapsed:.1f}/s"
+                f"[progress] [scan] {tpath.name}: {done}/{total_str}{pct_str}"
+                f"  {inst_rate:.1f}/s now, {avg_rate:.1f}/s avg"
             )
             # Print scan progress as a discrete line to avoid fighting with other
             # in-place tickers (embedder, heartbeats).
             _progress_newline(sys.stderr)
             _progress_write(msg, sys.stderr)
             _progress_newline(sys.stderr)
+            
+            # Update tracking for next instantaneous calculation
+            last_render_count = done
+            last_render_ts = now
             last_render = now
         
         # show initial 0/N state (or ? if unknown)
