@@ -153,8 +153,8 @@ run_producer() {
         --set-env="TOKENIZERS_PARALLELISM=false" \
         "$IMG" -- \
         bash -c '
-            echo "[diag:producer] nproc=$(nproc)"
             echo "[diag:producer] Cpus_allowed=$(grep Cpus_allowed_list /proc/self/status | cut -f2)"
+            python3 -c "import os; aff=os.sched_getaffinity(0); print(\"[diag:producer] affinity_cpus=\", len(aff))"
             echo "[diag:producer] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
             exec litkit \
                 --embed-producer \
@@ -215,8 +215,8 @@ srun -N1 -n1 -w "$CONSUMER_NODE" \
     --set-env="TOKENIZERS_PARALLELISM=false" \
     "$IMG" -- \
     bash -c '
-        echo "[diag:bootstrap] nproc=$(nproc)"
         echo "[diag:bootstrap] Cpus_allowed=$(grep Cpus_allowed_list /proc/self/status | cut -f2)"
+        python3 -c "import os; aff=os.sched_getaffinity(0); print(\"[diag:bootstrap] affinity_cpus=\", len(aff))"
         exec litkit \
             --faiss-writer \
             --init-indices-only \
@@ -273,8 +273,8 @@ srun -N1 -n1 -w "$CONSUMER_NODE" \
     --set-env="TOKENIZERS_PARALLELISM=false" \
     "$IMG" -- \
     bash -c '
-        echo "[diag:consumer] nproc=$(nproc)"
         echo "[diag:consumer] Cpus_allowed=$(grep Cpus_allowed_list /proc/self/status | cut -f2)"
+        python3 -c "import os; aff=os.sched_getaffinity(0); print(\"[diag:consumer] affinity_cpus=\", len(aff))"
         exec litkit \
             --faiss-writer \
             --consume-only \
