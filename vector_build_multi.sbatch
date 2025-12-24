@@ -61,6 +61,7 @@ export USE_LOCAL_STAGING="${USE_LOCAL_STAGING:-1}"  # Local SSD staging enabled 
 #   small_test.manifest   (~760 MB, 15-20 min) - quick validation  
 #   medium_test.manifest  (~7 GB, 30-45 min)   - moderate test
 #   large_test.manifest   (~185 GB, 3-5 hours) - full production
+# Tar files referenced by manifests are at: /path/to/PMC-OA
 MANIFEST_FILE="${MANIFEST:-tiny_test.manifest}"
 export LITKIT_TAR_MANIFEST="${LITKIT_WORKSPACE}/${MANIFEST_FILE}"
 

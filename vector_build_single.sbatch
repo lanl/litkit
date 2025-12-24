@@ -40,6 +40,7 @@ fi
 #   small_test.manifest   (~760 MB, 15-20 min) - quick validation  
 #   medium_test.manifest  (~7 GB, 30-45 min)   - moderate test
 #   large_test.manifest   (~185 GB, 3-5 hours) - full production
+# Tar files referenced by manifests are at: /path/to/PMC-OA
 : "${MANIFEST:=/path/to/litkit/workspace/tiny_test.manifest}"
 : "${TAR_DIR:=}"
 
