@@ -389,45 +389,21 @@ done
 sleep 10
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# WATCHDOG: Kill job if any producer dies early (prevents wasted GPU hours)
+# CONSUMER: Run in background so main shell can wait on producers
 # ═══════════════════════════════════════════════════════════════════════════════
-# Without this, a producer failure at minute 5 would let the consumer run for
-# hours waiting for segments that will never arrive. The watchdog polls every
-# 15 seconds and calls scancel if any producer exits with nonzero.
-watch_producers() {
-    while true; do
-        for ((i=0; i<NUM_PRODUCERS; i++)); do
-            pid="${PRODUCER_PIDS[$i]}"
-            if ! kill -0 "$pid" 2>/dev/null; then
-                # Producer exited; collect status
-                if wait "$pid" 2>/dev/null; then
-                    : # Producer exited successfully, continue watching others
-                else
-                    rc=$?
-                    echo "[watchdog] FATAL: Producer $i (PID $pid) failed with exit code $rc; cancelling job ${SLURM_JOB_ID}" >&2
-                    scancel "${SLURM_JOB_ID}" 2>/dev/null || true
-                    return 1
-                fi
-            fi
-        done
-        sleep 15
-    done
-}
-
-watch_producers &
-WATCHDOG_PID=$!
-echo "[main] Watchdog started with PID $WATCHDOG_PID (polls every 15s)"
+# Main shell owns producer PIDs, so it can correctly wait on them.
+# If any producer fails, we kill the consumer and cancel the job.
+# This avoids the bash subshell wait limitation that broke the old watchdog.
 
 # Run consumer on the last node (already set above in bootstrap)
 # NOTE: Producers rsync to FLAT directories (filenames are shard-unique):
 #   sqlite/litkit_shard_XX.sqlite3
 #   emb_segments/paper_seg_shardXX_*.npz, chunk_seg_shardXX_*.npz
 # Consumer's non-recursive glob finds all files directly in these directories.
-echo "Starting consumer on node: $CONSUMER_NODE"
+echo "Starting consumer on node: $CONSUMER_NODE (background)"
 # --exclusive: prevent step resource overlap (serial step, safe)
 # NOTE: GPUs inherited from job-level allocation (no step-level --gres to avoid conflicts)
-# NOTE: Wrapped with set +e to ensure cleanup runs even on consumer failure
-set +e
+# NOTE: Consumer runs in background so main shell can wait on producers first
 srun -N1 -n1 -w "$CONSUMER_NODE" \
     --cpus-per-task="$SLURM_CPUS_PER_TASK" \
     --cpu-bind=cores \
@@ -470,27 +446,16 @@ srun -N1 -n1 -w "$CONSUMER_NODE" \
             --papers-index hnsw \
             --chunks-index flat \
             --num-shards '"$((SLURM_NNODES - 1))"'
-    '
-CONSUMER_RC=$?
-set -e
+    ' &
+CONSUMER_PID=$!
+echo "[main] Consumer started with PID $CONSUMER_PID"
 
-# Stop watchdog (consumer finished, no longer needed)
-kill "$WATCHDOG_PID" 2>/dev/null || true
-wait "$WATCHDOG_PID" 2>/dev/null || true
-echo "[main] Watchdog stopped"
-
-# Handle consumer failure (after cleanup, before producer waits)
-if (( CONSUMER_RC != 0 )); then
-    echo "[main] FATAL: Consumer failed with exit code $CONSUMER_RC" >&2
-    # Kill any remaining producers to avoid burning GPU hours
-    for pid in "${PRODUCER_PIDS[@]}"; do
-        kill "$pid" 2>/dev/null || true
-    done
-    scancel "${SLURM_JOB_ID}" 2>/dev/null || true
-    exit "$CONSUMER_RC"
-fi
-
-# Wait for all background jobs (producers) and check return codes
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN SHELL WAITS ON PRODUCERS (correct bash wait semantics)
+# ═══════════════════════════════════════════════════════════════════════════════
+# The main shell owns the producer PIDs, so `wait` works correctly here.
+# If any producer fails, we kill the consumer and cancel the job immediately.
+# This achieves the "early abort" behavior without the subshell wait bug.
 echo "Waiting for all producers to complete..."
 FAILED_PRODUCERS=()
 for ((i=0; i<NUM_PRODUCERS; i++))
@@ -502,13 +467,26 @@ do
         rc=$?
         echo "[main] ERROR: Producer $i (PID $pid) failed with exit code $rc" >&2
         FAILED_PRODUCERS+=($i)
+        # Early abort: kill consumer and cancel job on first producer failure
+        echo "[main] FATAL: Producer $i failed; killing consumer and cancelling job" >&2
+        kill "$CONSUMER_PID" 2>/dev/null || true
+        scancel "${SLURM_JOB_ID}" 2>/dev/null || true
+        exit "$rc"
     fi
 done
 
-if [[ ${#FAILED_PRODUCERS[@]} -gt 0 ]]; then
-    echo "[main] FATAL: ${#FAILED_PRODUCERS[@]} producer(s) failed: ${FAILED_PRODUCERS[*]}" >&2
-    echo "[main] Check individual producer logs for details." >&2
-    exit 1
+echo "[main] All $NUM_PRODUCERS producers completed successfully"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WAIT FOR CONSUMER (producers succeeded)
+# ═══════════════════════════════════════════════════════════════════════════════
+echo "[main] Waiting for consumer to complete..."
+if wait "$CONSUMER_PID"; then
+    echo "[main] Consumer completed successfully"
+else
+    CONSUMER_RC=$?
+    echo "[main] FATAL: Consumer failed with exit code $CONSUMER_RC" >&2
+    exit "$CONSUMER_RC"
 fi
 
 echo "=== Multi-Node Litkit Build Complete ==="
