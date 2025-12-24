@@ -1497,11 +1497,14 @@ def build_or_update_indices(args):
         if not args.quiet:
             _eprint("=================================================================")
     else:
-        if not args.quiet:
-            _eprint("\n=== SUMMARY ================================================")
-        _post_build_sanity_check(conn, args)
-        if not args.quiet:
-            _eprint("=================================================================")
+        # Skip sanity check for producers - they don't have FAISS indices locally
+        # (LITKIT_WORKSPACE=/local_stage but indices are on NFS at /workspace)
+        if not args.embed_producer:
+            if not args.quiet:
+                _eprint("\n=== SUMMARY ================================================")
+            _post_build_sanity_check(conn, args)
+            if not args.quiet:
+                _eprint("=================================================================")
 
     _eprint(f"[done] indexed {papers_added_total} papers and {chunks_added_total} chunks (this run)")
     conn.close()
