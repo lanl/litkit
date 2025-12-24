@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=litkit_multi
 #SBATCH --partition=gpu-v100
-#SBATCH --nodes=4
+#SBATCH --nodes=3
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
@@ -54,7 +54,7 @@ export LITKIT_WORKSPACE="${LITKIT_REPO}/workspace"  # Shared NFS workspace (cons
 # LOCAL STAGING: Use node-local SSD to avoid NFS metadata storm
 # Evidence: 47× faster for small-file creates (see BOTTLENECK.md)
 export LOCAL_SSD="/local/scratch"
-export USE_LOCAL_STAGING="${USE_LOCAL_STAGING:-0}"  # Set to 1 to enable local SSD staging
+export USE_LOCAL_STAGING="${USE_LOCAL_STAGING:-1}"  # Local SSD staging enabled by default
 
 # MANIFEST selection (edit this ONE LINE to change which manifest is used):
 #   tiny_test.manifest    (~few MB, 5-10 min) - for debugging merge logic
