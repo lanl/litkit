@@ -66,7 +66,7 @@ MANIFEST_FILE="${MANIFEST:-tiny_test.manifest}"
 export LITKIT_TAR_MANIFEST="${LITKIT_WORKSPACE}/${MANIFEST_FILE}"
 
 # Container and CUDA setup for V100 nodes
-export IMG="${LITKIT_REPO}/sqfs/litkit-v0.3.34-aarch64-lean.sqfs"
+export IMG="${LITKIT_REPO}/sqfs/litkit-v0.3.35-aarch64-lean.sqfs"
 export CDI_SPEC_DIR="/path/to/cdi-v100"
 export CUDA_BASE="/path/to/cuda-12.5-host/cuda-12.5"
 export CUDA_LIBA="${CUDA_BASE}/targets/sbsa-linux/lib"

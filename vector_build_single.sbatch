@@ -121,7 +121,7 @@ fi
 ### ----- CLUSTER PATHS --------------------------------------------------------
 BASE="/path/to"
 LITKIT_DIR="$BASE/litkit"
-IMG="$LITKIT_DIR/sqfs/litkit-v0.3.34-aarch64-lean.sqfs"   # keep in sync with your image
+IMG="$LITKIT_DIR/sqfs/litkit-v0.3.35-aarch64-lean.sqfs"   # keep in sync with your image
 if [[ "$TARGET" == "gh" ]]; then
   CDI_SPEC_DIR="$BASE/cdi-grace"
 else

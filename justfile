@@ -51,7 +51,7 @@ set shell := ['bash', '-l', '-c']
 # ---- Paths & tags ----
 arch := env("ARCH", "aarch64")
 flavor := env("FLAVOR", "lean")           # fat | lean
-tag := "v0.3.34-" + arch + "-" + flavor
+tag := "v0.3.35-" + arch + "-" + flavor
 name := "litkit"
 sqfs-path := "./sqfs" / name + "-" + tag + ".sqfs"
 

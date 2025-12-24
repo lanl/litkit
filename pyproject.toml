@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "litkit"
-version = "0.3.34"
+version = "0.3.35"
 description = "Literature tooling: ingest, embed, index, answer."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"

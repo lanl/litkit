@@ -690,6 +690,30 @@ the segment directory before consumer ingestion, or just accept the storage over
 
 ---
 
+## Version Bump Checklist
+
+When releasing a new version, update the version string in these **5 files**:
+
+| File | Location | Format |
+|------|----------|--------|
+| `pyproject.toml` | Line ~7 | `version = "X.Y.Z"` |
+| `justfile` | Line ~54 | `tag := "vX.Y.Z-" + arch + "-" + flavor` |
+| `vector_build_single.sbatch` | Line ~124 | `IMG="...litkit-vX.Y.Z-aarch64-lean.sqfs"` |
+| `vector_build_multi.sbatch` | Line ~69 | `IMG="...litkit-vX.Y.Z-aarch64-lean.sqfs"` |
+| `vector_resume_consumer.sbatch` | Line ~53 | `IMG="...litkit-vX.Y.Z-aarch64-lean.sqfs"` |
+
+**Quick check:**
+```bash
+grep -rn "0\.3\." --include="*.py" --include="*.toml" --include="justfile" --include="*.sbatch" .
+```
+
+**After version bump:**
+1. `just reset && just build` — rebuild container with new tag
+2. Copy `.sqfs` to cluster: `/path/to/litkit/sqfs/`
+3. Commit and push all changed files
+
+---
+
 ## License
 
 Proprietary — LANL
