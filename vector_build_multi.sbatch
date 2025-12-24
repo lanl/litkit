@@ -468,9 +468,9 @@ ALL_PIDS=("${PRODUCER_PIDS[@]}" "$CONSUMER_PID")
 abort_all() {
     local why="$1"
     echo "[main] FATAL: $why" >&2
-    # Best-effort kill local children
-    for p in "${ALL_PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
-    # Hard stop the allocation/steps
+    # Best-effort kill local children (try process group first, then PID)
+    for p in "${ALL_PIDS[@]}"; do kill -TERM "-$p" 2>/dev/null || kill "$p" 2>/dev/null || true; done
+    # Hard stop the allocation/steps (this is the real hammer)
     scancel "$SLURM_JOB_ID" 2>/dev/null || true
 }
 
@@ -496,7 +496,7 @@ while :; do
         fi
 
         # Exited -> reap exactly once and capture rc
-        if wait "$p"; then
+        if wait "$p" 2>/dev/null; then
             rc=0
         else
             rc=$?
@@ -504,6 +504,14 @@ while :; do
         REAPED[$p]=1
 
         role="${PID_ROLE[$p]:-unknown}"
+
+        # Handle rc=127 ("not a child of this shell" / already reaped)
+        # This can happen in edge cases even with REAPED tracking
+        if (( rc == 127 )); then
+            echo "[main] WARN: $role PID $p not waitable (rc=127); treating as already reaped" >&2
+            rc=0
+        fi
+
         echo "[main] $role finished (PID $p) rc=$rc"
 
         if (( rc != 0 )); then
