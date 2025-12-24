@@ -78,10 +78,12 @@ workspace-host := justfile_directory() / workspace
 test-tar-shards-host := env("TEST_TAR_SHARDS", "/path/to/test_tar_shards")
 pmc-oa-host          := env("PMC_OA_DIR",      "/path/to/PMC-OA")
 
-# Secrets/LLM
-openai-api-key := env("OPENAI_API_KEY")
-openai-base-url := env("OPENAI_BASE_URL", "")
-llm-model := env("LLM_MODEL", "o3")
+# Secrets/LLM (hosted LLM API defaults)
+openai-api-key := env("OPENAI_API_KEY", "")
+openai-base-url := env("OPENAI_BASE_URL", "https://llm.example.com")
+llm-model := env("LLM_MODEL", "gpt-oss-120b")
+ssl-cert-file := env("SSL_CERT_FILE", "/etc/ssl/certs/ca-bundle.crt")
+llm-api-key-file := env("LLM_API_KEY_FILE", "~/.llm_api_key")
 default-query  := "What is the role of follicular dendritic cells (FDCs) in HIV dynamics under antiretroviral therapy?"
 
 help:
@@ -259,15 +261,31 @@ ask-nollm +query=default-query:
 
 # ======================== Query from file (with diagnostics) ========================
 # Reads question from workspace/question.txt by default
+# Auto-loads API key from ~/.llm_api_key if OPENAI_API_KEY is not set
 ask-file file="question.txt":
 	#!/usr/bin/env bash
 	set -euo pipefail
 	
+	# Auto-load API key from key file if not already set
+	keyfile="{{ llm-api-key-file }}"
+	keyfile="${keyfile/#\~/$HOME}"  # expand ~
+	if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+	    if [[ -f "$keyfile" ]]; then
+	        OPENAI_API_KEY="$(head -n1 "$keyfile" | tr -d '[:space:]')"
+	        export OPENAI_API_KEY
+	        echo "[info] Loaded API key from $keyfile"
+	    fi
+	fi
+	
 	# Check for API key
 	if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-	    echo "ERROR: OPENAI_API_KEY not set"
+	    echo "ERROR: OPENAI_API_KEY not set and no key file found"
 	    echo ""
-	    echo "To set from a key file:"
+	    echo "Option 1 - Create a key file:"
+	    echo "  echo 'your-api-key' > ~/.llm_api_key && chmod 600 ~/.llm_api_key"
+	    echo "  just ask-file"
+	    echo ""
+	    echo "Option 2 - Set environment variable:"
 	    echo "  export OPENAI_API_KEY=\"\$(cat ~/.llm_api_key)\""
 	    echo "  just ask-file"
 	    exit 1
@@ -278,11 +296,19 @@ ask-file file="question.txt":
 	
 	echo "=== DIAGNOSTIC INFO ==="
 	echo "Model:    {{ llm-model }}"
-	echo "          (override: LLM_MODEL=gpt-4o just ask-file)"
+	echo "          (override: LLM_MODEL=gpt-oss-20b just ask-file)"
+	echo "          (list available: curl -sH \"Authorization: Bearer \$OPENAI_API_KEY\" {{ openai-base-url }}/models | jq -r '.data[].id')"
+	echo ""
 	echo "Endpoint: {{ openai-base-url }}"
 	echo "          (override: OPENAI_BASE_URL=https://api.openai.com/v1 just ask-file)"
+	echo ""
 	echo "API key:  set (${#OPENAI_API_KEY} chars)"
-	echo "          (override: OPENAI_API_KEY=\"\$(cat ~/.llm_api_key)\" just ask-file)"
+	echo "          (override: OPENAI_API_KEY=... just ask-file)"
+	echo "          (key file: {{ llm-api-key-file }})"
+	echo ""
+	echo "SSL cert: {{ ssl-cert-file }}"
+	echo "          (override: SSL_CERT_FILE=/path/to/cert just ask-file)"
+	echo ""
 	echo "Question: $qfile"
 	echo "          (override: just ask-file file=other.txt)"
 	echo "========================"
