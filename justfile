@@ -294,6 +294,16 @@ ask-file file="question.txt":
 	qfile="{{ workspace-host }}/{{ file }}"
 	[ -f "$qfile" ] || { echo "ERROR: $qfile not found"; exit 1; }
 	
+	# Helper function for human-readable file sizes
+	filesize() {
+	    local f="$1"
+	    if [[ -f "$f" ]]; then
+	        du -sh "$f" 2>/dev/null | cut -f1 || stat -f%z "$f" 2>/dev/null || echo "?"
+	    else
+	        echo "(not found)"
+	    fi
+	}
+	
 	echo "=== DIAGNOSTIC INFO ==="
 	echo "Model:    {{ llm-model }}"
 	echo "          (override: LLM_MODEL=gpt-oss-20b just ask-file)"
@@ -311,6 +321,11 @@ ask-file file="question.txt":
 	echo ""
 	echo "Question: $qfile"
 	echo "          (override: just ask-file file=other.txt)"
+	echo ""
+	echo "Vector store:"
+	echo "  Papers index: {{ workspace-host }}/indices/faiss.papers ($(filesize "{{ workspace-host }}/indices/faiss.papers"))"
+	echo "  Chunks index: {{ workspace-host }}/indices/faiss.chunks ($(filesize "{{ workspace-host }}/indices/faiss.chunks"))"
+	echo "  SQLite DB:    {{ workspace-host }}/sqlite/litkit.sqlite3 ($(filesize "{{ workspace-host }}/sqlite/litkit.sqlite3"))"
 	echo "========================"
 	echo ""
 	
