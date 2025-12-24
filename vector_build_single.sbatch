@@ -86,6 +86,11 @@ fi
 # Debug mode for parallelism verification (set to 0 for quiet production runs)
 : "${LITKIT_DEBUG:=1}"
 
+# Local staging: use node-local SSD to avoid NFS metadata storm (see BOTTLENECK.md)
+: "${LOCAL_SSD:=/local/scratch}"
+: "${USE_LOCAL_STAGING:=1}"                  # 1 = stage to local SSD, rsync back at end
+: "${LOCAL_SSD_MIN_FREE_GB:=50}"             # Minimum free space required
+
 # Role flags
 : "${FAISS_WRITER:=1}"
 : "${EMBED_PRODUCER:=0}"
@@ -236,7 +241,50 @@ if [[ ! -f "$CDI_SPEC_DIR/nvidia.json" ]]; then
 fi
 nvidia-ctk cdi list --spec-dir="$CDI_SPEC_DIR" || true
 
+### ----- LOCAL STAGING SETUP --------------------------------------------------
+ACTUAL_USE_LOCAL_STAGING="$USE_LOCAL_STAGING"
+LOCAL_STAGE_DIR=""
+
+if [[ "$ACTUAL_USE_LOCAL_STAGING" == "1" ]]; then
+    echo "[staging] Checking local SSD at $LOCAL_SSD..."
+    
+    if [[ ! -d "$LOCAL_SSD" ]]; then
+        echo "[staging] WARN: LOCAL_SSD missing ($LOCAL_SSD); falling back to NFS" >&2
+        ACTUAL_USE_LOCAL_STAGING="0"
+    elif ! mountpoint -q "$LOCAL_SSD" 2>/dev/null; then
+        echo "[staging] WARN: LOCAL_SSD not a mountpoint ($LOCAL_SSD); falling back to NFS" >&2
+        ACTUAL_USE_LOCAL_STAGING="0"
+    else
+        # Check free space
+        free_gb="$(df -BG "$LOCAL_SSD" 2>/dev/null | awk 'NR==2{gsub(/G/,"",$4); print $4}' || echo 0)"
+        if [[ ! "$free_gb" =~ ^[0-9]+$ ]]; then free_gb=0; fi
+        
+        if (( free_gb < LOCAL_SSD_MIN_FREE_GB )); then
+            echo "[staging] WARN: LOCAL_SSD has ${free_gb}GB free (< ${LOCAL_SSD_MIN_FREE_GB}GB required); falling back to NFS" >&2
+            ACTUAL_USE_LOCAL_STAGING="0"
+        else
+            LOCAL_STAGE_DIR="${LOCAL_SSD}/litkit_${SLURM_JOB_ID:-$$}"
+            echo "[staging] LOCAL_SSD validated: ${free_gb}GB free"
+            echo "[staging] Using local staging: $LOCAL_STAGE_DIR"
+            mkdir -p "$LOCAL_STAGE_DIR/sqlite" "$LOCAL_STAGE_DIR/indices" "$LOCAL_STAGE_DIR/emb_segments"
+        fi
+    fi
+fi
+
+if [[ "$ACTUAL_USE_LOCAL_STAGING" == "1" ]]; then
+    echo "[staging] Build will write to local SSD, rsync to NFS at end"
+else
+    echo "[staging] Build will write directly to NFS"
+fi
+
 ### ----- COMMON ch-run ARGS ---------------------------------------------------
+# Determine container workspace based on staging mode
+if [[ "$ACTUAL_USE_LOCAL_STAGING" == "1" ]]; then
+    CONTAINER_WS="/local_stage"
+else
+    CONTAINER_WS="/workspace"
+fi
+
 CHR=(
   "$CHRUN"
   --unset-env='*'
@@ -249,11 +297,16 @@ CHR=(
   --bind "$WORKSPACE:/workspace"
   --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB"
   --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-  --set-env="LITKIT_WORKSPACE=/workspace"
+  --set-env="LITKIT_WORKSPACE=$CONTAINER_WS"
   --set-env="HF_HOME=/app/hf_cache"
   --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1"
   --set-env="LITKIT_DEBUG=${LITKIT_DEBUG}"
 )
+
+# Bind local staging directory if enabled
+if [[ "$ACTUAL_USE_LOCAL_STAGING" == "1" ]]; then
+    CHR+=( --bind "$LOCAL_STAGE_DIR:/local_stage" )
+fi
 
 # Use manifest to find tar shards
 if [[ -n "${MANIFEST}" ]]; then
@@ -406,4 +459,30 @@ rm -f "${WORKSPACE:-$LITKIT_WORKSPACE}/.writer_guard" 2>/dev/null || true
 ### ----- RUN BUILD ------------------------------------------------------------
 echo "[info] Starting build in Charliecloud..."
 "${CHR[@]}" "$IMG" -- litkit "${LITKIT_ARGS[@]}"
+BUILD_RC=$?
+
+### ----- RSYNC BACK TO NFS (if local staging) ---------------------------------
+if [[ "$ACTUAL_USE_LOCAL_STAGING" == "1" ]]; then
+    if [[ "$BUILD_RC" -eq 0 ]]; then
+        echo "[staging] Build succeeded; syncing local outputs -> NFS"
+        rsync_ver="$(/usr/bin/rsync --version 2>/dev/null | head -1 || true)"
+        echo "[staging] rsync version: ${rsync_ver:-unknown}"
+        
+        # Sync SQLite, indices, and segments
+        /usr/bin/rsync -a --delay-updates "$LOCAL_STAGE_DIR/sqlite/" "$WORKSPACE/sqlite/" 2>/dev/null || true
+        /usr/bin/rsync -a --delay-updates "$LOCAL_STAGE_DIR/indices/" "$WORKSPACE/indices/" 2>/dev/null || true
+        /usr/bin/rsync -a --delay-updates "$LOCAL_STAGE_DIR/emb_segments/" "$WORKSPACE/emb_segments/" 2>/dev/null || true
+        
+        echo "[staging] Cleanup local staging dir"
+        rm -rf "$LOCAL_STAGE_DIR"
+    else
+        echo "[staging] Build failed (rc=$BUILD_RC); preserving local staging dir for debugging: $LOCAL_STAGE_DIR" >&2
+    fi
+fi
+
+if [[ "$BUILD_RC" -ne 0 ]]; then
+    echo "[error] Build failed with exit code $BUILD_RC" >&2
+    exit "$BUILD_RC"
+fi
+
 echo "[done] Vector store build completed."
