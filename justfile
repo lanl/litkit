@@ -51,7 +51,7 @@ set shell := ['bash', '-l', '-c']
 # ---- Paths & tags ----
 arch := env("ARCH", "aarch64")
 flavor := env("FLAVOR", "lean")           # fat | lean
-tag := "v0.3.34-" + arch + "-" + flavor
+tag := "v0.3.35-" + arch + "-" + flavor
 name := "litkit"
 sqfs-path := "./sqfs" / name + "-" + tag + ".sqfs"
 
@@ -78,11 +78,20 @@ workspace-host := justfile_directory() / workspace
 test-tar-shards-host := env("TEST_TAR_SHARDS", "/path/to/test_tar_shards")
 pmc-oa-host          := env("PMC_OA_DIR",      "/path/to/PMC-OA")
 
-# Secrets/LLM
-openai-api-key := env("OPENAI_API_KEY")
-openai-base-url := env("OPENAI_BASE_URL", "")
-llm-model := env("LLM_MODEL", "o3")
+# Secrets/LLM (hosted LLM API defaults)
+openai-api-key := env("OPENAI_API_KEY", "")
+openai-base-url := env("OPENAI_BASE_URL", "https://llm.example.com")
+llm-model := env("LLM_MODEL", "gpt-oss-120b")
+ssl-cert-file := env("SSL_CERT_FILE", "/etc/ssl/certs/ca-bundle.crt")
+llm-api-key-file := env("LLM_API_KEY_FILE", "~/.llm_api_key")
 default-query  := "What is the role of follicular dendritic cells (FDCs) in HIV dynamics under antiretroviral therapy?"
+
+# CUDA/GPU bindings (V100 defaults; override for GH200)
+cdi-spec-dir := env("CDI_SPEC_DIR", "/path/to/cdi-v100")
+cuda-base := env("CUDA_BASE", "/path/to/cuda-12.5-host/cuda-12.5")
+cuda-liba := env("CUDA_LIBA", cuda-base + "/targets/sbsa-linux/lib")
+cuda-libb := env("CUDA_LIBB", cuda-base + "/lib64")
+hf-cache-host := env("HF_CACHE_HOST", "/path/to/hf_cache_persist")
 
 help:
 	just -l -u
@@ -256,6 +265,152 @@ ask-nollm +query=default-query:
 	printf 'litkit --no-llm -- %q\n' "{{ query }}" > "{{ workspace-host }}/.ask_nollm.sh"
 	chmod +x "{{ workspace-host }}/.ask_nollm.sh"
 	just -f {{ justfile() }} run /workspace/.ask_nollm.sh
+
+# ======================== Query from file (with diagnostics) ========================
+# Reads question from workspace/question.txt by default
+# Auto-loads API key from ~/.llm_api_key if OPENAI_API_KEY is not set
+# Uses CUDA bindings for GPU-accelerated embedding
+ask-file file="question.txt":
+	#!/usr/bin/env bash
+	set -euo pipefail
+	
+	# Auto-load API key from key file if not already set
+	keyfile="{{ llm-api-key-file }}"
+	keyfile="${keyfile/#\~/$HOME}"  # expand ~
+	if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+	    if [[ -f "$keyfile" ]]; then
+	        OPENAI_API_KEY="$(head -n1 "$keyfile" | tr -d '[:space:]')"
+	        export OPENAI_API_KEY
+	        echo "[info] Loaded API key from $keyfile"
+	    fi
+	fi
+	
+	# Check for API key
+	if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+	    echo "ERROR: OPENAI_API_KEY not set and no key file found"
+	    echo ""
+	    echo "Option 1 - Create a key file:"
+	    echo "  echo 'your-api-key' > ~/.llm_api_key && chmod 600 ~/.llm_api_key"
+	    echo "  just ask-file"
+	    echo ""
+	    echo "Option 2 - Set environment variable:"
+	    echo "  export OPENAI_API_KEY=\"\$(cat ~/.llm_api_key)\""
+	    echo "  just ask-file"
+	    exit 1
+	fi
+	
+	qfile="{{ workspace-host }}/{{ file }}"
+	[ -f "$qfile" ] || { echo "ERROR: $qfile not found"; exit 1; }
+	
+	# Validate CUDA paths
+	cuda_ok=1
+	[[ -d "{{ cdi-spec-dir }}" ]] || { cuda_ok=0; echo "[warn] CDI spec dir not found: {{ cdi-spec-dir }}"; }
+	[[ -d "{{ cuda-liba }}" ]] || { cuda_ok=0; echo "[warn] CUDA lib dir A not found: {{ cuda-liba }}"; }
+	[[ -d "{{ cuda-libb }}" ]] || { cuda_ok=0; echo "[warn] CUDA lib dir B not found: {{ cuda-libb }}"; }
+	
+	# Helper function for human-readable file sizes
+	filesize() {
+	    local f="$1"
+	    if [[ -f "$f" ]]; then
+	        du -sh "$f" 2>/dev/null | cut -f1 || stat -f%z "$f" 2>/dev/null || echo "?"
+	    else
+	        echo "(not found)"
+	    fi
+	}
+	
+	echo "=== DIAGNOSTIC INFO ==="
+	echo "Model:    {{ llm-model }}"
+	echo "          (override: LLM_MODEL=gpt-oss-20b just ask-file)"
+	echo "          (list available: curl -sH \"Authorization: Bearer \$OPENAI_API_KEY\" {{ openai-base-url }}/models | jq -r '.data[].id')"
+	echo ""
+	echo "Endpoint: {{ openai-base-url }}"
+	echo "          (override: OPENAI_BASE_URL=https://api.openai.com/v1 just ask-file)"
+	echo ""
+	echo "API key:  set (${#OPENAI_API_KEY} chars)"
+	echo "          (override: OPENAI_API_KEY=... just ask-file)"
+	echo "          (key file: {{ llm-api-key-file }})"
+	echo ""
+	echo "SSL cert: {{ ssl-cert-file }}"
+	echo "          (override: SSL_CERT_FILE=/path/to/cert just ask-file)"
+	echo ""
+	echo "Question: $qfile"
+	echo "          (override: just ask-file file=other.txt)"
+	echo ""
+	echo "Vector store:"
+	echo "  Papers index: {{ workspace-host }}/indices/papers.faiss ($(filesize "{{ workspace-host }}/indices/papers.faiss"))"
+	echo "  Chunks index: {{ workspace-host }}/indices/chunks.faiss ($(filesize "{{ workspace-host }}/indices/chunks.faiss"))"
+	echo "  SQLite DB:    {{ workspace-host }}/sqlite/litkit.sqlite3 ($(filesize "{{ workspace-host }}/sqlite/litkit.sqlite3"))"
+	echo ""
+	echo "CUDA/GPU:"
+	echo "  CDI spec dir: {{ cdi-spec-dir }} $([[ -d '{{ cdi-spec-dir }}' ]] && echo '✓' || echo '✗')"
+	echo "          (override: CDI_SPEC_DIR=/path/to/cdi-grace just ask-file)"
+	echo "  CUDA base:    {{ cuda-base }} $([[ -d '{{ cuda-base }}' ]] && echo '✓' || echo '✗')"
+	echo "          (override: CUDA_BASE=/path/to/cuda-12.5 just ask-file)"
+	echo "  CUDA lib A:   {{ cuda-liba }} $([[ -d '{{ cuda-liba }}' ]] && echo '✓' || echo '✗')"
+	echo "  CUDA lib B:   {{ cuda-libb }} $([[ -d '{{ cuda-libb }}' ]] && echo '✓' || echo '✗')"
+	echo "  HF cache:     {{ hf-cache-host }} $([[ -d '{{ hf-cache-host }}' ]] && echo '✓' || echo '✗')"
+	echo "========================"
+	echo ""
+	
+	if [[ $cuda_ok -eq 0 ]]; then
+	    echo "ERROR: CUDA paths not valid. Are you on a GPU node?"
+	    echo ""
+	    echo "For V100 (gpu-v100 partition):"
+	    echo "  CDI_SPEC_DIR=/path/to/cdi-v100 just ask-file"
+	    echo ""
+	    echo "For GH200 (gpu-gh200 partition):"
+	    echo "  CDI_SPEC_DIR=/path/to/cdi-grace just ask-file"
+	    exit 1
+	fi
+	
+	# Check image exists
+	[ -f "{{ sqfs-path }}" ] || { echo "ERROR: image not found: {{ sqfs-path }}. Run 'just build' or 'just release'."; exit 1; }
+	
+	# Ensure ch-run is available
+	if ! command -v ch-run >/dev/null 2>&1; then
+	  if [ -x "{{ charlie-bin }}/ch-run" ]; then
+	    export PATH="{{ charlie-bin }}:$PATH"
+	  else
+	    module --ignore_cache load charliecloud >/dev/null 2>&1 || true
+	  fi
+	fi
+	command -v ch-run >/dev/null 2>&1 || { echo "ERROR: ch-run not found in PATH=${PATH}"; exit 1; }
+	
+	# Create workspace dirs
+	mkdir -p "{{ workspace-host }}" "{{ sqlite-dir }}" "{{ indices-dir }}"
+	mkdir -p "{{ hf-cache-host }}"
+	
+	# Run with CUDA bindings
+	ch-run "{{ sqfs-path }}" \
+	  --unset-env='*' \
+	  --cdi-dirs="{{ cdi-spec-dir }}" \
+	  --cdi=nvidia.com/gpu=all \
+	  --bind "{{ cuda-liba }}:{{ cuda-liba }}" \
+	  --bind "{{ cuda-libb }}:{{ cuda-libb }}" \
+	  --bind "{{ workspace-host }}:/workspace" \
+	  --bind "{{ hf-cache-host }}:/app/hf_cache" \
+	  --bind "{{ test-tar-shards-host }}:/data/test_tar_shards" \
+	  --bind "{{ pmc-oa-host }}:/data/pmc_oa" \
+	  --bind "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem:/workspace/host-ca.pem" \
+	  --set-env="LD_LIBRARY_PATH={{ cuda-liba }}:{{ cuda-libb }}" \
+	  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+	  --set-env="HOME=/workspace" \
+	  --set-env="OPENAI_API_KEY=${OPENAI_API_KEY}" \
+	  --set-env="OPENAI_BASE_URL={{ openai-base-url }}" \
+	  --set-env="LITKIT_OPENAI_TIMEOUT_SEC={{ env("LITKIT_OPENAI_TIMEOUT_SEC", "600") }}" \
+	  --set-env="SSL_CERT_FILE=/workspace/host-ca.pem" \
+	  --set-env="REQUESTS_CA_BUNDLE=/workspace/host-ca.pem" \
+	  --set-env="CURL_CA_BUNDLE=/workspace/host-ca.pem" \
+	  --set-env="HF_HOME=/app/hf_cache" \
+	  --set-env="HF_HUB_OFFLINE=1" \
+	  --set-env="TRANSFORMERS_OFFLINE=1" \
+	  --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
+	  --set-env="LITKIT_WORKSPACE=/workspace" \
+	  --set-env="TOKENIZERS_PARALLELISM=false" \
+	  --set-env="LC_ALL=C.UTF-8" \
+	  --set-env="LANG=C.UTF-8" \
+	  --cd /workspace -- \
+	  litkit --llm-model={{ llm-model }} --question-file "/workspace/{{ file }}"
 
 # ======================== Shell ========================
 shell:

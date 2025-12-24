@@ -1,19 +1,46 @@
 # src/litkit/cli.py
+# ═══════════════════════════════════════════════════════════════════════════════
+# CRITICAL: macOS FAISS threading fix MUST come BEFORE any other imports
+# ═══════════════════════════════════════════════════════════════════════════════
+# On macOS, FAISS + MPS threading causes segfaults. The env vars must be set
+# BEFORE any C extension (faiss, numpy, torch) is loaded because OpenMP
+# initializes its thread pool at library load time.
+#
+# This block must stay at the absolute top of this file.
+# ═══════════════════════════════════════════════════════════════════════════════
+import os as _os
+import sys as _sys
+if _sys.platform == "darwin":
+    _os.environ.setdefault("FAISS_NUM_THREADS", "1")
+    _os.environ.setdefault("OMP_NUM_THREADS", "1")
+# ═══════════════════════════════════════════════════════════════════════════════
+
+"""Litkit CLI entrypoint.
+
+This module provides the command-line interface for litkit, including:
+- Build/index management (--rebuild, --update, --build-only)
+- Two-stage RAG retrieval (paper shortlisting + chunk search)
+- LLM-powered question answering
+
+Business logic is delegated to well-organized submodules:
+- litkit.db: SQLite operations
+- litkit.index: FAISS index operations  
+- litkit.build: Build pipeline orchestration
+- litkit.retrieval: RAG retrieval pipeline
+- litkit.segments: Embedding segment I/O
+- litkit.ingest: Tar/XML parsing
+"""
 
 import os
 import sys
-
-if sys.version_info < (3,10):
-    sys.stderr.write("[env] Python >= 3.10 required.\n")
-    sys.exit(2)
 
 from . import __version__ as LITKIT_VERSION
 
 # -------- simple early quieting (env), used before argparse exists ----------
 # Set LITKIT_QUIET=1 to squelch startup banners that print before args are parsed.
-QUIET = os.environ.get("LITKIT_QUIET", "0") == "1"
-# Suppress early banners for --version/--help
-_SUPPRESS_EARLY = any(x in sys.argv for x in ("--version", "-h", "--help"))
+# NOTE: Do not use a frozen QUIET variable here - use is_quiet() from progress.py
+# which checks os.environ on each call for consistent behavior after --quiet is parsed.
+# For --version/--help, argparse exits before any printing, so no special handling needed.
 
 
 def _version_banner() -> str:
@@ -25,23 +52,11 @@ def _version_banner() -> str:
 
 
 # -------------------- Standard library imports --------------------
+# Only imports needed BEFORE argparse runs (for --help/--version) are at module level.
+# Other stdlib imports are deferred to their use sites to minimize import-time side effects.
 import argparse
-import atexit
-import errno
-import hashlib
-import json
-import logging
-import math
-import random
-import re
-import signal
-import socket
-import sqlite3
 import threading
-import time
-import unicodedata
 from pathlib import Path
-from contextlib import contextmanager, nullcontext
 from typing import Iterator
 
 
@@ -49,203 +64,618 @@ from typing import Iterator
 # from lxml import etree
 from types import SimpleNamespace
 
-from litkit.embeddings.base import (
-    _PROGRESS_LOCK as _PROGRESS_LOCK,  # reuse the shared lock
+# ═══════════════════════════════════════════════════════════════════════════════
+# IMPORT STRATEGY: Stdlib + lightweight only at module level
+# ═══════════════════════════════════════════════════════════════════════════════
+# 
+# Module-level imports must NOT pull in faiss, numpy, torch, lxml, transformers.
+# This ensures `python -m litkit --help` and `python -m litkit --version` work
+# even if heavy dependencies are missing.
+#
+# Heavy imports are deferred to:
+#   1. main() - after argparse runs (most imports)
+#   2. Function scope - for thin wrappers and build_or_update_indices
+#
+# What CAN stay at module level:
+#   - stdlib (os, sys, pathlib, typing, argparse, etc.)
+#   - litkit.progress (pure Python, no heavy deps)
+#   - litkit.concurrent (pure Python, uses fcntl which is stdlib)
+#   - litkit.config.paths (pure Python)
+#   - TYPE_CHECKING blocks for type hints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from typing import TYPE_CHECKING
+
+from litkit.progress import (
+    eprint as _eprint,
 )
-from litkit.embeddings.base import (
-    Embedder,  # protocol for type hints
-)
-from litkit.embeddings.base import (
-    progress_is_append as _progress_is_append,
-)
-from litkit.embeddings.base import (
-    progress_newline as _progress_newline,
-)
-from litkit.embeddings.base import (
-    progress_write as _progress_write,
-)
-from litkit.embeddings.devices import configure_threads, detect_device
-from litkit.embeddings.factory import make_chunk_embedder, make_paper_embedder
-from litkit.formatting.answers import (
-    normalize_answer_and_build_refs,
-    render_references,
-)
-from litkit.frontload.cap import cap_chunks_per_paper
-from litkit.ingest.ingest import (
-    ArticleMeta,
-    TarMemberMeta,
-    count_tar_xml_members,
-    iter_tar_paths,
-    iter_tar_xml_streams,
-    pack_paragraphs as ingest_pack_paragraphs,
-    parallel_iter_tar_articles,
-    parse_xml_fileobj,
+from litkit.concurrent import (
+    FileLock as _FileLockBase,
+    FLOCK_AVAILABLE,
 )
 
+# Type hints only - not imported at runtime
+if TYPE_CHECKING:
+    from litkit.embeddings.base import Embedder
+    from litkit.ingest.ingest import ArticleMeta, TarMemberMeta
+# Heavy imports (litkit.db, litkit.segments, litkit.embeddings.*, litkit.ingest.*)
+# are deferred via _load_heavy_deps(). This function is idempotent and must be
+# called at the top of any function that uses these dependencies.
 
-_FAISS_LOCK_DEPTH = threading.local()
-
-def _faiss_lock_enter():
-    _FAISS_LOCK_DEPTH.n = getattr(_FAISS_LOCK_DEPTH, "n", 0) + 1
-
-def _faiss_lock_exit():
-    _FAISS_LOCK_DEPTH.n = max(0, getattr(_FAISS_LOCK_DEPTH, "n", 0) - 1)
-
-def _in_faiss_lock() -> bool:
-    return getattr(_FAISS_LOCK_DEPTH, "n", 0) > 0
-
-_DB_LOCK_DEPTH = threading.local()
-
-def _db_lock_enter():  _DB_LOCK_DEPTH.n = getattr(_DB_LOCK_DEPTH, "n", 0) + 1
-def _db_lock_exit():   _DB_LOCK_DEPTH.n = max(0, getattr(_DB_LOCK_DEPTH, "n", 0) - 1)
-def _in_db_lock() -> bool: return getattr(_DB_LOCK_DEPTH, "n", 0) > 0
+_heavy_lock = threading.Lock()
+_deps: SimpleNamespace | None = None  # Populated by _load_heavy_deps()
 
 
-def _eprint(msg: str = "", *, end: str = "\n") -> None:
-    sys.stderr.write(msg + end)
+def _load_internal_modules() -> SimpleNamespace:
+    """Load heavy litkit internal modules (db, segments, embeddings, etc).
+    
+    This imports modules that are part of litkit itself and always succeed
+    if litkit is installed correctly. These pull in torch, transformers,
+    lxml, numpy etc. which is why they're deferred.
+    
+    Separate from _probe_faiss() to make failure modes clear:
+    - Internal module import failure = broken litkit install
+    - FAISS probe failure = optional dependency missing
+    
+    Returns:
+        SimpleNamespace with all imported functions/classes.
+    """
+    from litkit.embeddings.devices import configure_threads, detect_device
+    from litkit.embeddings.factory import make_chunk_embedder, make_paper_embedder
+    from litkit.formatting.answers import normalize_answer_and_build_refs, render_references
+    from litkit.ingest.ingest import (
+        iter_tar_paths,
+        iter_tar_xml_streams,
+        parallel_iter_tar_articles,
+        parse_xml_fileobj,
+    )
+    from litkit.ingest import is_uncompressed_tar, shard_filter
+    from litkit.db import (
+        init_db as db_init_db,
+        init_shard_db as db_init_shard_db,
+        connect_db as db_connect_db,
+        shard_db_path as db_shard_db_path,
+        chunk_ids_to_paper_ids as db_chunk_ids_to_paper_ids,
+        flush_pending_marks as db_flush_pending_marks,
+        load_temp_candidates as db_load_temp_candidates,
+    )
+    from litkit.segments import (
+        validate_shard_consistency as seg_validate_shard_consistency,
+        write_build_meta as seg_write_build_meta,
+        read_build_meta as seg_read_build_meta,
+        has_segment_files as seg_has_segment_files,
+        SegmentWriter,
+        ChunkSegmentWriter,
+        ProducerCoordinator as SegProducerCoordinator,
+        ConsumerCoordinator as SegConsumerCoordinator,
+        ingest_paper_segments as seg_ingest_paper_segments,
+        ingest_chunk_segments as seg_ingest_chunk_segments,
+    )
+    
+    return SimpleNamespace(
+        # Embeddings
+        configure_threads=configure_threads,
+        detect_device=detect_device,
+        make_paper_embedder=make_paper_embedder,
+        make_chunk_embedder=make_chunk_embedder,
+        # Formatting
+        normalize_answer_and_build_refs=normalize_answer_and_build_refs,
+        render_references=render_references,
+        # Ingest
+        iter_tar_paths=iter_tar_paths,
+        iter_tar_xml_streams=iter_tar_xml_streams,
+        parallel_iter_tar_articles=parallel_iter_tar_articles,
+        parse_xml_fileobj=parse_xml_fileobj,
+        is_uncompressed_tar=is_uncompressed_tar,
+        shard_filter=shard_filter,
+        # DB
+        db_init_db=db_init_db,
+        db_init_shard_db=db_init_shard_db,
+        db_connect_db=db_connect_db,
+        db_shard_db_path=db_shard_db_path,
+        db_chunk_ids_to_paper_ids=db_chunk_ids_to_paper_ids,
+        db_flush_pending_marks=db_flush_pending_marks,
+        db_load_temp_candidates=db_load_temp_candidates,
+        # Segments
+        seg_validate_shard_consistency=seg_validate_shard_consistency,
+        seg_write_build_meta=seg_write_build_meta,
+        seg_read_build_meta=seg_read_build_meta,
+        seg_has_segment_files=seg_has_segment_files,
+        SegmentWriter=SegmentWriter,
+        ChunkSegmentWriter=ChunkSegmentWriter,
+        SegProducerCoordinator=SegProducerCoordinator,
+        SegConsumerCoordinator=SegConsumerCoordinator,
+        seg_ingest_paper_segments=seg_ingest_paper_segments,
+        seg_ingest_chunk_segments=seg_ingest_chunk_segments,
+    )
+
+
+def _probe_faiss() -> bool:
+    """Probe FAISS availability and configure if present.
+    
+    Returns True if faiss is importable and usable, False otherwise.
+    
+    Side effects (if available):
+    - Sets faiss.cvar.seed for reproducible IVF training
+    
+    This is separate from _load_internal_modules() because:
+    1. FAISS is optional for some operations (--help, early validation)
+    2. Failure here != broken install, just missing optional dep
+    3. Makes it easy to add more optional probes (torch version, cuda, etc.)
+    
+    Does NOT raise on missing faiss - caller uses _require_faiss() for that.
+    """
+    # IMPORTANT: Only catch ImportError (missing faiss), NOT other exceptions.
+    # A broken faiss install should fail fast, not be silently ignored.
     try:
-        sys.stderr.flush()
-    except Exception:
-        pass
+        import faiss
+        try:
+            faiss.cvar.seed = int(os.environ.get("LITKIT_FAISS_SEED", "123456"))
+        except AttributeError:
+            pass  # faiss.cvar.seed not available in this build (e.g., macOS faiss-cpu)
+        return True
+    except ImportError:
+        return False  # Will fail fast via _require_faiss() when actually needed
 
 
-# fcntl is not available on Windows
-try:
-    import fcntl
+def _load_heavy_deps() -> None:
+    """Idempotent, thread-safe loader for heavy dependencies.
+    
+    Orchestrates loading of:
+    1. Internal litkit modules (db, segments, embeddings, etc.) via _load_internal_modules()
+    2. Optional third-party deps probe (FAISS) via _probe_faiss()
+    
+    Must be called at the top of any function that uses:
+    - litkit.embeddings.* (torch, transformers)
+    - litkit.db.* (sqlite3 wrappers)
+    - litkit.segments.* (numpy)
+    - litkit.ingest.* (lxml)
+    - litkit.formatting.* (answer rendering)
+    
+    Safe to call multiple times from multiple threads; only loads once.
+    Uses double-checked locking to avoid races while minimizing lock contention.
+    
+    After loading, access dependencies via `_deps.name` (e.g., `_deps.db_connect_db`).
+    """
+    global _deps
+    if _deps is not None:
+        return
+    with _heavy_lock:
+        if _deps is not None:  # Double-check inside lock
+            return
+        
+        # Load internal litkit modules (always required for most operations)
+        modules = _load_internal_modules()
+        
+        # Probe optional third-party dependencies
+        faiss_available = _probe_faiss()
+        
+        # Reserved keys that _load_heavy_deps() sets explicitly (not from modules)
+        # If modules ever exports a conflicting name, we fail fast rather than
+        # silently overriding with zero warning.
+        reserved_keys = frozenset({"faiss_available"})
+        module_keys = set(vars(modules).keys())
+        collisions = reserved_keys & module_keys
+        if collisions:
+            raise RuntimeError(
+                f"_load_internal_modules() exported reserved key(s): {collisions}. "
+                "Rename in the module to avoid namespace collision with _load_heavy_deps()."
+            )
+        
+        # Consolidate into deps namespace (collision-safe after check above)
+        _deps = SimpleNamespace(
+            faiss_available=faiss_available,
+            **vars(modules),  # Merge all module exports
+        )
 
-    FLOCK_AVAILABLE = True
-except ModuleNotFoundError:
-    fcntl = None
-    FLOCK_AVAILABLE = False
+
 
 # logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
 
-def _effective_nlist(n_train: int, requested_nlist: int, min_nlist: int = 16, *, user_forced: bool=False) -> int:
-    if n_train <= 0:
-        return 0
+def deps() -> SimpleNamespace:
+    """Load heavy dependencies (idempotent) and return the deps namespace.
     
-    cap_by_data = min(requested_nlist, n_train)
-    cap_by_heuristic = min(n_train, max(1, int(4 * math.sqrt(n_train))))
-    dynamic_floor = 128 if (n_train >= 100_000 and not user_forced) else min_nlist
-    floor = min(n_train, max(1, dynamic_floor))
+    Use this instead of accessing _deps directly to ensure deps are loaded
+    and avoid NoneType crashes if someone forgets _load_heavy_deps().
     
-    return max(floor, min(cap_by_data, cap_by_heuristic))
+    Example:
+        d = deps()
+        conn = d.db_connect_db(...)
+    """
+    _load_heavy_deps()
+    assert _deps is not None, "_load_heavy_deps() failed to populate _deps"
+    return _deps
+
+
+def _require_faiss(context: str = "this operation") -> None:
+    """Fail fast if FAISS is not available.
+    
+    FAISS is required for build and retrieval operations:
+    - Build paths: creating/updating indices (--rebuild, --update, --build-only, etc.)
+    - Query paths: shortlist_papers(), search_chunks_constrained()
+    - Maintenance: --reconcile-only, --consume-only
+    
+    NOT required for: --help, --version, early validation errors, pure-SQLite queries.
+    
+    Call this early in any code path that touches FAISS indices.
+    """
+    d = deps()
+    if not d.faiss_available:
+        raise SystemExit(
+            f"[error] FAISS is required for {context}.\n"
+            "Install faiss-cpu or faiss-gpu:\n"
+            "  pip install faiss-cpu    # CPU-only\n"
+            "  pip install faiss-gpu    # CUDA-enabled"
+        )
 
 
 def _maybe_cleanup_own_stale_guard():
+    """Best-effort cleanup of a guard file left by THIS process.
+    
+    Only removes the guard if ALL three conditions match:
+    1. PID matches os.getpid()
+    2. Host matches socket.gethostname()
+    3. Timestamp is within a reasonable window (7 days)
+    
+    This handles the case where the same process tries to re-create
+    a guard (e.g., after a soft restart), but does NOT clean up
+    guards left by crashed processes - that's handled by TTL-based
+    stale detection in _create_writer_guard_or_exit.
+    
+    Why all three checks? On busy HPC clusters, PID reuse is not rare.
+    A stale guard from a dead process could have the same PID as the
+    current process (after kernel PID wraparound). Requiring host match
+    and recent timestamp greatly reduces false positives.
+    """
+    import socket
+    import time
+    
+    get_runtime()  # ensure WRITER_GUARD is bound
     try:
         if WRITER_GUARD.exists():
-            pid, host, ts = (WRITER_GUARD.read_text().split() + ["", "", "0"])[:3]
-            if pid.isdigit() and int(pid) == os.getpid():
+            # Parse guard file: PID HOST TIMESTAMP
+            parts = WRITER_GUARD.read_text().split()
+            if len(parts) < 3:
+                return  # malformed guard, don't touch
+            
+            pid_str, host, ts_str = parts[0], parts[1], parts[2]
+            
+            # Only cleanup if ALL three match "this process":
+            # 1. PID matches current process
+            # 2. Host matches current hostname (guards against PID reuse on different node)
+            # 3. Timestamp is within reasonable window (7 days = 604800 sec)
+            MAX_AGE_SEC = 604800  # 7 days
+            if (pid_str.isdigit() 
+                and int(pid_str) == os.getpid()
+                and host == socket.gethostname()
+                and ts_str.isdigit() 
+                and (time.time() - int(ts_str)) < MAX_AGE_SEC):
                 WRITER_GUARD.unlink(missing_ok=True)
     except Exception:
         pass
 
 
 def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
+    """Create a writer guard file or exit if another writer is active.
+    
+    Stdlib imports (atexit, errno, signal, socket, time) are deferred to this function
+    to minimize import-time side effects for --help/--version.
+    
+    Uses a bounded retry loop (max 2 attempts) to handle stale guard cleanup.
+    
+    DESIGN DECISIONS (cross-host TTL eviction & signal handling):
+    
+    1. Cross-host guard handling:
+       - On same host: we check PID liveness via os.kill(pid, 0) before evicting
+       - On different host: we REFUSE to auto-evict (cannot verify PID liveness)
+         * Exit with instructions to manually remove the guard: rm .writer_guard
+         * This prevents data corruption from evicting a legitimately running build
+       - TTL only applies to same-host scenarios where we can verify PID is dead
+       - Mitigations for stale cross-host guards:
+         * SLURM scripts should include `rm -f $WORKSPACE/.writer_guard` at job start
+         * Users can manually remove stale guards if certain the other job is dead
+       - Rationale: false eviction is catastrophic; manual intervention is safer
+    
+    2. Signal handler uses os._exit(1):
+       - On SIGINT/SIGTERM, we clean up the guard file then os._exit(1)
+       - This bypasses normal Python shutdown (atexit, finally, destructors)
+       - Risk: FAISS indices and SQLite may have unflushed data
+       - Why this is safe:
+         * reconcile_sqlite_flags_with_faiss() runs on EVERY faiss_writer startup
+         * backfill_unindexed_vectors() repairs any missing vectors
+         * Guard cleanup is CRITICAL: a leftover guard blocks all future runs
+         * Normal shutdown can deadlock if interrupted during a lock hold
+       - Accepted tradeoff: rely on reconcile+backfill vs. risk deadlock/blocked runs
+    """
+    # Deferred imports to minimize module-level side effects
+    import atexit
+    import errno
+    import signal
+    import socket
+    import time
+    
+    get_runtime()  # ensure WRITER_GUARD is bound
     _maybe_cleanup_own_stale_guard()
     if not getattr(args, "faiss_writer", False):
         return
     if ttl_sec is None:
-        ttl_sec = int(os.environ.get("LITKIT_WRITER_GUARD_TTL", "86400"))  # 24h default
+        try:
+            # Default TTL=0 (disabled) for safety in multi-host HPC environments.
+            # Cross-host TTL eviction cannot verify PID liveness, so auto-eviction
+            # risks evicting a legitimate long-running build (>24h jobs are common).
+            # Same-host: PID check via os.kill(pid, 0) still works regardless of TTL.
+            # Set LITKIT_WRITER_GUARD_TTL=86400 (or higher) to enable auto-eviction.
+            ttl_sec = int(os.environ.get("LITKIT_WRITER_GUARD_TTL", "0"))
+        except ValueError:
+            _eprint("[writer] WARNING: invalid LITKIT_WRITER_GUARD_TTL; using 0 (disabled)")
+            ttl_sec = 0
 
     def _cleanup_guard():
         try:
-            if os.path.exists(WRITER_GUARD):
-                os.remove(WRITER_GUARD)
+            WRITER_GUARD.unlink(missing_ok=True)
         except Exception:
             pass
 
-    try:
-        fd = os.open(WRITER_GUARD, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(
-            fd, f"{os.getpid()} {socket.gethostname()} {int(time.time())}\n".encode()
-        )
+    max_attempts = 2  # initial try + one retry after stale cleanup
+    for attempt in range(max_attempts):
         try:
-            os.fsync(fd)
-        except Exception:
-            pass
-        os.close(fd)
-        atexit.register(_cleanup_guard)
-        try:
-            if threading.current_thread() is threading.main_thread():
-                # ensure guard is removed, then hard-exit the process safely
-                signal.signal(signal.SIGINT,  lambda *_: (_cleanup_guard(), os._exit(1)))
-                signal.signal(signal.SIGTERM, lambda *_: (_cleanup_guard(), os._exit(1)))
-        except Exception:
-            pass
-    except FileExistsError:
-        info = "unknown"
-        try:
-            info = Path(WRITER_GUARD).read_text().strip()
-            parts = info.split()
-            # ts = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
-            ts = 0
-            if len(parts) >= 3:
-                try: ts = int(parts[2])
-                except ValueError: ts = 0
-            if ts and (time.time() - ts) > ttl_sec:
-                _eprint(f"[writer] Guard appears stale (> {ttl_sec}s): {info}. Attempting exclusive cleanup.")
-                try:
-                    stale = WRITER_GUARD.with_suffix(".guard.stale."+str(os.getpid()))
-                    # Atomic claim: if this replace fails, someone else is cleaning.
-                    os.replace(WRITER_GUARD, stale)
-                    stale.unlink(missing_ok=False)
-                    # success: retry once non-recursively
-                    return _create_writer_guard_or_exit(args, ttl_sec=ttl_sec)
-                except Exception as e:
-                    _eprint(f"[writer] ERROR: failed to remove guard: {e}.")
+            # Use os.fspath() for explicit Path→str conversion (consistent with other os.* calls)
+            fd = os.open(os.fspath(WRITER_GUARD), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(
+                fd, f"{os.getpid()} {socket.gethostname()} {int(time.time())}\n".encode()
+            )
+            try:
+                os.fsync(fd)
+            except Exception:
+                pass
+            os.close(fd)
+            atexit.register(_cleanup_guard)
+            try:
+                if threading.current_thread() is threading.main_thread():
+                    # ═══════════════════════════════════════════════════════════════
+                    # SIGNAL HANDLER SCOPE: ENTIRE WRITER SESSION
+                    # ═══════════════════════════════════════════════════════════════
+                    # This handler is installed for the ENTIRE --faiss-writer session,
+                    # not just critical regions. Any SIGINT/SIGTERM during writer mode
+                    # will hard-exit and rely on reconcile+backfill to repair partial
+                    # state on next startup. This is intentional and documented.
+                    #
+                    # Non-writer roles (--embed-producer, query-only) do NOT get this
+                    # handler - they use normal Python shutdown.
+                    # ═══════════════════════════════════════════════════════════════
+                    
+                    # HARD KILL on SIGINT/SIGTERM: clean up guard file, then os._exit(1).
+                    #
+                    # WHY os._exit(1) instead of sys.exit():
+                    # 1. Avoids deadlock if interrupted while holding FileLock (flock is not reentrant)
+                    # 2. Avoids partial writes from half-executed finally/atexit handlers
+                    # 3. Guard cleanup is CRITICAL: leftover guard blocks ALL future runs
+                    #
+                    # WHY this is SAFE despite bypassing normal shutdown:
+                    # 1. FAISS saves are ATOMIC (see litkit/index/io.py):
+                    #    - write to .tmp, fsync, os.replace, fsync dir
+                    #    - index file is either fully old or fully new, never corrupt
+                    # 2. reconcile_sqlite_flags_with_faiss() runs on EVERY faiss_writer start
+                    # 3. backfill_unindexed_vectors() re-embeds any missing vectors
+                    # 4. Producer mode: segments are durable (written before checkpoint advance)
+                    # 5. Writer mode: FAISS saves are checkpointed; partial batches are re-embedded
+                    #
+                    # The invariant: reconcile+backfill ALWAYS runs before any new work.
+                    # See build_or_update_indices() near the faiss_writer block.
+                    #
+                    # NOTE: Signal handlers are installed AFTER guard creation and fsync,
+                    # so we cannot exit mid-guard-write. Logging is explicit and flushed
+                    # before os._exit() per red team feedback.
+                    
+                    def _signal_exit_handler(signum, frame):
+                        """Hard exit handler with explicit logging before os._exit(1)."""
+                        import signal as sig_mod  # local import to get signal names
+                        sig_name = sig_mod.Signals(signum).name if hasattr(sig_mod, 'Signals') else f"signal {signum}"
+                        # Write to stderr and flush immediately before hard exit
+                        msg = f"\n[signal] Received {sig_name}; cleaning up guard and exiting (hard exit).\n"
+                        msg += "[signal] NOTE: reconcile+backfill will repair any partial state on next startup.\n"
+                        try:
+                            sys.stderr.write(msg)
+                            sys.stderr.flush()
+                        except Exception:
+                            pass  # best effort - don't let logging failure block cleanup
+                        _cleanup_guard()
+                        os._exit(1)
+                    
+                    signal.signal(signal.SIGINT, _signal_exit_handler)
+                    signal.signal(signal.SIGTERM, _signal_exit_handler)
+            except Exception:
+                pass
+            return  # Success - guard created
+        except FileExistsError:
+            info = "unknown"
+            stale_cleaned = False
+            try:
+                info = Path(WRITER_GUARD).read_text().strip()
+                parts = info.split()
+                ts = 0
+                guard_pid = None
+                guard_host = None
+                if len(parts) >= 1 and parts[0].isdigit():
+                    guard_pid = int(parts[0])
+                if len(parts) >= 2:
+                    guard_host = parts[1]
+                if len(parts) >= 3:
+                    try: ts = int(parts[2])
+                    except ValueError: ts = 0
+                
+                # Explicit malformed guard detection: if we couldn't parse PID or host,
+                # the guard file is corrupt (not just "another writer active").
+                # Give a targeted message instead of the confusing generic error.
+                if guard_pid is None or not guard_host:
+                    sys.stderr.write(
+                        f"[writer] Guard file appears corrupt (expected: 'PID HOST TIMESTAMP'):\n"
+                        f"         File: {WRITER_GUARD}\n"
+                        f"         Contents: {info!r}\n"
+                        "         If you are CERTAIN no writer is running, remove it:\n"
+                        f"           rm {WRITER_GUARD}\n"
+                    )
                     sys.exit(2)
-        except Exception:
-            pass
-        sys.stderr.write(
-            f"[writer] Another FAISS writer appears active (guard {WRITER_GUARD} exists: {info}).\n"
-            "Stop the other job or remove the stale guard if you are sure it is dead.\n"
-        )
-        sys.exit(2)
+                
+                # TTL ≤ 0 means "never consider guards stale" (manual cleanup required).
+                if ttl_sec > 0 and ts and (time.time() - ts) > ttl_sec and attempt == 0:
+                    # Guard appears stale by timestamp, but check PID liveness first
+                    # to avoid evicting long-running builds that exceed TTL.
+                    is_live = False
+                    if guard_host == socket.gethostname() and guard_pid is not None:
+                        # Same host: can check if PID is still alive
+                        try:
+                            os.kill(guard_pid, 0)  # Signal 0 = check existence
+                            is_live = True
+                            _eprint(f"[writer] Guard PID {guard_pid} is still alive (long build?). Not evicting.")
+                        except OSError as e:
+                            # ESRCH (no such process) or EPERM (exists but we can't signal)
+                            if e.errno == errno.ESRCH:
+                                is_live = False  # Process dead, safe to evict
+                            elif e.errno == errno.EPERM:
+                                is_live = True  # Process exists but we can't signal it
+                            else:
+                                is_live = True  # Unknown error, be conservative
+                    # Different host: NEVER auto-evict. We cannot verify PID liveness,
+                    # so auto-eviction could corrupt data if a build is still running.
+                    # User must manually remove the guard: rm .writer_guard
+                    if guard_host != socket.gethostname():
+                        sys.stderr.write(
+                            f"[writer] Guard held by DIFFERENT HOST ({guard_host}); cannot verify if process is alive.\n"
+                            f"         Guard file: {WRITER_GUARD}\n"
+                            f"         Guard info: {info}\n"
+                            "         If you are CERTAIN the other job is dead, manually remove the guard:\n"
+                            f"           rm {WRITER_GUARD}\n"
+                        )
+                        sys.exit(2)
+                    
+                    # Same host: we verified PID is dead (is_live=False), safe to evict
+                    if not is_live:
+                        _eprint(f"[writer] Guard appears stale (> {ttl_sec}s, process dead): {info}. Attempting exclusive cleanup.")
+                        try:
+                            stale = WRITER_GUARD.with_name(f"{WRITER_GUARD.name}.stale.{os.getpid()}")
+                            # Atomic claim: if this replace fails, someone else is cleaning.
+                            os.replace(WRITER_GUARD, stale)
+                            stale.unlink(missing_ok=False)
+                            stale_cleaned = True  # retry once via continue
+                        except Exception as e:
+                            _eprint(f"[writer] ERROR: failed to remove guard: {e}.")
+                            sys.exit(2)
+            except Exception:
+                pass
+            
+            if stale_cleaned:
+                continue  # Retry exactly once after successful cleanup
+            
+            # Not stale, or already retried, or couldn't determine staleness
+            sys.stderr.write(
+                f"[writer] Another FAISS writer appears active (guard {WRITER_GUARD} exists: {info}).\n"
+                "Stop the other job or remove the stale guard if you are sure it is dead.\n"
+            )
+            sys.exit(2)
 
 # -- Paths / offline env --
+# Path discovery and workspace configuration delegated to litkit.config.paths
+# WorkspacePaths import is deferred to _init_runtime() for future-proofing:
+# if someone later adds numpy/torch to paths.py, --help/--version still work.
 
 
-def _find_root() -> Path:
-    """Return repo root.
-    Preference:
-    1) LITKIT_ROOT
-    2) CWD or its parents containing .git or pyproject.toml
-    3) Package path or its parents containing .git or pyproject.toml
-    4) CWD if it has src/litkit
-    5) site-packages parent (last resort)
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAZY RUNTIME INITIALIZATION (Phase 2 refactor)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Path discovery and filesystem I/O are deferred until first access.
+# 
+# What IS deferred (lazy):
+# - Path constant resolution (via __getattr__/get_runtime())
+# - Directory creation (sqlite_dir, indices_dir)
+# - Environment variable setup (HF_HOME, HF_HUB_OFFLINE, etc.)
+# (Note: faiss.cvar.seed is now set in _load_heavy_deps(), not here)
+#
+# What is NOT deferred (import-time):
+# - Third-party imports: faiss, numpy (heavyweight but necessary for type hints)
+# - Internal module imports: litkit.build, litkit.retrieval, etc.
+#
+# Access any path constant (e.g., SQLITE_DIR) to trigger initialization.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_runtime: "WorkspacePaths | None" = None  # String annotation - import deferred
+_runtime_lock = threading.Lock()
+
+
+def get_runtime() -> "WorkspacePaths":
+    """Thread-safe lazy initialization of runtime paths and directories.
+    
+    Side effects (first call only):
+    - Creates SQLITE_DIR and INDICES_DIR directories
+    - Sets HF_HOME, HF_HUB_OFFLINE, TRANSFORMERS_OFFLINE, TOKENIZERS_PARALLELISM env vars
+    - Populates module-level globals (ROOT, WORKSPACE, DB_PATH, etc.)
+    
+    Returns:
+        WorkspacePaths: Immutable container with all path constants.
     """
-    env = os.getenv("LITKIT_ROOT")
-    if env:
-        return Path(env).expanduser().resolve()
-
-    here = Path(__file__).resolve().parent
-    cwd = Path.cwd().resolve()
-
-    for p in [cwd] + list(cwd.parents):
-        if (p / ".git").exists() or (p / "pyproject.toml").exists():
-            return p
-    for p in [here] + list(here.parents):
-        if (p / ".git").exists() or (p / "pyproject.toml").exists():
-            return p
-    if (cwd / "src" / "litkit").exists():
-        return cwd
-    try:
-        return here.parents[1]
-    except IndexError:
-        return here
+    global _runtime
+    if _runtime is not None:
+        return _runtime
+    with _runtime_lock:
+        if _runtime is not None:
+            return _runtime
+        _runtime = _init_runtime()
+        # Populate module-level globals for internal code that uses bare names
+        for attr_name, field_name in _LAZY_PATH_ATTRS.items():
+            globals()[attr_name] = getattr(_runtime, field_name)
+        return _runtime
 
 
-def _resolve_workspace(root: Path) -> Path:
-    """Return path to the workspace directory."""
-    ws = os.getenv("LITKIT_WORKSPACE")
-    return Path(ws).expanduser().resolve() if ws else (root / "workspace").resolve()
+def _init_runtime() -> "WorkspacePaths":
+    """Perform all one-time initialization. Called only by get_runtime()."""
+    from litkit.config.paths import WorkspacePaths  # deferred for future-proofing
+    paths = WorkspacePaths.from_env_or_default()
+    
+    # Set environment variables (safe defaults for HPC/offline use)
+    paths.setup_environment()
+    
+    # Create required directories
+    paths.ensure_directories()
+    
+    return paths
 
 
-ROOT = _find_root()
-WORKSPACE = _resolve_workspace(ROOT)
+# Backward compatibility: module-level __getattr__ for lazy path access
+# Allows both `litkit.cli.SQLITE_DIR` and `from litkit.cli import SQLITE_DIR`
+_LAZY_PATH_ATTRS = {
+    "ROOT": "root",
+    "WORKSPACE": "workspace",
+    "HF_HOME": "hf_home",
+    "SQLITE_DIR": "sqlite_dir",
+    "INDICES_DIR": "indices_dir",
+    "EMBED_SEGMENTS_DIR": "embed_segments_dir",
+    "DB_PATH": "db_path",
+    "CKPT_PATH": "ckpt_path",
+    "DB_LOCK": "db_lock",
+    "FAISS_LOCK": "faiss_lock",
+    "WRITER_GUARD": "writer_guard",
+    "PAPER_INDEX_PATH": "paper_index_path",
+    "CHUNK_INDEX_PATH": "chunk_index_path",
+    "CHUNK_TRAINED_FLAG": "chunk_trained_flag",
+    "CKPT_LOCK": "ckpt_lock",
+}
+
+
+def __getattr__(name: str):
+    """Module-level __getattr__ for lazy initialization of path constants.
+    
+    This function is called when an attribute is not found in the module namespace.
+    On first access, we populate the module globals so subsequent local lookups work.
+    """
+    if name in _LAZY_PATH_ATTRS:
+        # Trigger full initialization and populate ALL path globals
+        rt = get_runtime()
+        for attr_name, field_name in _LAZY_PATH_ATTRS.items():
+            globals()[attr_name] = getattr(rt, field_name)
+        # Return the requested attribute
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _report_paths(
@@ -255,7 +685,9 @@ def _report_paths(
     tar_dir_origin: str | None = None,  # "(from LITKIT_TAR_DIR)" or "(default)"
 ):
     """Print paths once args are parsed, so banners reflect reality."""
-    if QUIET:
+    # Use is_quiet() to check env var at runtime (not frozen at import time)
+    from litkit.progress import is_quiet
+    if is_quiet():
         return
     if tar_manifest:
         _eprint(f"[paths] using manifest -> " f"{tar_manifest} for paths to tar shards")
@@ -266,20 +698,6 @@ def _report_paths(
     _eprint(f"[paths] using {workspace} as writable directory for job artifacts/outputs")
 
 
-HF_HOME = WORKSPACE / "hf_cache"  # location of HF models
-SQLITE_DIR = WORKSPACE / "sqlite"  # location of SQLite DB
-INDICES_DIR = WORKSPACE / "indices"  # location of FAISS indices for papers and chunks
-
-# Temporary storage for embedding segments from producers
-#   This setting is only used if --embed-dir is set.
-EMBED_SEGMENTS_DIR = WORKSPACE / "emb_segments"
-
-os.environ.setdefault("HF_HOME", str(HF_HOME))
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("LITKIT_SEGMENT_FSYNC_DIR", "1")  # default: fsync directory entries for crash safety
-
 # Reasonable defaults for large Lustre/NFS runs:
 # ~131,072 vectors/segment ≈ 0.4 GB per file (fp32, dim=768). Half that if stored as fp16.
 DEFAULT_EMBED_SEGMENT_SIZE = int(os.environ.get("LITKIT_EMBED_SEGMENT_SIZE", "131072"))
@@ -288,254 +706,19 @@ DEFAULT_EMBED_SEGMENT_DTYPE = os.environ.get("LITKIT_EMBED_SEGMENT_DTYPE", "fp16
 # Default SQLite busy timeout in milliseconds (tunable for shared filesystems).
 DEFAULT_BUSY_TIMEOUT_MS = int(os.environ.get("LITKIT_SQLITE_BUSY_TIMEOUT_MS", "120000"))
 
-try:
-    SQLITE_DIR.mkdir(parents=True, exist_ok=True)
-    INDICES_DIR.mkdir(parents=True, exist_ok=True)
-except Exception as e:
-    sys.stderr.write(
-        f"[paths] ERROR: cannot create {SQLITE_DIR} or {INDICES_DIR}: {e}\n"
-        "[paths] Set LITKIT_WORKSPACE to a writable Lustre/NFS path and re-run.\n"
-    )
-    sys.exit(2)
-
-DB_FILENAME = os.environ.get("LITKIT_DB_FILE", "litkit.sqlite3")
-DB_PATH = SQLITE_DIR / DB_FILENAME
-CKPT_PATH = SQLITE_DIR / "build_checkpoint.json"
 
 
-def _shard_db_path(shard_id: int) -> Path:
-    """Return path to shard-specific SQLite database for producer mode."""
-    return SQLITE_DIR / f"litkit_shard_{shard_id:02d}.sqlite3"
 
-
-def _list_shard_dbs() -> list[Path]:
-    """List all shard SQLite databases in the sqlite directory."""
-    return sorted(SQLITE_DIR.glob("litkit_shard_*.sqlite3"))
-
-
-def merge_shard_databases(main_conn, delete_after_merge: bool = True) -> dict[str, int]:
-    """Merge all per-shard SQLite databases into the main database using bulk SQL operations.
-    
-    Uses ATTACH DATABASE + INSERT...SELECT for efficient bulk merging instead of
-    row-by-row Python loops. This is ~100x faster for large databases.
-    
-    The merge is idempotent: duplicate papers (same doc_id) and chunks (same paper_id+ord)
-    are skipped using INSERT OR IGNORE and conflict detection.
-    
-    Args:
-        main_conn: Connection to the main litkit.sqlite3 database
-        delete_after_merge: If True, delete shard DBs after successful merge
-    
-    Returns:
-        Dict with merge statistics: {"papers": N, "chunks": M, "files": F, "shards": S}
-    """
-    shard_dbs = _list_shard_dbs()
-    if not shard_dbs:
-        return {"papers": 0, "chunks": 0, "files": 0, "shards": 0}
-    
-    _eprint(f"[merge] Found {len(shard_dbs)} shard database(s) to merge (using bulk SQL)")
-    
-    stats = {"papers": 0, "chunks": 0, "files": 0, "shards": 0}
-    main_cur = main_conn.cursor()
-    
-    for shard_idx, shard_db in enumerate(shard_dbs):
-        _eprint(f"[merge] Processing {shard_db.name}...")
-        t0 = time.time()
-        
-        # Use unique alias per shard to avoid "database already in use" errors
-        shard_alias = f"shard_db_{shard_idx}"
-        # Use unique temp table name per shard for safety
-        temp_map_table = f"_shard_paper_map_{shard_idx}"
-        
-        try:
-            # ATTACH the shard database for bulk operations
-            main_cur.execute(f"ATTACH DATABASE ? AS {shard_alias}", (str(shard_db),))
-            
-            try:
-                # Count rows before merge for statistics
-                papers_before = main_cur.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
-                chunks_before = main_cur.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-                files_before = main_cur.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-                
-                # 1) BULK MERGE PAPERS
-                # Insert papers that don't already exist (by doc_id), ignoring duplicates
-                # Use a subquery to exclude papers whose doc_id already exists in main
-                main_cur.execute(f"""
-                    INSERT OR IGNORE INTO papers(doc_id, pmid, pmcid, title, abstract, in_index)
-                    SELECT s.doc_id, s.pmid, s.pmcid, s.title, s.abstract, 0
-                    FROM {shard_alias}.papers s
-                    WHERE s.doc_id IS NOT NULL 
-                      AND s.doc_id != ''
-                      AND NOT EXISTS (
-                          SELECT 1 FROM papers m WHERE m.doc_id = s.doc_id
-                      )
-                """)
-                
-                # 2) BULK MERGE CHUNKS
-                # Create a temp table to map shard paper_id -> main paper_id via doc_id
-                # Drop first to ensure clean state (no IF NOT EXISTS to avoid stale data)
-                main_cur.execute(f"DROP TABLE IF EXISTS {temp_map_table}")
-                main_cur.execute(f"""
-                    CREATE TEMP TABLE {temp_map_table} AS
-                    SELECT s.id AS shard_pid, m.id AS main_pid
-                    FROM {shard_alias}.papers s
-                    JOIN papers m ON m.doc_id = s.doc_id
-                    WHERE s.doc_id IS NOT NULL AND s.doc_id != ''
-                """)
-                
-                # Insert chunks with remapped paper_id, skipping duplicates (same paper_id+ord)
-                main_cur.execute(f"""
-                    INSERT OR IGNORE INTO chunks(paper_id, ord, text, in_index)
-                    SELECT pm.main_pid, sc.ord, sc.text, 0
-                    FROM {shard_alias}.chunks sc
-                    JOIN {temp_map_table} pm ON pm.shard_pid = sc.paper_id
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM chunks mc 
-                        WHERE mc.paper_id = pm.main_pid AND mc.ord = sc.ord
-                    )
-                """)
-                
-                # 3) BULK MERGE FILES
-                # Insert/replace files with remapped paper_id
-                main_cur.execute(f"""
-                    INSERT OR REPLACE INTO files(path, size, mtime, paper_id)
-                    SELECT sf.path, sf.size, sf.mtime, pm.main_pid
-                    FROM {shard_alias}.files sf
-                    JOIN {temp_map_table} pm ON pm.shard_pid = sf.paper_id
-                """)
-                
-                # Drop temp table immediately after use
-                main_cur.execute(f"DROP TABLE IF EXISTS {temp_map_table}")
-                
-                # Count rows after merge for statistics
-                papers_after = main_cur.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
-                chunks_after = main_cur.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-                files_after = main_cur.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-                
-                papers_merged = papers_after - papers_before
-                chunks_merged = chunks_after - chunks_before
-                files_merged = files_after - files_before
-                
-                stats["papers"] += papers_merged
-                stats["chunks"] += chunks_merged
-                stats["files"] += files_merged
-                stats["shards"] += 1
-                
-                elapsed = time.time() - t0
-                _eprint(f"[merge] {shard_db.name}: +{papers_merged} papers, +{chunks_merged} chunks, +{files_merged} files ({elapsed:.1f}s)")
-                
-            finally:
-                # Always detach the shard database
-                try:
-                    main_cur.execute(f"DETACH DATABASE {shard_alias}")
-                except Exception:
-                    pass
-            
-            # Delete shard DB after successful merge
-            if delete_after_merge:
-                try:
-                    shard_db.unlink()
-                    _eprint(f"[merge] Deleted {shard_db.name}")
-                except Exception as e:
-                    _eprint(f"[merge] WARNING: could not delete {shard_db.name}: {e}")
-            
-        except Exception as e:
-            _eprint(f"[merge] ERROR processing {shard_db.name}: {e.__class__.__name__}: {e}")
-            import traceback
-            traceback.print_exc()
-            # Continue with next shard
-    
-    # Commit all changes
-    main_conn.commit()
-    
-    _eprint(f"[merge] Complete: {stats['papers']} papers, {stats['chunks']} chunks, {stats['files']} files from {stats['shards']} shard(s)")
-    return stats
-
-
-def init_shard_db(shard_id: int, journal_mode: str, busy_timeout_ms: int):
-    """Initialize a shard-specific SQLite database for producer mode.
-    
-    Each producer writes to its own shard DB to avoid lock contention.
-    The consumer later merges all shard DBs into the main database.
-    """
-    shard_path = _shard_db_path(shard_id)
-    _eprint(f"[db] Producer shard {shard_id}: using {shard_path}")
-    
-    conn = sqlite3.connect(shard_path, isolation_level="DEFERRED", timeout=busy_timeout_ms / 1000.0)
-    
-    mode = (journal_mode or "TRUNCATE").upper()
-    conn.execute(f"PRAGMA journal_mode={mode};")
-    conn.execute("PRAGMA synchronous=FULL;")
-    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)};")
-    conn.execute("PRAGMA temp_store=MEMORY;")
-    
-    conn.executescript(SCHEMA)
-    _ensure_in_index_columns(conn)
-    conn.commit()
-    
-    return conn
-
-
-PROMPT_HEADROOM_TOKENS = int(os.environ.get("LITKIT_PROMPT_HEADROOM_TOKENS", "200"))
-
-
-class FileLock:
+# FileLock wrapper that binds the DB_LOCK and FAISS_LOCK paths at runtime
+# for lock depth tracking. Uses litkit.concurrent.FileLock as the base.
+class FileLock(_FileLockBase):
+    """File lock with runtime binding of DB_LOCK and FAISS_LOCK paths."""
     def __init__(self, path: Path):
-        self.path = path
-        self._fd = None
-        self._faiss_depth_bumped = False  # only for our FAISS depth counter
-
-    def __enter__(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = open(self.path, "w")
-
-        acquired = True
-        if FLOCK_AVAILABLE and fcntl is not None:
-            try:
-                fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX)
-            except OSError as e:
-                # Treat ENOTSUP/EOPNOTSUPP as “best-effort” (no advisory locking),
-                # but continue as if acquired.
-                if e.errno not in (getattr(errno, "ENOTSUP", 95), getattr(errno, "EOPNOTSUPP", 95)):
-                    raise
-                _eprint(f"[lock] WARNING: flock unsupported on {self.path}; proceeding best-effort.")
-                globals()["_ADVISORY_LOCK_DISABLED"] = True
-
-        # Always bump our logical counters if we ‘acquired’ (best-effort counts as acquired)
-        if self.path == DB_LOCK:
-            _db_lock_enter()
-        if self.path == FAISS_LOCK:
-            _faiss_lock_enter()
-            self._faiss_depth_bumped = True
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        try:
-            # Always try to unlock the OS file lock if available.
-            if FLOCK_AVAILABLE and fcntl is not None:
-                try:
-                    fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
-                except OSError as e:
-                    if e.errno not in (getattr(errno, "ENOTSUP", 95), getattr(errno, "EOPNOTSUPP", 95)):
-                        raise
-        finally:
-            try:
-                self._fd.close()
-            finally:
-                if self.path == FAISS_LOCK and self._faiss_depth_bumped:
-                    _faiss_lock_exit()
-                    self._faiss_depth_bumped = False
-                if self.path == DB_LOCK:
-                    _db_lock_exit()
+        get_runtime()  # ensure DB_LOCK and FAISS_LOCK are initialized
+        super().__init__(path, db_lock_path=DB_LOCK, faiss_lock_path=FAISS_LOCK)
 
 # Always acquire in this order to avoid deadlock: DB_LOCK then FAISS_LOCK
-DB_LOCK = SQLITE_DIR / "db.writer.lock"
-FAISS_LOCK = SQLITE_DIR / "faiss.writer.lock"
-WRITER_GUARD = SQLITE_DIR / "faiss_writer.guard"
-
-# One-time advisory-lock status reporting
-_ADVISORY_LOCK_DISABLED = False
-_ADVISORY_LOCK_NOTICE_PRINTED = False
+# (These constants are now provided via lazy __getattr__ from get_runtime())
 
 # Producer-mode segment writers (set in main)
 chunk_seg_writer = None
@@ -550,11 +733,11 @@ OPENAI_TIMEOUT_SEC = int(os.environ.get("LITKIT_OPENAI_TIMEOUT_SEC", "15"))
 
 
 def _default_base_url_for(model: str) -> str:
-    m = model.lower()
-    if m.startswith("gpt-oss"):
-        return os.environ.get("OPENAI_BASE_URL", "http://localhost:1234/v1")
-    if m.startswith("o3"):
-        return os.environ.get("OPENAI_BASE_URL", "http://localhost:1234/v1")
+    """Default base URL for OpenAI-compatible endpoints.
+    
+    All models currently use the same default; the parameter is retained
+    for future model-specific routing if needed.
+    """
     return os.environ.get("OPENAI_BASE_URL", "http://localhost:1234/v1")
 
 def _default_api_key_for(model: str) -> str:
@@ -611,42 +794,6 @@ BATCH_TRAIN_FLUSH = int(
     os.environ.get("LITKIT_TRAIN_FLUSH", "4000")
 )  # how many training chunks per embed flush
 
-# token budgets (approx; ~4 chars/token heuristic used)
-BUDGET_TOKENS_O3 = 32000
-BUDGET_TOKENS_OSS20B = 3000
-
-# -------------------- DB schema --------------------
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS papers (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  doc_id TEXT,                      -- stable document identifier (pmcid or pmid or hash)
-  pmid TEXT,
-  pmcid TEXT,
-  title TEXT,
-  abstract TEXT,
-  in_index INTEGER DEFAULT 0        -- 0=not yet in FAISS, 1=added
-);
-CREATE TABLE IF NOT EXISTS chunks (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  paper_id INTEGER NOT NULL,
-  ord INTEGER NOT NULL,
-  text TEXT NOT NULL,
-  in_index INTEGER DEFAULT 0,       -- 0=not yet in FAISS, 1=added
-  FOREIGN KEY(paper_id) REFERENCES papers(id)
-);
-CREATE INDEX IF NOT EXISTS chunks_paper_id ON chunks(paper_id);
-CREATE INDEX IF NOT EXISTS chunks_paper_ord ON chunks(paper_id, ord);
-CREATE TABLE IF NOT EXISTS files (
-  path TEXT PRIMARY KEY,
-  size INTEGER,
-  mtime REAL,
-  paper_id INTEGER
-);
-CREATE UNIQUE INDEX IF NOT EXISTS papers_pmcid_uq ON papers(pmcid) WHERE pmcid <> '';
-CREATE UNIQUE INDEX IF NOT EXISTS papers_pmid_uq  ON papers(pmid)  WHERE pmid  <> '';
-CREATE UNIQUE INDEX IF NOT EXISTS papers_doc_id_uq ON papers(doc_id) WHERE doc_id <> '';
-"""
-
 
 # -------------------- Destructive action confirmation --------------------
 def _fmt_bytes(n: int) -> str:
@@ -674,6 +821,7 @@ def _confirm_rebuild(conn) -> None:
     """Ask the user to confirm --rebuild when in an interactive TTY.
     In non-interactive mode, require --yes or LITKIT_ASSUME_YES=1.
     """
+    get_runtime()  # ensure path globals are bound
     # Allow fully non-interactive approvals
     assume_yes = os.environ.get("LITKIT_ASSUME_YES", "0") == "1"
     if assume_yes:
@@ -706,7 +854,8 @@ def _confirm_rebuild(conn) -> None:
     _eprint(f"  • Clear SQLite tables in: {DB_PATH}")
     _eprint(f"  • Remove checkpoint: {CKPT_PATH} [{ckpt_sz}]")
     _eprint(f"  • {counts}")
-    # resp = input("\nType 'yes' to continue (anything else aborts): ").strip().lower()
+    # Note: _eprint (litkit.progress.eprint) supports end= in its signature:
+    # def eprint(msg: str = "", *, end: str = "\n") -> None
     _eprint("\nType 'yes' to continue (anything else aborts): ", end="")
     resp = input().strip().lower()
     if resp not in ("y", "yes"):
@@ -718,10 +867,12 @@ def _resolve_question(args) -> str | None:
     """Resolve the effective question from one of:
     1) --question-file FILE (or '-' for stdin)
     2) Positional 'question' that is:
-        - '@path' shorthand (read from path)
-        - a path to an existing file (read from file)
+        - '@path' shorthand (explicit file read)
         - a literal string otherwise
     Returns the question text (stripped) or None.
+    
+    NOTE: Implicit file read (treating any existing file path as "read this file")
+    was removed as a footgun. Use '@path' or --question-file for file input.
     """
     # 1) explicit flag wins
     if args.question_file is not None:
@@ -733,1458 +884,43 @@ def _resolve_question(args) -> str | None:
     if not q:
         return None
 
-    # 2a) '@file' shorthand
+    # 2a) '@file' shorthand - explicit opt-in to file read
     if q.startswith("@") and len(q) > 1:
         p = Path(q[1:])
         if p.is_file():
             return p.read_text(encoding="utf-8", errors="ignore").strip()
+        # '@path' was specified but file doesn't exist - treat as literal (user error)
 
-    # 2b) treat as literal question
+    # 2b) treat as literal question (no implicit file read)
     return q.strip()
 
 
-def _maybe_fsync_dir(p: Path):
-    # Optional: fsync the containing directory for extra safety on some NFS setups
-    if os.environ.get("LITKIT_SEGMENT_FSYNC_DIR", "1") != "1":
-        return
-    try:
-        dfd = os.open(str(p.parent), os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
-    except Exception:
-        pass
-
-
-# -------------------- Utils --------------------
-def init_db(journal_mode: str, busy_timeout_ms: int):
-    """Initialize (or open) the SQLite database and ensure schema exists.
-
-    Supported journal modes: TRUNCATE (default) | WAL
-    - TRUNCATE: safe on shared HPC filesystems (reduced metadata churn vs DELETE).
-    - WAL     : excellent locally; avoid on shared FS (NFS/Lustre).
-    """
-    conn = sqlite3.connect(DB_PATH, isolation_level="DEFERRED", timeout=busy_timeout_ms / 1000.0)
-
-    mode = (journal_mode or "TRUNCATE").upper()
-    supported = {"TRUNCATE", "WAL"}
-    if mode not in supported:
-        _eprint(f"[db] WARNING: unsupported journal_mode={mode!r} -> forcing TRUNCATE")
-        mode = "TRUNCATE"
-
-    # Apply requested journal mode (TRUNCATE (default) | WAL)
-    conn.execute(f"PRAGMA journal_mode={mode};")
-
-    if mode == "WAL":
-        # WAL can misbehave on shared HPC filesystems; warn the operator.
-        _eprint(
-            "[db] WARNING: WAL selected. Ensure the DB is on node-local storage. "
-            "On shared FS (NFS/Lustre), prefer --sqlite-journal-mode TRUNCATE."
-        )
-        conn.execute("PRAGMA wal_autocheckpoint=1000;")
-
-    eff_mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
-    _eprint(f"[db] journal_mode set to {eff_mode}")
-
-    # Crash-safe on shared filesystems (NFS/Lustre) requires FULL.
-    conn.execute("PRAGMA synchronous=FULL;")
-    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)};")
-    conn.execute("PRAGMA temp_store=MEMORY;")  # force in-memory temp storage
-
-    conn.executescript(SCHEMA)
-    _ensure_in_index_columns(conn)
-    conn.commit()
-    return conn
-
-
-def _ensure_in_index_columns(conn):
-    """Idempotent migration: ensure `in_index` and `doc_id` columns exist."""
-    cur = conn.cursor()
-    for table in ("papers", "chunks"):
-        cols = {row[1] for row in cur.execute(f"PRAGMA table_info({table})")}
-        if "in_index" not in cols:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN in_index INTEGER DEFAULT 0")
-    
-    # Ensure doc_id column exists on papers table (for multi-producer deduplication)
-    papers_cols = {row[1] for row in cur.execute("PRAGMA table_info(papers)")}
-    if "doc_id" not in papers_cols:
-        cur.execute("ALTER TABLE papers ADD COLUMN doc_id TEXT")
-        # Create unique index for doc_id if it doesn't exist
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS papers_doc_id_uq ON papers(doc_id) WHERE doc_id <> ''")
-    
-    conn.commit()
-
-
-def pack_paragraphs(
-    paras, max_chars=CHUNK_TARGET_CHARS, min_chars=BODY_MIN_CHARS, overlap_chars=CHUNK_OVERLAP_CHARS
-):
-    """Greedy pack paragraphs, then add a small character overlap between
-    consecutive chunks to reduce claim-splitting.
-    """
-    chunks, buf, total = [], [], 0
-
-    def _flush_buf():
-        nonlocal chunks, buf, total
-        if not buf:
-            return
-        cur = " ".join(buf)
-        if len(cur) < min_chars and chunks:
-            chunks[-1] = chunks[-1] + " " + cur
-        else:
-            chunks.append(cur)
-        buf, total = [], 0
-
-    for p in paras:
-        if buf and total + len(p) + 1 > max_chars:
-            _flush_buf()
-        buf.append(p)
-        total += len(p) + 1
-    _flush_buf()
-
-    if overlap_chars > 0 and len(chunks) > 1:
-        out = [chunks[0]]
-        for i in range(1, len(chunks)):
-            tail = chunks[i - 1][-overlap_chars:]
-            out.append((tail + " " + chunks[i]).strip())
-        chunks = out
-    return chunks
-
-
-def _dedupe_ids_and_texts(ids: list[int], texts: list[str]) -> tuple[list[int], list[str]]:
-    """Keep the first occurrence of each id; return aligned id/text lists."""
-    out_ids, out_texts, seen = [], [], set()
-    for i, t in zip(ids, texts, strict=False):
-        if i in seen:
-            continue
-        seen.add(i)
-        out_ids.append(i)
-        out_texts.append(t)
-    return out_ids, out_texts
-
-
-def _dedupe_papers_with_doc_ids(
-    ids: list[int], texts: list[str], doc_ids: list[str]
-) -> tuple[list[int], list[str], list[str]]:
-    """Keep the first occurrence of each id; return aligned id/text/doc_id lists."""
-    out_ids, out_texts, out_doc_ids, seen = [], [], [], set()
-    for i, t, d in zip(ids, texts, doc_ids, strict=False):
-        if i in seen:
-            continue
-        seen.add(i)
-        out_ids.append(i)
-        out_texts.append(t)
-        out_doc_ids.append(d)
-    return out_ids, out_texts, out_doc_ids
-
-
-def _dedupe_chunks_with_doc_ids(
-    ids: list[int], texts: list[str], paper_doc_ids: list[str], ords: list[int]
-) -> tuple[list[int], list[str], list[str], list[int]]:
-    """Keep the first occurrence of each id; return aligned id/text/paper_doc_id/ord lists."""
-    out_ids, out_texts, out_doc_ids, out_ords, seen = [], [], [], [], set()
-    for i, t, d, o in zip(ids, texts, paper_doc_ids, ords, strict=False):
-        if i in seen:
-            continue
-        seen.add(i)
-        out_ids.append(i)
-        out_texts.append(t)
-        out_doc_ids.append(d)
-        out_ords.append(o)
-    return out_ids, out_texts, out_doc_ids, out_ords
-
-
 # -------------------- Embedders --------------------
-import faiss
-import numpy as np
 
-# Deterministic FAISS training (IVF/PQ k-means init)
-try:
-    faiss.cvar.seed = int(os.environ.get("LITKIT_FAISS_SEED", "123456"))
-except Exception:
-    pass
-
-
-# --- shared progress line state (prevents line collisions) ---
-
-
-def _phase(name: str, stream=None):
-    """Print a simple phase banner (operator log only)."""
-    stream = stream or sys.stderr
-    try:
-        _progress_newline(stream)
-    except Exception:
-        pass
-    stream.write(f"[phase] {name}\n")
-    stream.flush()
-    try:
-        with _PROGRESS_LOCK:
-            globals()["_PROGRESS_LAST_LEN"] = 0
-    except Exception:
-        pass
-
-
-def _pick_nprobe(nlist: int, user: int | None) -> int:
-    if user is not None:
-        target = int(user)
-    else:
-        target = int(math.sqrt(max(1, nlist)))
-    min_floor = 32 if nlist >= 16384 else 8
-    max_cap = 1024 if nlist >= 65536 else 512
-    return min(nlist, max(min_floor, min(max_cap, target)))
-
-
-class _SegmentWriter:
-    """Writes paper embedding segments to disk using doc_id (globally unique file path) for identification.
-    
-    Format: NPZ with keys 'doc_ids' (object array of strings), 'vecs' (float16/float32), 'dim', 'count'.
-    The doc_id is the canonical file path (e.g., "tar:///path/to/file.tar!/member.nxml") which is
-    globally unique across all shards and stable across DB merges.
-    """
-    def __init__(self, outdir: Path, segment_size: int, dtype: str, shard_id: int, kind: str):
-        self.outdir = Path(outdir)
-        self.outdir.mkdir(parents=True, exist_ok=True)
-        self.segment_size = int(segment_size)
-        self.dtype = np.float16 if dtype == "fp16" else np.float32
-        self.shard_id = int(shard_id)
-        self.seq = 0
-        self.kind = kind
-
-    def _next_path(self) -> Path:
-        ts = int(time.time())
-        p = self.outdir / f"{self.kind}_sh{self.shard_id:02d}_{ts}_{self.seq:06d}.npz"
-        self.seq += 1
-        return p
-
-    def write(self, doc_ids: list[str], vecs: np.ndarray):
-        """Write paper embeddings to segment file.
-        
-        Args:
-            doc_ids: List of doc_id strings (globally unique file paths)
-            vecs: Embedding vectors (N x dim)
-        """
-        if len(doc_ids) == 0:
-            return
-        if vecs.dtype != self.dtype:
-            vecs = vecs.astype(self.dtype, copy=False)
-
-        N = len(doc_ids)
-        for start in range(0, N, self.segment_size):
-            end = min(N, start + self.segment_size)
-            doc_ids_i = np.array(doc_ids[start:end], dtype=object)
-            vecs_i = np.ascontiguousarray(vecs[start:end])
-            dim = vecs_i.shape[1]
-
-            final = self._next_path()
-            tmp = final.with_suffix(final.suffix + ".tmp")
-
-            # Write to a temp file, fsync, then atomic replace
-            final.parent.mkdir(parents=True, exist_ok=True)
-            with open(tmp, "wb") as fh:
-                np.savez(
-                    fh, doc_ids=doc_ids_i, vecs=vecs_i, dim=np.int32(dim), count=np.int32(len(doc_ids_i))
-                )
-                try:
-                    if os.environ.get("LITKIT_SEGMENT_FSYNC_FILE", "1") == "1":
-                        fh.flush()
-                        os.fsync(fh.fileno())
-                except Exception:
-                    pass
-
-            os.replace(tmp, final)
-            _maybe_fsync_dir(final)
-
-
-# -------------------- Build Metadata (shard consistency) --------------------
-BUILD_META_FILE = ".build_meta.json"
-
-
-def _write_build_meta(seg_dir: Path, num_shards: int, manifest_path: str | None = None, *, mode: str = "single") -> None:
-    """Write build metadata to segment directory for shard consistency checking.
-    
-    Args:
-        seg_dir: Directory to write metadata to
-        num_shards: Number of producer shards (0 or 1 for single-node mode)
-        manifest_path: Optional path to the tar manifest file
-        mode: Build mode - "single" for single-node, "multi" for multi-node producer/consumer
-    """
-    seg_dir = Path(seg_dir)
-    seg_dir.mkdir(parents=True, exist_ok=True)
-    meta_path = seg_dir / BUILD_META_FILE
-    
-    meta = {
-        "num_shards": num_shards,
-        "mode": mode,  # "single" or "multi"
-        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "timestamp": int(time.time()),
-        "hostname": socket.gethostname(),
-        "manifest": manifest_path,
-    }
-    
-    tmp = meta_path.with_suffix(".tmp")
-    with open(tmp, "w") as f:
-        f.write(json.dumps(meta, indent=2))
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except Exception:
-            pass
-    os.replace(tmp, meta_path)
-    _maybe_fsync_dir(meta_path)
-    _eprint(f"[build] Wrote build metadata: mode={mode}, num_shards={num_shards}")
-
-
-def _read_build_meta(seg_dir: Path) -> dict | None:
-    """Read build metadata from segment directory. Returns None if not found."""
-    meta_path = Path(seg_dir) / BUILD_META_FILE
-    if not meta_path.exists():
-        return None
-    try:
-        return json.loads(meta_path.read_text())
-    except Exception as e:
-        _eprint(f"[build] WARNING: could not read {meta_path}: {e}")
-        return None
-
-
-def _has_segment_files(seg_dir: Path) -> bool:
-    """Check if segment directory has any .npz files (indicating prior work)."""
-    seg_dir = Path(seg_dir)
-    if not seg_dir.exists():
-        return False
-    return bool(list(seg_dir.glob("*.npz")) or list(seg_dir.glob(".shard_*_complete")))
-
-
-def _validate_shard_consistency(seg_dir: Path, current_num_shards: int, *, current_mode: str = "single") -> None:
-    """Validate that current shard count and mode match any existing build.
-    
-    Args:
-        seg_dir: Directory containing build metadata and segments
-        current_num_shards: Number of producer shards for this run
-        current_mode: Build mode - "single" for single-node, "multi" for multi-node
-    
-    Raises SystemExit if there's a mismatch to prevent data corruption.
-    """
-    seg_dir = Path(seg_dir)
-    meta = _read_build_meta(seg_dir)
-    has_segments = _has_segment_files(seg_dir)
-    
-    if meta is not None:
-        stored_shards = meta.get("num_shards")
-        stored_mode = meta.get("mode", "single")  # Default to "single" for legacy builds
-        started_at = meta.get("started_at", "unknown")
-        
-        # Check for mode mismatch (prevents resuming multi-node with single-node or vice versa)
-        if stored_mode != current_mode:
-            if stored_mode == "multi" and current_mode == "single":
-                raise SystemExit(
-                    f"\n[ERROR] Build mode mismatch!\n"
-                    f"  Existing build: multi-node ({stored_shards} shards, started {started_at})\n"
-                    f"  Current request: single-node\n"
-                    f"\n"
-                    f"You cannot resume a multi-node build with single-node mode.\n"
-                    f"\n"
-                    f"Options:\n"
-                    f"  1. Resume with multi-node:\n"
-                    f"       sbatch -N{stored_shards + 1} vector_build_multi.sbatch\n"
-                    f"       (N = num_shards + 1 for the consumer node)\n"
-                    f"\n"
-                    f"  2. Start fresh (DELETES ALL EXISTING WORK):\n"
-                    f"       rm -rf {seg_dir}/*\n"
-                    f"       rm -rf {SQLITE_DIR}/*\n"
-                    f"       rm -rf {INDICES_DIR}/*\n"
-                    f"       # Then resubmit your single-node job\n"
-                )
-            elif stored_mode == "single" and current_mode == "multi":
-                raise SystemExit(
-                    f"\n[ERROR] Build mode mismatch!\n"
-                    f"  Existing build: single-node (started {started_at})\n"
-                    f"  Current request: multi-node ({current_num_shards} shards)\n"
-                    f"\n"
-                    f"You cannot resume a single-node build with multi-node mode.\n"
-                    f"\n"
-                    f"Options:\n"
-                    f"  1. Resume with single-node:\n"
-                    f"       sbatch vector_build_single.sbatch\n"
-                    f"\n"
-                    f"  2. Start fresh (DELETES ALL EXISTING WORK):\n"
-                    f"       rm -rf {seg_dir}/*\n"
-                    f"       rm -rf {SQLITE_DIR}/*\n"
-                    f"       rm -rf {INDICES_DIR}/*\n"
-                    f"       # Then resubmit your multi-node job\n"
-                )
-        
-        # Check for shard count mismatch (only relevant for multi-node mode)
-        if current_mode == "multi" and stored_shards is not None and stored_shards != current_num_shards:
-            raise SystemExit(
-                f"\n[ERROR] Shard count mismatch!\n"
-                f"  Existing build: {stored_shards} shards (started {started_at})\n"
-                f"  Current request: {current_num_shards} shards\n"
-                f"\n"
-                f"Options:\n"
-                f"  1. Resume with matching shard count:\n"
-                f"       sbatch -N{stored_shards + 1} vector_build_multi.sbatch\n"
-                f"       (N = num_shards + 1 for the consumer node)\n"
-                f"\n"
-                f"  2. Start fresh (DELETES ALL EXISTING WORK):\n"
-                f"       rm -rf {seg_dir}/*\n"
-                f"       rm -rf {SQLITE_DIR}/*\n"
-                f"       rm -rf {INDICES_DIR}/*\n"
-                f"       # Then resubmit your job\n"
-            )
-        # Mode and shard count match, good to proceed
-        return
-    
-    # No metadata file
-    if has_segments:
-        # Legacy case: segments exist but no metadata
-        _eprint(
-            f"[build] WARNING: Found segment files but no {BUILD_META_FILE}. "
-            f"Assuming current settings (mode={current_mode}, shards={current_num_shards}) are correct. "
-            f"Writing metadata for future runs."
-        )
-        _write_build_meta(seg_dir, current_num_shards, mode=current_mode)
-    # else: Fresh start, metadata will be written by the first producer
-
-
-class ProducerCoordinator:
-    """Manages producer completion signaling for multi-node coordination."""
-    
-    def __init__(self, outdir: Path, shard_id: int, num_shards: int):
-        self.outdir = Path(outdir)
-        self.shard_id = int(shard_id)
-        self.num_shards = int(num_shards)
-        self.marker_file = self.outdir / f".shard_{self.shard_id:02d}_complete"
-    
-    def mark_complete(self):
-        """Signal that this producer shard has finished processing."""
-        self.outdir.mkdir(parents=True, exist_ok=True)
-        tmp = self.marker_file.with_suffix(".tmp")
-        
-        marker_data = {
-            "shard_id": self.shard_id,
-            "num_shards": self.num_shards,
-            "timestamp": time.time(),
-            "hostname": socket.gethostname(),
-            "pid": os.getpid()
-        }
-        
-        with open(tmp, "w") as f:
-            f.write(json.dumps(marker_data, indent=2))
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                pass
-        
-        os.replace(tmp, self.marker_file)
-        _maybe_fsync_dir(self.marker_file)
-        _eprint(f"[producer] Shard {self.shard_id}/{self.num_shards} marked complete")
-
-
-class ConsumerCoordinator:
-    """Manages consumer polling for producer completion in multi-node scenarios."""
-    
-    def __init__(self, outdir: Path, num_shards: int):
-        self.outdir = Path(outdir)
-        self.num_shards = int(num_shards)
-    
-    def count_complete_shards(self) -> int:
-        """Return the number of producer shards that have completed."""
-        if not self.outdir.exists():
-            return 0
-        
-        complete = 0
-        for i in range(self.num_shards):
-            marker = self.outdir / f".shard_{i:02d}_complete"
-            if marker.exists():
-                complete += 1
-        return complete
-    
-    def all_producers_complete(self) -> bool:
-        """Check if all producer shards have completed."""
-        return self.count_complete_shards() == self.num_shards
-    
-    def wait_for_completion(
-        self, 
-        poll_interval: float = 10.0, 
-        timeout: float = 14400.0,
-        progress_callback=None
-    ) -> bool:
-        """Wait for all producers to signal completion.
-        
-        Args:
-            poll_interval: How often to check for completion (seconds)
-            timeout: Maximum time to wait (seconds), default 4 hours
-            progress_callback: Optional function called with (complete, total) each poll
-        
-        Returns:
-            True if all completed within timeout, False if timed out
-        """
-        start = time.time()
-        last_report = 0.0
-        report_interval = 60.0  # Report progress every minute
-        
-        while time.time() - start < timeout:
-            complete = self.count_complete_shards()
-            
-            if progress_callback:
-                progress_callback(complete, self.num_shards)
-            
-            # Periodic progress report
-            now = time.time()
-            if (now - last_report) >= report_interval:
-                _eprint(f"[consumer] Waiting for producers: {complete}/{self.num_shards} complete")
-                last_report = now
-            
-            if complete == self.num_shards:
-                _eprint(f"[consumer] All {self.num_shards} producers complete!")
-                return True
-            
-            time.sleep(poll_interval)
-        
-        complete = self.count_complete_shards()
-        _eprint(f"[consumer] TIMEOUT after {timeout}s: only {complete}/{self.num_shards} producers complete")
-        return False
-
-
-# --- lightweight progress line (stderr), dependency-free ---
-class _Progress:
-    def __init__(
-        self,
-        label: str,
-        total: int | None = None,
-        start: int = 0,
-        min_interval: float = 0.2,
-        stream=None,
-        emit_final_line: bool = True,
-    ):
-        self.label = label
-        self.total = total if (total is not None and total > 0) else None
-        self.done = int(start)
-        self.start_ts = time.time()
-        self.last_ts = 0.0
-        self.min_interval = float(min_interval)
-        self.stream = stream if stream is not None else sys.stderr
-        self.emit_final_line = bool(emit_final_line)
-        self._last_len = 0
-
-    def _write_line(self, s: str):
-        _progress_write(s, self.stream)
-
-    def _fmt(self) -> str:
-        elapsed = max(1e-3, time.time() - self.start_ts)
-        rate = self.done / elapsed
-        if self.total is None:
-            return f"[progress] {self.label}: {self.done}  ({rate:.1f}/s)"
-        pct = 100.0 * self.done / max(1, self.total)
-        return f"[progress] {self.label}: {self.done}/{self.total}  ({pct:.1f}%)  {rate:.1f}/s"
-
-    def tick(self, inc: int = 1, force: bool = False):
-        self.done += inc
-        now = time.time()
-        if force or (now - self.last_ts) >= self.min_interval:
-            self._write_line(self._fmt())
-            self.last_ts = now
-
-
-    def finish(self, emit_final_line: bool | None = None):
-        # Use instance default unless overridden per-call
-        do_emit = self.emit_final_line if emit_final_line is None else bool(emit_final_line)
-        if do_emit:
-            _progress_write(self._fmt(), self.stream)
-        _progress_newline(self.stream)
-
-
-class _Pulse:
-    """Background heartbeat that refreshes a single progress line with elapsed time."""
-
-    def __init__(self, label: str, period: float = 0.5, stream=None):
-        self.label = label
-        self.period = float(period)
-        self.stream = stream if stream is not None else sys.stderr
-        self._stop = threading.Event()
-        self._t0 = time.time()
-        self._thr = threading.Thread(target=self._run, daemon=True)
-        self._thr.start()
-
-    def _print_line(self, s: str):
-        _progress_write(s, self.stream)
-
-    def _run(self):
-        while not self._stop.is_set():
-            elapsed = int(time.time() - self._t0)
-            self._print_line(f"[progress] {self.label}: training... {elapsed}s elapsed")
-            self._stop.wait(self.period)
-
-    def stop(self):
-        self._stop.set()
-        try:
-            self._thr.join(timeout=2.0)
-        except Exception:
-            pass
-        # Always terminate the line so the next writer doesn't append mid-line.
-        if _progress_is_append():
-            _progress_write(
-                f"[progress] {self.label}: completed in {int(time.time()-self._t0)}s",
-                self.stream,
-            )
-            _progress_newline(self.stream)
-        else:
-            self._print_line(
-                f"[progress] {self.label}: training… {int(time.time()-self._t0)}s elapsed"
-            )
-            _progress_newline(self.stream)
-
-def _idmap_bloom(index, bits_per_key=8):
-    # Build once per process when needed
-    ids = None
-    try:
-        if isinstance(index, faiss.IndexIDMap2):
-            ids = faiss.vector_to_array(index.id_map)
-        elif hasattr(index, "index") and isinstance(index.index, faiss.IndexIDMap2):
-            ids = faiss.vector_to_array(index.index.id_map)
-    except Exception:
-        return None
-    if ids is None:
-        return None
-    import hashlib
-    import math
-
-    n = len(ids)
-    if n == 0:
-        return None
-    m = max(1024, n * bits_per_key)  # bits
-    k = max(2, int(round((m / n) * math.log(2))))  # hash rounds
-    bitarr = bytearray((m + 7) // 8)
-
-    def _set(h):
-        i = h % m
-        bitarr[i // 8] = bitarr[i // 8] | (1 << (i % 8))
-
-    def _hashes(x):
-        b = int(x).to_bytes(8, "little", signed=False)
-        h1 = int(hashlib.blake2b(b, digest_size=8).hexdigest(), 16)
-        h2 = int(hashlib.sha1(b).hexdigest(), 16)
-        for t in range(k):
-            yield (h1 + t * h2)
-
-    for x in ids:
-        for h in _hashes(x):
-            _set(h)
-
-    def contains(x):
-        for h in _hashes(int(x)):
-            i = h % m
-            if (bitarr[i // 8] >> (i % 8)) & 1 == 0:
-                return False
-        return True
-
-    return contains
+# Note: faiss.cvar.seed is set inside _load_heavy_deps() for conceptual purity
+# (_init_runtime() is now purely filesystem/env; faiss belongs with heavy deps)
 
 
 # -------------------- FAISS index helpers --------------------
-# Single source of truth for product-quantizer bits
-PQ_BITS = 8  # keep this in sync across training & _ivfpq_index
-PAPER_INDEX_PATH = INDICES_DIR / "papers.faiss"
-CHUNK_INDEX_PATH = INDICES_DIR / "chunks.faiss"
-CHUNK_TRAINED_FLAG = INDICES_DIR / "chunks.trained.json"
-CKPT_LOCK = SQLITE_DIR / "ckpt.writer.lock"
-# Allow a safe fallback to downcast() for reporting if duck-typing/extract fail.
-# Set LITKIT_FAISS_NO_DOWNCAST=1 to disable the downcast fallback entirely.
-USE_DOWNCAST_FALLBACK = os.environ.get("LITKIT_FAISS_NO_DOWNCAST", "") == ""
+# (Constants PQ_BITS and USE_DOWNCAST_FALLBACK are now imported from litkit.index)
+# (Path constants are now provided via lazy __getattr__ from get_runtime():
+#  PAPER_INDEX_PATH, CHUNK_INDEX_PATH, CHUNK_TRAINED_FLAG, CKPT_LOCK)
 
 # ------------------------------------------------------------------
 # Producer-mode segment writer handle (set in main(); read elsewhere)
 # ------------------------------------------------------------------
 
 
-def _unwrap_core_and_kind(
-    idx, max_depth: int = 12, allow_downcast_fallback: bool = USE_DOWNCAST_FALLBACK
-):
-    """Return (kind, core, wrappers) where kind in {'ivf','hnsw','flat'}.
-    Unwraps common wrappers (.index/.base_index). Prefers duck-typing and
-    faiss.extract_index_ivf; optionally falls back to downcast_index for read-only introspection.
-    """
-    base = idx
-    wrappers = [type(base).__name__]
-
-    for _ in range(max_depth):
-        if base is None:
-            break
-
-        # --- IVF via duck-typing ---
-        if hasattr(base, "nlist"):
-            return "ivf", base, wrappers
-
-        # --- IVF via FAISS helper (safe) ---
-        try:
-            ivf = faiss.extract_index_ivf(base)  # returns IndexIVF if applicable
-            return "ivf", ivf, wrappers
-        except Exception:
-            pass
-
-        # --- HNSW via duck-typing ---
-        if hasattr(base, "hnsw"):
-            return "hnsw", base, wrappers
-
-        # unwrap one layer of common wrappers
-        nxt = getattr(base, "index", None) or getattr(base, "base_index", None)
-        if nxt is None:
-            break
-        base = nxt
-        wrappers.append(type(base).__name__)
-
-    if allow_downcast_fallback:
-        # Last resort: downcast to reveal subclass attributes on some wheels
-        try:
-            obj = faiss.downcast_index(base)
-            if hasattr(obj, "nlist"):
-                return "ivf", obj, wrappers
-            if hasattr(obj, "hnsw"):
-                return "hnsw", obj, wrappers
-        except Exception:
-            pass
-
-    return "flat", base, wrappers
-
-
-def _add_ids_union_compat(index, ids_list, X, *, table, cur, save_path: Path):
-    ids_arr = np.asarray(ids_list, dtype=np.int64)
-
-    present = _faiss_present_ids(index) or set()
-    mask = np.array([int(i) not in present for i in ids_arr], dtype=bool)
-
-    if not mask.any():
-        _mark_in_index(cur, table, [int(i) for i in ids_arr])
-        return 0
-
-    ids_new = ids_arr[mask]
-    X_new = np.ascontiguousarray(X[mask].astype("float32"))
-    index.add_with_ids(X_new, ids_new)
-    _faiss_save(index, save_path)
-    _mark_in_index(cur, table, [int(i) for i in ids_new])
-    return int(ids_new.size)
-
-
 # Throttle index saves to reduce I/O on shared filesystems.
 _SAVE_MIN_SEC = int(os.environ.get("LITKIT_SAVE_EVERY_SEC", "120"))
 _last_save_ts = {"papers": 0.0, "chunks": 0.0}
 
-_MARKS_FLUSH_EVERY = int(os.environ.get("LITKIT_MARKS_FLUSH_EVERY", "10"))  # 0=off
-
-def _maybe_flush_marks_every(conn, cur, batch_counter: int) -> bool:
-    if _MARKS_FLUSH_EVERY and (batch_counter % _MARKS_FLUSH_EVERY) == 0:
-        with FileLock(DB_LOCK):
-            _flush_pending_marks(cur)
-            conn.commit()
-        return True
-    return False
-
-
-def _assert_faiss_locked():
-    if not _in_faiss_lock():
-        raise AssertionError(
-            "FAISS save called without holding FAISS_LOCK. "
-            "If you also update SQLite, acquire DB_LOCK first."
-        )
-
-
-def _faiss_save(index, path: Path) -> bool:
-    _assert_faiss_locked()
-    label = "papers" if Path(path).name.startswith("papers") else "chunks"
-    now = time.time()
-    if (now - _last_save_ts.get(label, 0.0)) < _SAVE_MIN_SEC:
-        return False
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    faiss.write_index(index, str(tmp))
-    try:
-        fd = os.open(str(tmp), os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except Exception:
-        pass
-    os.replace(tmp, path)
-    _maybe_fsync_dir(path)
-    _last_save_ts[label] = now
-    return True
-
-def _faiss_save_force(index, path: Path) -> bool:
-    _assert_faiss_locked()
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    faiss.write_index(index, str(tmp))
-    try:
-        fd = os.open(str(tmp), os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except Exception:
-        pass
-    os.replace(tmp, path)
-    _maybe_fsync_dir(path)
-    label = "papers" if Path(path).name.startswith("papers") else "chunks"
-    _last_save_ts[label] = time.time()
-    return True
 
 
 
-from collections import defaultdict
-
-_PENDING_MARKS = defaultdict(list)
-
-
-def _flush_pending_marks(cur):
-    for tbl, ids in list(_PENDING_MARKS.items()):
-        if not ids:
-            continue
-        _mark_in_index(cur, tbl, ids)
-        _PENDING_MARKS[tbl].clear()
-
-
-class _ChunkSegmentWriter:
-    """Writes chunk embedding segments to disk using (paper_doc_id, ord) for identification.
-    
-    Format: NPZ with keys:
-      - 'paper_doc_ids': object array of strings (parent paper's doc_id)
-      - 'ords': int32 array (chunk ordinal within paper: -1=title/abstract, 0,1,2...=body)
-      - 'vecs': float16/float32 embedding vectors
-      - 'dim': int32 embedding dimension
-      - 'count': int32 number of vectors
-    
-    The combination (paper_doc_id, ord) uniquely identifies a chunk globally across all shards.
-    File name format: chunks_sh{shard:02d}_{ts}_{seq:06d}.npz
-    """
-
-    def __init__(self, outdir: Path, segment_size: int, dtype: str, shard_id: int):
-        self.outdir = Path(outdir)
-        self.segment_size = int(segment_size)
-        self.dtype = np.float16 if dtype == "fp16" else np.float32
-        self.shard_id = int(shard_id)
-        self.seq = 0
-        self.outdir.mkdir(parents=True, exist_ok=True)
-
-    def _next_path(self) -> Path:
-        ts = int(time.time())
-        p = self.outdir / f"chunks_sh{self.shard_id:02d}_{ts}_{self.seq:06d}.npz"
-        self.seq += 1
-        return p
-
-    def write(self, paper_doc_ids: list[str], ords: list[int], vecs: np.ndarray):
-        """Write chunk embeddings to segment file.
-        
-        Args:
-            paper_doc_ids: List of doc_id strings for each chunk's parent paper
-            ords: List of chunk ordinals (-1 for title/abstract, 0+ for body chunks)
-            vecs: Embedding vectors (N x dim)
-        """
-        if len(paper_doc_ids) == 0:
-            return
-        assert len(paper_doc_ids) == len(ords) == vecs.shape[0], "paper_doc_ids/ords/vecs length mismatch"
-        if vecs.dtype != self.dtype:
-            vecs = vecs.astype(self.dtype, copy=False)
-
-        N = len(paper_doc_ids)
-        for start in range(0, N, self.segment_size):
-            end = min(N, start + self.segment_size)
-            doc_ids_i = np.array(paper_doc_ids[start:end], dtype=object)
-            ords_i = np.array(ords[start:end], dtype=np.int32)
-            vecs_i = np.ascontiguousarray(vecs[start:end])
-            dim = vecs_i.shape[1]
-
-            final = self._next_path()  # e.g., chunks_shXX_<ts>_<seq>.npz
-            tmp = final.with_suffix(final.suffix + ".tmp")
-
-            final.parent.mkdir(parents=True, exist_ok=True)
-            with open(tmp, "wb") as fh:
-                np.savez(
-                    fh, paper_doc_ids=doc_ids_i, ords=ords_i, vecs=vecs_i, 
-                    dim=np.int32(dim), count=np.int32(len(doc_ids_i))
-                )
-                try:
-                    if os.environ.get("LITKIT_SEGMENT_FSYNC_FILE", "1") == "1":
-                        fh.flush()
-                        os.fsync(fh.fileno())
-                except Exception:
-                    pass
-
-            os.replace(tmp, final)  # atomic rename on same filesystem
-            _maybe_fsync_dir(final)
-
-
-def _clear_chunk_trained_flag():
-    try:
-        CHUNK_TRAINED_FLAG.unlink()
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        _eprint(f"[train] WARNING: could not remove {CHUNK_TRAINED_FLAG}: {e}")
-
-
-def _faiss_load(path: Path):
-    """Load a FAISS index."""
-    return faiss.read_index(str(path))
-
-
-def _hnsw_index(
-    dim: int, M: int = 32, ef_construction: int = 200, ef_search: int = 128
-) -> faiss.Index:
-    # 1) Prefer explicit IP ctor
-    try:
-        idx = faiss.IndexHNSWFlat(dim, M, faiss.METRIC_INNER_PRODUCT)
-    except TypeError:
-        # 2) Older wheels: try factory with explicit metric
-        try:
-            idx = faiss.index_factory(dim, f"HNSW{M}", faiss.METRIC_INNER_PRODUCT)
-        except Exception as e:
-            # 3) Last resort: 2-arg ctor + attribute (if available) else hard fail
-            idx = faiss.IndexHNSWFlat(dim, M)
-            if hasattr(idx, "metric_type"):
-                idx.metric_type = faiss.METRIC_INNER_PRODUCT
-            else:
-                raise RuntimeError(
-                    "FAISS build does not support IP HNSW (metric_type unset and 3-arg ctor unavailable). "
-                    "Install a newer faiss (>=1.7.4, CPU or GPU) or run with --papers-index flat."
-                ) from e
-
-    idx.hnsw.efConstruction = int(ef_construction)
-    idx.hnsw.efSearch = int(ef_search)
-    return idx
-
-
-def _kind_and_core(idx):
-    kind, core, _ = _unwrap_core_and_kind(idx)
-    return kind, core
-
-
-def _report_faiss_index(label: str, path: Path):
-    """Identify and print the FAISS core index type, robust to wrappers and SWIG base-class objects.
-    Uses _unwrap_core_and_kind (duck-typing first, optional downcast fallback).
-    """
-    try:
-        idx = faiss.read_index(str(path))
-    except Exception as e:
-        _eprint(f"[faiss] {label}: (could not load index: {e.__class__.__name__})")
-        return
-
-    kind, core, wrappers = _unwrap_core_and_kind(idx)
-
-    if kind == "ivf":
-        nlist = getattr(core, "nlist", None)
-        nprobe = getattr(core, "nprobe", None)
-
-        # Detect IVFPQ via presence of .pq and pull subquantizer count robustly
-        pq = getattr(core, "pq", None)
-        m_val = None
-        if pq is not None:
-            for attr in ("M", "m", "nb_subquantizers", "nbSubquantizers"):
-                if hasattr(pq, attr):
-                    try:
-                        m_val = int(getattr(pq, attr))
-                        break
-                    except Exception:
-                        pass
-
-        if m_val is not None:
-            # IVFPQ
-            msg = f"[faiss] {label}: IVF-PQ nlist={int(nlist) if nlist is not None else 'N/A'} m={m_val}"
-            if nprobe is not None:
-                msg += f" nprobe={int(nprobe)}"
-            _eprint(msg)
-        else:
-            # Plain IVF
-            msg = f"[faiss] {label}: IVF nlist={int(nlist) if nlist is not None else 'N/A'}"
-            if nprobe is not None:
-                msg += f" nprobe={int(nprobe)}"
-            _eprint(msg)
-        return
-
-    if kind == "hnsw":
-        h = getattr(core, "hnsw", None)
-        ef = getattr(h, "efSearch", None) if h is not None else None
-
-        # Only include M if actually exposed/int-able on this wheel
-        M = None
-        if h is not None:
-            for attr in ("M", "m", "nb_neighbors", "nbNeighbors"):
-                if hasattr(h, attr):
-                    try:
-                        M = int(getattr(h, attr))
-                        break
-                    except Exception:
-                        pass
-
-        if M is not None:
-            _eprint(f"[faiss] {label}: HNSW M={M} efSearch={int(ef) if ef is not None else 'N/A'}")
-        else:
-            _eprint(f"[faiss] {label}: HNSW efSearch={int(ef) if ef is not None else 'N/A'}")
-
-        return
-
-    # FLAT
-    _eprint(f"[faiss] {label}: FLAT")
-
-    return
-
-
-def _flat_ip_index(dim: int) -> faiss.Index:
-    """Create an exact inner-product (cosine when normalized) flat index."""
-    return faiss.IndexFlatIP(dim)
-
-
-def _ivfpq_index(dim: int, nlist: int = 16384, m: int = 64, bits: int = PQ_BITS) -> faiss.Index:
-    """Create IVF-PQ index (inner product). Code size = `m` bytes per vector (8 bits/subquantizer)."""
-    quantizer = faiss.IndexFlatIP(dim)
-    idx = faiss.IndexIVFPQ(quantizer, dim, nlist, m, bits)
-    if hasattr(idx, "metric_type"):
-        idx.metric_type = faiss.METRIC_INNER_PRODUCT
-    return idx
-
-
-def _safe_pq_m(dim: int, requested_m: int) -> int:
-    """Return the largest divisor of `dim` that is <= requested_m (and >=1).
-    Guarantees a valid FAISS IVFPQ `m` (subvector count).
-    """
-    if requested_m is None or requested_m <= 0:
-        requested_m = min(64, dim)
-    requested_m = min(requested_m, dim)
-    # scan downwards until we hit a divisor
-    for m in range(requested_m, 0, -1):
-        if dim % m == 0:
-            return m
-    return 1
-
-
-def _ensure_parent(path: Path):
-    """Ensure parent directory of `path` exists."""
-    path.parent.mkdir(parents=True, exist_ok=True)
 
 
 # -------------------- Embedding segment I/O (producer↔writer) --------------------
-def _segment_fname(kind: str, producer: str, seq: int) -> str:
-    # kind: "chunks" or "papers"
-    # producer: short id (e.g., hostname-pid)
-    return f"{kind}.seg.{producer}.{seq:08d}.npz"
-
-
-def _segment_write(
-    outdir: Path,
-    kind: str,
-    producer: str,
-    seq: int,
-    ids: np.ndarray,
-    X: np.ndarray,
-    on_disk_dtype: str = "fp16",
-) -> Path:
-    outdir.mkdir(parents=True, exist_ok=True)
-    fname = _segment_fname(kind, producer, seq)
-    tmp = outdir / (fname + ".tmp")
-    final = outdir / fname
-
-    X_store = (
-        X.astype(np.float16, copy=False)
-        if on_disk_dtype == "fp16"
-        else X.astype(np.float32, copy=False)
-    )
-    np.savez(
-        tmp,
-        kind=kind,
-        dtype="fp16" if on_disk_dtype == "fp16" else "fp32",
-        dim=X.shape[1],
-        n=X.shape[0],
-        ids=ids.astype(np.int64, copy=False),
-        emb=X_store,
-    )
-    try:
-        fh = os.open(str(tmp), os.O_RDONLY)
-        try:
-            os.fsync(fh)
-        finally:
-            os.close(fh)
-    except Exception:
-        pass
-    os.replace(tmp, final)
-    _maybe_fsync_dir(final)
-    return final
-
-
-def preload_paper_id_map(conn) -> dict[str, int]:
-    """Preload doc_id → paper_id mapping for O(1) lookups during segment ingestion.
-    
-    Returns:
-        Dict mapping doc_id strings to paper_id integers.
-    """
-    cur = conn.cursor()
-    rows = cur.execute(
-        "SELECT doc_id, id FROM papers WHERE doc_id IS NOT NULL AND doc_id != ''"
-    ).fetchall()
-    return {str(doc_id): int(paper_id) for doc_id, paper_id in rows}
-
-
-def preload_chunk_id_map(conn) -> dict[tuple[int, int], int]:
-    """Preload (paper_id, ord) → chunk_id mapping for O(1) lookups during segment ingestion.
-    
-    Returns:
-        Dict mapping (paper_id, ord) tuples to chunk_id integers.
-    """
-    cur = conn.cursor()
-    rows = cur.execute("SELECT paper_id, ord, id FROM chunks").fetchall()
-    return {(int(paper_id), int(ord_val)): int(chunk_id) for paper_id, ord_val, chunk_id in rows}
-
-
-def _ingest_paper_segments(
-    conn, paper_index, outdir: Path, *, save_every: int = 2, paper_id_map: dict[str, int] | None = None
-):
-    """Ingest paper embedding segments from producer nodes.
-    
-    Segments contain doc_ids (globally unique file paths) and embeddings.
-    At ingestion time, we resolve doc_id → paper_id using the merged main DB.
-    
-    Args:
-        conn: SQLite connection to main database
-        paper_index: FAISS index for papers
-        outdir: Directory containing segment files
-        save_every: Save index every N segment files
-        paper_id_map: Optional preloaded doc_id → paper_id mapping for O(1) lookups.
-                      If None, will be loaded once at start.
-    """
-    outdir = Path(outdir)
-    if not outdir.exists():
-        return 0
-    cand = sorted(
-        list(outdir.glob("papers_*.npz"))  # new style
-        + list(outdir.glob("papers.seg.*.npz"))  # old style
-        + list(outdir.glob("papers_*.npz.ingesting"))
-        + list(outdir.glob("papers.seg.*.npz.ingesting"))
-    )
-    if not cand:
-        return 0
-    
-    # Preload paper_id_map once if not provided (O(1) lookups vs O(N) queries)
-    if paper_id_map is None:
-        paper_id_map = preload_paper_id_map(conn)
-        _eprint(f"[segments] preloaded {len(paper_id_map)} paper ID mappings")
-    
-    cur = conn.cursor()
-    added_total = 0
-    batch_counter = 0
-    for p in cand:
-        is_ingesting = p.name.endswith(".npz.ingesting")
-        tmp = p if is_ingesting else p.with_suffix(p.suffix + ".ingesting")
-        if not is_ingesting:
-            try:
-                os.replace(p, tmp)
-            except FileNotFoundError:
-                continue
-            except Exception:
-                continue
-        try:
-            with np.load(tmp, mmap_mode="r", allow_pickle=True) as z:
-                if "kind" in z.files and str(z["kind"].item()).strip() != "papers":
-                    raise ValueError("wrong segment kind for paper ingester")
-                
-                # New format: doc_ids + vecs (content-addressed)
-                if "doc_ids" in z.files and "vecs" in z.files:
-                    doc_ids = z["doc_ids"]  # object array of strings
-                    X = np.ascontiguousarray(z["vecs"].astype(np.float32))
-                    
-                    # Resolve doc_id → paper_id using preloaded map (O(1) lookups)
-                    resolved_ids = []
-                    valid_mask = []
-                    for i, doc_id in enumerate(doc_ids):
-                        doc_id_str = str(doc_id)
-                        paper_id = paper_id_map.get(doc_id_str)
-                        if paper_id is not None:
-                            resolved_ids.append(paper_id)
-                            valid_mask.append(True)
-                        else:
-                            # Paper not in merged DB yet - skip this embedding
-                            valid_mask.append(False)
-                    
-                    if not resolved_ids:
-                        os.remove(tmp)
-                        continue
-                    
-                    # Filter to only valid entries
-                    valid_mask = np.array(valid_mask, dtype=bool)
-                    ids = np.array(resolved_ids, dtype=np.int64)
-                    X = X[valid_mask]
-                
-                # Legacy format: ids + vecs (shard-local IDs, deprecated)
-                elif "ids" in z.files and ("vecs" in z.files or "emb" in z.files):
-                    ids = np.ascontiguousarray(z["ids"].astype(np.int64))
-                    X = np.ascontiguousarray(
-                        (z["vecs"] if "vecs" in z.files else z["emb"]).astype(np.float32)
-                    )
-                else:
-                    raise ValueError(f"Segment missing doc_ids/vecs or ids/vecs in {p.name}")
-            
-            if ids.size == 0:
-                os.remove(tmp)
-                continue
-
-            if not isinstance(paper_index, faiss.IndexIDMap2):
-                paper_index = faiss.IndexIDMap2(paper_index)
-
-            prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
-            added, ids_added, saved = 0, [], False
-            try:
-                with FileLock(FAISS_LOCK):
-                    added, ids_added = _add_with_ids_dedup(paper_index, ids, X)
-                    if added:
-                        saved = _faiss_save_force(paper_index, PAPER_INDEX_PATH) if prior_ntotal == 0 \
-                                else _faiss_save(paper_index, PAPER_INDEX_PATH)
-            except RuntimeError:
-                # Compat path: hold DB_LOCK then FAISS_LOCK (lock-order invariant), and commit under DB_LOCK.
-                with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                    added = _add_ids_union_compat(
-                        paper_index, ids, X, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
-                    )
-                    conn.commit()
-                saved = bool(added)
-            if added:
-                if saved:
-                    with FileLock(DB_LOCK):
-                        if len(ids_added) > 0:
-                            _mark_in_index(cur, "papers", [int(i) for i in ids_added])
-                        conn.commit()
-                else:
-                    if len(ids_added) > 0:
-                        _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
-
-            added_total += int(added or 0)
-            batch_counter += 1
-            os.remove(tmp)
-
-            if (batch_counter % max(1, int(save_every))) == 0:
-                with FileLock(FAISS_LOCK):
-                    saved_now = _faiss_save(paper_index, PAPER_INDEX_PATH)
-                if saved_now:
-                    with FileLock(DB_LOCK):
-                        _flush_pending_marks(cur)
-                        conn.commit()
-        except Exception as e:
-            if not is_ingesting:
-                try:
-                    os.replace(tmp, p)
-                except Exception:
-                    pass
-            _eprint(f"[segments] ERROR ingesting {p.name}: {e.__class__.__name__}: {e}")
-    return added_total
-
-
-def _ingest_chunk_segments(
-    conn, chunk_index, outdir: Path, *, save_every: int = 2,
-    paper_id_map: dict[str, int] | None = None,
-    chunk_id_map: dict[tuple[int, int], int] | None = None
-):
-    """Ingest chunk embedding segments from producer nodes.
-    
-    Segments contain (paper_doc_id, ord) pairs and embeddings.
-    At ingestion time, we resolve (paper_doc_id, ord) → chunk_id using the merged main DB.
-    
-    Safe file-handling:
-      - rename "<file>.npz" -> "<file>.npz.ingesting" before reading (atomic)
-      - if already ".npz.ingesting", read in place
-      - on success, delete the .ingesting file
-      - on failure, rename back so it can be retried next run
-
-    Args:
-        conn: SQLite connection to main database
-        chunk_index: FAISS index for chunks
-        outdir: Directory containing segment files
-        save_every: Save index every N segment files
-        paper_id_map: Optional preloaded doc_id → paper_id mapping for O(1) lookups.
-                      If None, will be loaded once at start.
-        chunk_id_map: Optional preloaded (paper_id, ord) → chunk_id mapping for O(1) lookups.
-                      If None, will be loaded once at start.
-
-    Returns the number of vectors added.
-    """
-    outdir = Path(outdir)
-    if not outdir.exists():
-        return 0
-
-    # Ensure external ID mapping is present for robust remove and add
-    if not isinstance(chunk_index, faiss.IndexIDMap2):
-        chunk_index = faiss.IndexIDMap2(chunk_index)
-
-    # Accept both our writer's names and generic .npz containing {'ids','vecs'}.
-    # Also consider files already in the ".ingesting" state.
-    cand = sorted(
-        list(outdir.glob("chunks_*.npz"))  # new style
-        + list(outdir.glob("chunks.seg.*.npz"))  # old style
-        + list(outdir.glob("chunks_*.npz.ingesting"))
-        + list(outdir.glob("chunks.seg.*.npz.ingesting"))
-    )
-    if not cand:
-        return 0
-
-    # Preload ID maps once if not provided (O(1) lookups vs O(N) queries)
-    if paper_id_map is None:
-        paper_id_map = preload_paper_id_map(conn)
-        _eprint(f"[segments] preloaded {len(paper_id_map)} paper ID mappings")
-    if chunk_id_map is None:
-        chunk_id_map = preload_chunk_id_map(conn)
-        _eprint(f"[segments] preloaded {len(chunk_id_map)} chunk ID mappings")
-
-    cur = conn.cursor()
-    added_total = 0
-    batch_counter = 0
-
-    for p in cand:
-        # Normalize to a working path "tmp" that we always read from:
-        is_ingesting = p.name.endswith(".npz.ingesting")
-        tmp = p if is_ingesting else p.with_suffix(p.suffix + ".ingesting")
-
-        if not is_ingesting:
-            try:
-                # Claim atomically; another writer may race us.
-                os.replace(p, tmp)
-            except FileNotFoundError:
-                continue
-            except Exception:
-                # Could not claim; skip
-                continue
-
-        try:
-            with np.load(tmp, mmap_mode="r", allow_pickle=True) as z:
-                # Reject wrong-kind files (old .seg has 'kind')
-                if "kind" in z.files and str(z["kind"].item()).strip() != "chunks":
-                    raise ValueError("wrong segment kind for chunk ingester")
-                
-                # New format: paper_doc_ids + ords + vecs (content-addressed)
-                if "paper_doc_ids" in z.files and "ords" in z.files and "vecs" in z.files:
-                    paper_doc_ids = z["paper_doc_ids"]  # object array of strings
-                    ords = z["ords"]  # int32 array
-                    X = np.ascontiguousarray(z["vecs"].astype(np.float32))
-                    
-                    # Resolve (paper_doc_id, ord) → chunk_id using preloaded maps (O(1) lookups)
-                    resolved_ids = []
-                    valid_mask = []
-                    for i, (doc_id, ord_val) in enumerate(zip(paper_doc_ids, ords)):
-                        doc_id_str = str(doc_id)
-                        ord_int = int(ord_val)
-                        
-                        # Get paper_id from preloaded map
-                        paper_id = paper_id_map.get(doc_id_str)
-                        
-                        if paper_id is not None:
-                            # Get chunk_id from preloaded map
-                            chunk_id = chunk_id_map.get((paper_id, ord_int))
-                            
-                            if chunk_id is not None:
-                                resolved_ids.append(chunk_id)
-                                valid_mask.append(True)
-                            else:
-                                # Chunk not in merged DB yet - skip this embedding
-                                valid_mask.append(False)
-                        else:
-                            # Paper not in merged DB yet - skip this embedding
-                            valid_mask.append(False)
-                    
-                    if not resolved_ids:
-                        os.remove(tmp)
-                        continue
-                    
-                    # Filter to only valid entries
-                    valid_mask = np.array(valid_mask, dtype=bool)
-                    ids = np.array(resolved_ids, dtype=np.int64)
-                    X = X[valid_mask]
-                
-                # Legacy format: ids + vecs (shard-local IDs, deprecated)
-                elif "ids" in z.files and "vecs" in z.files:
-                    ids = np.ascontiguousarray(z["ids"].astype(np.int64))
-                    X = np.ascontiguousarray(z["vecs"].astype(np.float32))
-                elif "ids" in z.files and "emb" in z.files:
-                    ids = np.ascontiguousarray(z["ids"].astype(np.int64))
-                    X = np.ascontiguousarray(z["emb"].astype(np.float32))
-                else:
-                    raise ValueError(f"Segment missing required keys: {z.files}")
-
-            if ids.size == 0:
-                os.remove(tmp)
-                continue
-
-            prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
-            added, ids_added, saved = 0, [], False
-            try:
-                with FileLock(FAISS_LOCK):
-                    sel = _make_id_selector(ids)
-                    _safe_remove_ids(chunk_index, sel)
-                    added, ids_added = _add_with_ids_dedup(chunk_index, ids, X)
-                    if added:
-                        saved = _faiss_save_force(chunk_index, CHUNK_INDEX_PATH) if prior_ntotal == 0 \
-                                else _faiss_save(chunk_index, CHUNK_INDEX_PATH)
-            except RuntimeError:
-                with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                    added = _add_ids_union_compat(
-                        chunk_index, ids, X, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
-                    )
-                    conn.commit()
-                saved = bool(added)
-            if added:
-                if saved:
-                    with FileLock(DB_LOCK):
-                        if len(ids_added) > 0:
-                            _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
-                        conn.commit()
-                else:
-                    if len(ids_added) > 0:
-                        _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
-
-            added_total += int(added)
-            batch_counter += 1
-            os.remove(tmp)
-
-            if (batch_counter % max(1, int(save_every))) == 0:
-                with FileLock(FAISS_LOCK):
-                    saved_now = _faiss_save(chunk_index, CHUNK_INDEX_PATH)
-                if saved_now:
-                    with FileLock(DB_LOCK):
-                        _flush_pending_marks(cur)
-                        conn.commit()
-
-        except Exception as e:
-            # If we claimed it, put it back so another run can retry.
-            if not is_ingesting:
-                try:
-                    os.replace(tmp, p)
-                except Exception:
-                    pass
-            _eprint(f"[segments] ERROR ingesting {p.name}: {e.__class__.__name__}: {e}")
-
-    return added_total
-
-
-def _extract_ivf(index):
-    """Return IVF/IVFPQ core using the same unwrapping logic as reporting."""
-    kind, core, _ = _unwrap_core_and_kind(index)
-    if kind == "ivf" and hasattr(core, "nlist"):
-        return core
-    return None
-
-
-def _auto_set_nprobe(index, user_nprobe=None, min_probe=8, max_probe=512):
-    """Set `nprobe` on IVF indices. If `user_nprobe` is None, choose ≈ sqrt(nlist)
-    clamped to [min_probe, max_probe] and ≤ nlist. No-op for non-IVF indices.
-
-    Returns:
-    -------
-    (nprobe, nlist) or None
-    """
-    ivf = _extract_ivf(index)
-    if ivf is None:
-        return  # FLAT/HNSW; nprobe not applicable
-    nlist = int(getattr(ivf, "nlist", 0))
-    if nlist <= 0:
-        return  # untrained IVF
-
-    target = _pick_nprobe(nlist, user_nprobe)
-    ivf.nprobe = target
-    return target, nlist
-
 
 def backfill_unindexed_vectors(
     conn,
@@ -2196,391 +932,71 @@ def backfill_unindexed_vectors(
     paper_bs=None,
     chunk_bs=None,
 ):
-    """Embed and add any rows that exist in SQLite but were never added to FAISS (in_index=0)."""
-    cur = conn.cursor()
-
-    # Papers
-    while True:
-        rows = cur.execute(
-            "SELECT id, (COALESCE(title,'') || ' ' || COALESCE(abstract,'')) AS txt "
-            "FROM papers WHERE in_index=0 LIMIT ?",
-            (batch,),
-        ).fetchall()
-        if not rows:
-            break
-        ids = [r[0] for r in rows]
-        texts = [(r[1] or "untitled").strip() for r in rows]
-        Xp = paper_embedder.encode(
-            texts, progress_label=f"Embedding papers (backfill, {len(texts)})", 
-            batch_size=paper_bs,
-            progress_done_summary=False,
-        )
-
-        if not isinstance(paper_index, faiss.IndexIDMap2):
-            paper_index = faiss.IndexIDMap2(paper_index)
-
-        try:
-            prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
-            with FileLock(FAISS_LOCK):
-                sel = _make_id_selector(ids)
-                _safe_remove_ids(paper_index, sel)
-                added, ids_added = _add_with_ids_dedup(paper_index, ids, Xp)
-                saved = False
-                if added:
-                    saved = _faiss_save_force(paper_index, PAPER_INDEX_PATH) if prior_ntotal == 0 \
-                            else _faiss_save(paper_index, PAPER_INDEX_PATH)
-        except RuntimeError:
-            with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                added = _add_ids_union_compat(
-                    paper_index, ids, Xp, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
-                )
-                conn.commit()
-            saved = bool(added)
-            ids_added = ids if added == 0 else []
-        if added and saved:
-            with FileLock(DB_LOCK):
-                _mark_in_index(cur, "papers", [int(i) for i in (ids_added or ids)])
-                _flush_pending_marks(cur)
-                conn.commit()
-        else:
-            if added:
-                _PENDING_MARKS["papers"].extend([int(i) for i in (ids_added or ids)])
-            conn.commit()
-
-    # Chunks
-    while True:
-        rows = cur.execute(
-            "SELECT id, text FROM chunks WHERE in_index=0 LIMIT ?", (batch,)
-        ).fetchall()
-        if not rows:
-            break
-        ids = [r[0] for r in rows]
-        texts = [r[1] for r in rows]
-        Xc = chunk_embedder.encode(
-            texts, progress_label=f"Embedding chunks (backfill, {len(texts)})", 
-            batch_size=chunk_bs,
-            progress_done_summary=False,
-        )
-        if not isinstance(chunk_index, faiss.IndexIDMap2):
-            chunk_index = faiss.IndexIDMap2(chunk_index)
-
-        try:
-            prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
-            with FileLock(FAISS_LOCK):
-                sel = _make_id_selector(ids)
-                _safe_remove_ids(chunk_index, sel)
-                added, ids_added = _add_with_ids_dedup(chunk_index, ids, Xc)
-                saved = False
-                if added:
-                    saved = _faiss_save_force(chunk_index, CHUNK_INDEX_PATH) if prior_ntotal == 0 \
-                            else _faiss_save(chunk_index, CHUNK_INDEX_PATH)
-        except RuntimeError:
-            with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                added = _add_ids_union_compat(
-                    chunk_index, ids, Xc, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
-                )
-                conn.commit()
-            saved = bool(added)
-            ids_added = ids if added == 0 else []
-        if added and saved:
-            with FileLock(DB_LOCK):
-                _mark_in_index(cur, "chunks", [int(i) for i in (ids_added or ids)])
-                _flush_pending_marks(cur)
-                conn.commit()
-        else:
-            if added:
-                _PENDING_MARKS["chunks"].extend([int(i) for i in (ids_added or ids)])
-            conn.commit()
-
-
-def _make_id_selector(ids_like):
-    """Return a FAISS IDSelector compatible with faiss build, or the raw int64 array as a last resort.
-    Supports both IDSelectorArray (newer) and IDSelectorBatch (older) names.
-    """
-    arr = np.ascontiguousarray(ids_like, dtype=np.int64)
-
-    Sel = getattr(faiss, "IDSelectorArray", None) or getattr(faiss, "IDSelectorBatch", None)
-    if Sel is not None:
-        return Sel(arr)
-
-    # Fallback: no selector types available — the only portable way is to rebuild without the ids.
-    # Callers that need removal should use this helper.
-    raise RuntimeError(
-        "FAISS build lacks IDSelectorArray/Batch; re-run with LITKIT_FAISS_COMPAT_REBUILD=1 to rebuild index without stale ids."
+    """Thin wrapper: delegates to litkit.build.backfill with runtime paths."""
+    _load_heavy_deps()  # litkit.build pulls in faiss/numpy
+    from litkit.build import backfill_unindexed_vectors as build_backfill_unindexed_vectors
+    get_runtime()
+    return build_backfill_unindexed_vectors(
+        conn, paper_embedder, chunk_embedder, paper_index, chunk_index,
+        paper_index_path=PAPER_INDEX_PATH,
+        chunk_index_path=CHUNK_INDEX_PATH,
+        faiss_lock_path=FAISS_LOCK,
+        db_lock_path=DB_LOCK,
+        FileLock=FileLock,
+        batch=batch,
+        paper_bs=paper_bs,
+        chunk_bs=chunk_bs,
     )
 
 
-def _safe_remove_ids(index, sel) -> int:
-    """Best-effort removal of ids irrespective of index family (IDMap2/HNSW/FLAT/IVF).
-    Returns the number of vectors removed (0 if unsupported or none removed).
-    """
-    # 1) Try on the current object
-    try:
-        return int(index.remove_ids(sel))
-    except Exception:
-        pass
-
-    # 2) Try to unwrap common wrappers (e.g., IndexIDMap2, IndexPreTransform)
-    base = getattr(index, "index", None)
-    for _ in range(8):
-        if base is None:
-            break
-        try:
-            return int(base.remove_ids(sel))
-        except Exception:
-            base = getattr(base, "index", None)
-
-    return 0
 
 
 def _post_build_sanity_check(conn, args):
-    """Sanity print after build: DB vs FAISS counts and index types (papers & chunks)."""
-    # ----- papers -----
-    try:
-        p_idx = faiss.read_index(str(PAPER_INDEX_PATH))
-    except Exception:
-        p_idx = None
-    _report_faiss_index("papers", PAPER_INDEX_PATH)
-
-    cur = conn.cursor()
-    n_db_p = cur.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
-    n_in_p = cur.execute("SELECT COUNT(*) FROM papers WHERE in_index=1").fetchone()[0]
-    n_faiss_p = int(getattr(p_idx, "ntotal", 0) or 0)
-    _eprint(f"[summary] papers: db={n_db_p} in_index={n_in_p} faiss_ntotal={n_faiss_p}")
-
-    # ----- chunks -----
-    try:
-        c_idx = faiss.read_index(str(CHUNK_INDEX_PATH))
-    except Exception:
-        c_idx = None
-    _report_faiss_index("chunks", CHUNK_INDEX_PATH)
-
-    n_db_c = cur.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-    n_in_c = cur.execute("SELECT COUNT(*) FROM chunks WHERE in_index=1").fetchone()[0]
-    n_faiss_c = int(getattr(c_idx, "ntotal", 0) or 0)
-    _eprint(f"[summary] chunks: db={n_db_c} in_index={n_in_c} faiss_ntotal={n_faiss_c}")
-
-
-_STOPWORDS = {
-    "the",
-    "and",
-    "for",
-    "with",
-    "that",
-    "this",
-    "from",
-    "into",
-    "your",
-    "about",
-    "does",
-    "what",
-    "when",
-    "where",
-    "which",
-    "who",
-    "whom",
-    "whose",
-    "why",
-    "how",
-    "are",
-    "is",
-    "was",
-    "were",
-    "be",
-    "been",
-    "being",
-    "of",
-    "on",
-    "in",
-    "to",
-    "a",
-    "an",
-    "as",
-    "by",
-    "at",
-    "it",
-    "its",
-    "their",
-    "them",
-    "we",
-    "you",
-    "i",
-}
-
-# optional kill-switch for lexical prefilter on very large DBs
-DISABLE_LEXICAL = os.environ.get("LITKIT_NO_LEXICAL", "") != ""
-
-# one-shot guard for noisy sqlite3.OperationalError logging in lexical prefilter
-_LEXICAL_WARN_ONCE = False
-
-
-def _query_terms(s: str) -> list[str]:
-    # extract alnum/underscore/dash tokens, lowercase, drop short/common words
-    words = re.findall(r"[A-Za-z0-9_-]{3,}", s.lower())
-    # keep “rare-ish” tokens (>=5 chars OR has digits OR camel-ish separator)
-    out = []
-    for w in words:
-        if w in _STOPWORDS:
-            continue
-        if (
-            len(w) >= 5
-            or (w.isupper() and len(w) >= 3)
-            or any(ch.isdigit() for ch in w)
-            or "_" in w
-            or "-" in w
-        ):
-            out.append(w)
-    # de-dup preserve order
-    seen = set()
-    uniq = []
-    for w in out:
-        if w not in seen:
-            seen.add(w)
-            uniq.append(w)
-    return uniq
-
-
-def _mark_in_index(cur, table: str, ids: list[int]):
-    cur.executemany(f"UPDATE {table} SET in_index=1 WHERE id=?", [(i,) for i in ids])
+    """Thin wrapper: delegates to litkit.build.post_build_sanity_check with runtime paths."""
+    _load_heavy_deps()  # litkit.build pulls in faiss/numpy
+    from litkit.build import post_build_sanity_check as build_post_build_sanity_check
+    get_runtime()
+    return build_post_build_sanity_check(
+        conn,
+        paper_index_path=PAPER_INDEX_PATH,
+        chunk_index_path=CHUNK_INDEX_PATH,
+    )
 
 
 def _auto_top_papers() -> int:
+    """Heuristic for Stage-1 shortlist size based on corpus size."""
+    d = deps()  # ensures loaded + returns namespace (consistent pattern)
+    get_runtime()  # ensure path globals are initialized for library use
+    
+    def _piecewise_heuristic(n: int) -> int:
+        if n < 50_000:
+            return 500
+        if n < 500_000:
+            return 1000
+        if n < 2_000_000:
+            return 2000
+        return 4000
+    
+    conn = None
     try:
-        conn = _connect_db()
+        conn = d.db_connect_db(DB_PATH)
         n = conn.execute("SELECT COUNT(1) FROM papers").fetchone()[0]
-        conn.close()
+        return _piecewise_heuristic(n)
     except Exception:
-        n = 0
-    # piecewise heuristic: stable and cheap
-    if n < 50_000:
-        return 500
-    if n < 500_000:
-        return 1000
-    if n < 2_000_000:
-        return 2000
-    return 4000
+        return _piecewise_heuristic(0)
+    finally:
+        if conn is not None:
+            conn.close()
 
 
-def _sqlite_norm_expr(field: str = "text") -> str:
-    """Build a SQL expression that normalizes common unicode variants so LIKE patterns match:
-    - Map hyphen/minus variants to ASCII '-'
-    - Map subscript digits to ASCII digits
-    - Lowercase
-    """
-    f = f"lower({field})"
-    # hyphen/minus variants: U+2010..U+2014, U+2212, plus soft hyphen U+00AD (strip)
-    for ch, repl in [
-        ("\u00ad", ""),
-        ("\u2010", "-"),
-        ("\u2011", "-"),
-        ("\u2012", "-"),
-        ("\u2013", "-"),
-        ("\u2014", "-"),
-        ("\u2212", "-"),
-    ]:
-        f = f"replace({f}, '{ch}', '{repl}')"
-    # subscript digits → ASCII
-    subs = "₀₁₂₃₄₅₆₇₈₉"
-    for d_sub, d in zip(subs, "0123456789", strict=False):
-        f = f"replace({f}, '{d_sub}', '{d}')"
-    return f
-
-
-def _escape_like(s: str, esc: str = "\\") -> str:
-    # Order matters: escape the escape char first, then the wildcards.
-    s = s.replace(esc, esc + esc)
-    s = s.replace("%", esc + "%")
-    s = s.replace("_", esc + "_")
-    return s
-
-
-def _normalize_for_search_py(s: str) -> str:
-    # Keep SQL ↔ Python normalization identical: SQLite LOWER() ≈ Python .lower()
-    s = unicodedata.normalize("NFKC", s).lower()
-    for ch, repl in [
-        ("\u00ad", ""),
-        ("\u2010", "-"),
-        ("\u2011", "-"),
-        ("\u2012", "-"),
-        ("\u2013", "-"),
-        ("\u2014", "-"),
-        ("\u2212", "-"),
-    ]:
-        s = s.replace(ch, repl)
-    trans = str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789")
-    return s.translate(trans)
-
-
-def _connect_db(busy_timeout_ms: int | None = None, *, autocommit: bool = False):
-    if busy_timeout_ms is None:
-        busy_timeout_ms = DEFAULT_BUSY_TIMEOUT_MS
-    iso = None if autocommit else "DEFERRED"
-    conn = sqlite3.connect(DB_PATH, isolation_level=iso, timeout=busy_timeout_ms / 1000.0)
-    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)};")
-    conn.execute("PRAGMA temp_store=MEMORY;")
-    return conn
-
-
-# DB helper
-def _ensure_temp_candidates_table(conn):
-    conn.execute("CREATE TEMP TABLE IF NOT EXISTS cand_papers (id INTEGER PRIMARY KEY)")
-    conn.execute("DELETE FROM cand_papers")
-
-
-# DB helper
-def _load_temp_candidates(conn, pids: list[int]) -> None:
-    _ensure_temp_candidates_table(conn)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM cand_papers")
-    cur.executemany("INSERT OR IGNORE INTO cand_papers(id) VALUES (?)", [(int(x),) for x in pids])
-    conn.commit()
-
-
-def load_checkpoint() -> dict:
-    """Load JSON checkpoint (if exists) for resumable workflows; else {}."""
-    if CKPT_PATH.exists():
-        try:
-            return json.loads(CKPT_PATH.read_text())
-        except Exception:
-            return {}
-    return {}
-
-
-def save_checkpoint(obj: dict):
-    with FileLock(CKPT_LOCK):
-        tmp = CKPT_PATH.with_suffix(".tmp")
-        with open(tmp, "w") as fh:
-            fh.write(json.dumps(obj, indent=2))
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, CKPT_PATH)
-        _maybe_fsync_dir(CKPT_PATH)
-
-
-def already_processed(cur, fpath: str, st) -> bool:
-    """Check if file at `fpath` with current stat `st` was already ingested
-    (size and mtime match a row in the files table).
-    """
-    cur.execute("SELECT size, mtime FROM files WHERE path=?", (fpath,))
-    row = cur.fetchone()
-    if not row:
-        return False
-    size, mtime = row
-    return size == st.st_size and abs(mtime - st.st_mtime) < 1e-6
-
-
-def _is_uncompressed_tar(tar_path: Path) -> bool:
-    """Detect if a tar file is uncompressed (no .gz/.bz2/.xz suffix)."""
-    name = tar_path.name.lower()
-    return name.endswith(".tar") and not any(
-        name.endswith(ext) for ext in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".txz")
-    )
+# NOTE: load_checkpoint and save_checkpoint moved to litkit.segments.checkpoint
+# Use seg_load_checkpoint() and seg_save_checkpoint() from imports above.
 
 
 def iter_tar_articles(
     tar_path: Path,
     parse_workers: int = 8,
-) -> Iterator[tuple[TarMemberMeta | SimpleNamespace, ArticleMeta]]:
+) -> Iterator[tuple["TarMemberMeta | SimpleNamespace", "ArticleMeta"]]:
     """Unified iterator over articles in a tar file.
     
     For uncompressed .tar files (when parse_workers > 1), uses parallel XML parsing.
@@ -2591,18 +1007,21 @@ def iter_tar_articles(
         - member_meta has .name, .size, .mtime attributes
         - article_meta is the parsed ArticleMeta dict
     """
-    use_parallel = parse_workers > 1 and _is_uncompressed_tar(tar_path)
+    d = deps()  # ensures loaded + returns namespace (consistent pattern)
+    use_parallel = parse_workers > 1 and d.is_uncompressed_tar(tar_path)
     
     if use_parallel:
         # Parallel path for uncompressed tars
-        _eprint(f"[scan] using parallel XML parsing ({parse_workers} workers) for {tar_path.name}")
-        for member_meta, article_meta in parallel_iter_tar_articles(tar_path, workers=parse_workers):
+        from litkit.progress import is_quiet
+        if not is_quiet():
+            _eprint(f"[scan] using parallel XML parsing ({parse_workers} workers) for {tar_path.name}")
+        for member_meta, article_meta in d.parallel_iter_tar_articles(tar_path, workers=parse_workers):
             yield member_meta, article_meta
     else:
         # Sequential path for compressed tars (or when parallel disabled)
-        for tarinfo, fobj in iter_tar_xml_streams(tar_path):
+        for tarinfo, fobj in d.iter_tar_xml_streams(tar_path):
             try:
-                article_meta = parse_xml_fileobj(fobj)
+                article_meta = d.parse_xml_fileobj(fobj)
                 if article_meta is not None:
                     # Wrap TarInfo in SimpleNamespace for consistent interface
                     member_meta = SimpleNamespace(
@@ -2616,294 +1035,6 @@ def iter_tar_articles(
                     fobj.close()
                 except Exception:
                     pass
-
-
-def register_file(cur, fpath: str, paper_id: int, st):
-    """Insert/replace the (path, size, mtime, paper_id) record in files table."""
-    cur.execute(
-        "INSERT OR REPLACE INTO files(path, size, mtime, paper_id) VALUES (?,?,?,?)",
-        (fpath, st.st_size, st.st_mtime, paper_id),
-    )
-
-
-# -------------------- Ingest helper for parallel/sequential paths --------------------
-
-class _IngestContext:
-    """Holds shared state for article ingestion across parallel and sequential paths."""
-    
-    def __init__(
-        self,
-        conn,
-        cur,
-        args,
-        paper_embedder,
-        chunk_embedder,
-        paper_index,
-        chunk_index,
-    ):
-        self.conn = conn
-        self.cur = cur
-        self.args = args
-        self.paper_embedder = paper_embedder
-        self.chunk_embedder = chunk_embedder
-        self.paper_index = paper_index
-        self.chunk_index = chunk_index
-        
-        # Buffers for batching
-        self.paper_ids_buf: list[int] = []
-        self.paper_texts_buf: list[str] = []
-        self.chunk_ids_buf: list[int] = []
-        self.chunk_texts_buf: list[str] = []
-        
-        # Counters
-        self.papers_added_total = 0
-        self.chunks_added_total = 0
-
-
-def _ingest_article(
-    ctx: _IngestContext,
-    meta: ArticleMeta,
-    file_path: str,
-    st: SimpleNamespace,
-) -> bool:
-    """Ingest a single parsed article into the database and embedding buffers.
-    
-    Args:
-        ctx: Shared ingest context with DB connection, embedders, indices, and buffers
-        meta: Parsed article metadata from parse_xml_fileobj()
-        file_path: Canonical path string (e.g., "tar://foo.tar!/member.nxml")
-        st: SimpleNamespace with .st_size and .st_mtime attributes
-    
-    Returns:
-        True if successfully ingested, False on error
-    """
-    cur = ctx.cur
-    conn = ctx.conn
-    args = ctx.args
-    
-    try:
-        pmcid = (meta["pmcid"] or "").strip()
-        pmid = (meta["pmid"] or "").strip()
-
-        pid_row = None
-        if pmcid:
-            pid_row = cur.execute(
-                "SELECT id FROM papers WHERE pmcid=?", (pmcid,)
-            ).fetchone()
-        if (pid_row is None) and pmid:
-            pid_row = cur.execute(
-                "SELECT id FROM papers WHERE pmid=?", (pmid,)
-            ).fetchone()
-        if pid_row:
-            pid = pid_row[0]
-        else:
-            cur.execute(
-                "INSERT INTO papers(pmid, pmcid, title, abstract) VALUES (?,?,?,?)",
-                (pmid, pmcid, meta["title"], meta["abstract"]),
-            )
-            pid = cur.lastrowid
-
-        seen_this_path = (
-            cur.execute("SELECT 1 FROM files WHERE path=?", (file_path,)).fetchone()
-            is not None
-        )
-        if seen_this_path:
-            if args.faiss_writer:
-                with FileLock(FAISS_LOCK):
-                    if not isinstance(ctx.paper_index, faiss.IndexIDMap2):
-                        ctx.paper_index = faiss.IndexIDMap2(ctx.paper_index)
-                    selp = _make_id_selector([pid])
-                    _safe_remove_ids(ctx.paper_index, selp)
-                    _faiss_save_force(ctx.paper_index, PAPER_INDEX_PATH)
-
-                old_ids = [
-                    row[0]
-                    for row in cur.execute(
-                        "SELECT id FROM chunks WHERE paper_id=?", (pid,)
-                    )
-                ]
-                if old_ids:
-                    with FileLock(FAISS_LOCK):
-                        if not isinstance(ctx.chunk_index, faiss.IndexIDMap2):
-                            ctx.chunk_index = faiss.IndexIDMap2(ctx.chunk_index)
-                        selc = _make_id_selector(old_ids)
-                        _safe_remove_ids(ctx.chunk_index, selc)
-                        _faiss_save_force(ctx.chunk_index, CHUNK_INDEX_PATH)
-            with FileLock(DB_LOCK):
-                cur.execute("DELETE FROM chunks WHERE paper_id=?", (pid,))
-                cur.execute("UPDATE papers SET in_index=0 WHERE id=?", (pid,))
-
-        register_file(cur, file_path, pid, st)
-
-        ta = (meta["title"] or "").strip()
-        ab = (meta["abstract"] or "").strip()
-        ta_ab = (ta + " " + ab).strip() or (
-            meta["paragraphs"][0][:800] if meta["paragraphs"] else "untitled"
-        )
-        ctx.paper_ids_buf.append(pid)
-        ctx.paper_texts_buf.append(ta_ab)
-
-        proposed_chunks = []
-        if ta_ab:
-            proposed_chunks.append((-1, ta_ab))
-
-        paras = meta["paragraphs"] or ([ab] if ab else [])
-        chunks = (
-            pack_paragraphs(
-                paras,
-                max_chars=int(
-                    getattr(args, "chunk_target_chars", CHUNK_TARGET_CHARS)
-                ),
-                min_chars=int(getattr(args, "chunk_min_chars", BODY_MIN_CHARS)),
-                overlap_chars=int(
-                    getattr(args, "chunk_overlap", CHUNK_OVERLAP_CHARS)
-                ),
-            )
-            if paras
-            else []
-        )
-        for ord_i, ch in enumerate(chunks):
-            proposed_chunks.append((ord_i, ch))
-
-        for ord_i, text_i in proposed_chunks:
-            cur.execute(
-                "INSERT INTO chunks(paper_id, ord, text) VALUES (?,?,?)",
-                (pid, ord_i, text_i),
-            )
-            cid = cur.lastrowid
-            ctx.chunk_ids_buf.append(cid)
-            ctx.chunk_texts_buf.append(text_i)
-
-        # Flush paper batch if needed
-        if len(ctx.paper_ids_buf) >= PAPER_BATCH:
-            _flush_paper_batch(ctx)
-
-        # Flush chunk batch if needed
-        if len(ctx.chunk_ids_buf) >= CHUNK_BATCH:
-            _flush_chunk_batch(ctx)
-
-        return True
-
-    except Exception as e:
-        _eprint(f"[ingest] ERROR {file_path}: {e.__class__.__name__}: {e}")
-        try:
-            with FileLock(DB_LOCK):
-                conn.rollback()
-        except Exception:
-            pass
-        return False
-
-
-def _flush_paper_batch(ctx: _IngestContext) -> None:
-    """Embed and persist the current paper buffer."""
-    if not ctx.paper_ids_buf:
-        return
-    
-    u_ids, u_texts = _dedupe_ids_and_texts(ctx.paper_ids_buf, ctx.paper_texts_buf)
-
-    if paper_seg_writer is not None:
-        Xp = ctx.paper_embedder.encode(
-            u_texts,
-            progress_label=f"Embedding papers (producer, {len(u_texts)})",
-            batch_size=ctx.args.paper_embed_bs,
-            progress_done_summary=False,
-        )
-        paper_seg_writer.write(
-            ids=np.asarray(u_ids, dtype=np.int64), vecs=Xp
-        )
-        ctx.conn.commit()
-        ctx.papers_added_total += len(u_ids)
-
-    elif ctx.args.faiss_writer:
-        Xp = ctx.paper_embedder.encode(
-            u_texts,
-            progress_label=f"Embedding papers (batch of {len(u_texts)})",
-            batch_size=ctx.args.paper_embed_bs,
-            progress_done_summary=False,
-        )
-        prior_ntotal = int(getattr(ctx.paper_index, "ntotal", 0) or 0)
-        sel = _make_id_selector(u_ids)
-        with FileLock(FAISS_LOCK):
-            _safe_remove_ids(ctx.paper_index, sel)
-            added, ids_added = _add_with_ids_dedup(ctx.paper_index, u_ids, Xp)
-            saved = False
-            if added:
-                if prior_ntotal == 0:
-                    saved = _faiss_save_force(ctx.paper_index, PAPER_INDEX_PATH)
-                else:
-                    saved = _faiss_save(ctx.paper_index, PAPER_INDEX_PATH)
-        if added:
-            if saved:
-                with FileLock(DB_LOCK):
-                    _mark_in_index(ctx.cur, "papers", [int(i) for i in ids_added])
-                    _flush_pending_marks(ctx.cur)
-                    ctx.conn.commit()
-            else:
-                _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
-        ctx.papers_added_total += int(added)
-
-    else:
-        ctx.conn.commit()
-        ctx.papers_added_total += len(u_ids)
-
-    ctx.paper_ids_buf.clear()
-    ctx.paper_texts_buf.clear()
-
-
-def _flush_chunk_batch(ctx: _IngestContext) -> None:
-    """Embed and persist the current chunk buffer."""
-    if not ctx.chunk_ids_buf:
-        return
-    
-    u_ids, u_texts = _dedupe_ids_and_texts(ctx.chunk_ids_buf, ctx.chunk_texts_buf)
-
-    if chunk_seg_writer is not None:
-        Xc = ctx.chunk_embedder.encode(
-            u_texts,
-            progress_label=f"Embedding chunks (producer, {len(u_texts)})",
-            batch_size=ctx.args.chunk_embed_bs,
-            progress_done_summary=False,
-        )
-        chunk_seg_writer.write(
-            ids=np.asarray(u_ids, dtype=np.int64), vecs=Xc
-        )
-        ctx.conn.commit()
-        ctx.chunks_added_total += len(u_ids)
-
-    elif ctx.args.faiss_writer:
-        Xc = ctx.chunk_embedder.encode(
-            u_texts,
-            progress_label=f"Embedding chunks (batch of {len(u_texts)})",
-            batch_size=ctx.args.chunk_embed_bs,
-            progress_done_summary=False,
-        )
-        prior_ntotal = int(getattr(ctx.chunk_index, "ntotal", 0) or 0)
-        sel = _make_id_selector(u_ids)
-        with FileLock(FAISS_LOCK):
-            _safe_remove_ids(ctx.chunk_index, sel)
-            added, ids_added = _add_with_ids_dedup(ctx.chunk_index, u_ids, Xc)
-            saved = False
-            if added:
-                if prior_ntotal == 0:
-                    saved = _faiss_save_force(ctx.chunk_index, CHUNK_INDEX_PATH)
-                else:
-                    saved = _faiss_save(ctx.chunk_index, CHUNK_INDEX_PATH)
-        if added:
-            if saved:
-                with FileLock(DB_LOCK):
-                    _mark_in_index(ctx.cur, "chunks", [int(i) for i in ids_added])
-                    _flush_pending_marks(ctx.cur)
-                    ctx.conn.commit()
-            else:
-                _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
-        ctx.chunks_added_total += int(added)
-
-    else:
-        ctx.conn.commit()
-        ctx.chunks_added_total += len(u_ids)
-
-    ctx.chunk_ids_buf.clear()
-    ctx.chunk_texts_buf.clear()
 
 
 def build_or_update_indices(args):
@@ -2922,12 +1053,48 @@ def build_or_update_indices(args):
     save indices. Other processes (possibly using --shard-id/--num-shards) only
     populate SQLite rows and commit; they do not mutate FAISS indices.
     """
-    need = args.rebuild or not (
-        DB_PATH.exists() and PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists()
+    # ═══════════════════════════════════════════════════════════════════════════
+    # FAST EARLY EXIT: explicit build-mode enumeration (maintainability fix)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Instead of checking "NOT need AND NOT flag1 AND NOT flag2 AND ..." (fragile),
+    # we explicitly enumerate all build-related flags. Adding a new maintenance mode
+    # means adding it to BUILD_FLAGS - one place, hard to forget.
+    #
+    # This ensures pure query runs don't pay the 2-5s import penalty for torch,
+    # transformers, lxml, etc. Only Path.exists() and args flags are used here.
+    # ═══════════════════════════════════════════════════════════════════════════
+    get_runtime()  # pure filesystem/env - no torch/numpy
+    
+    # Explicit list of all flags that indicate build-related work
+    # When adding new maintenance modes, ADD THEM HERE
+    BUILD_FLAGS = ("rebuild", "update", "build_only", "consume_only", "init_indices_only", "embed_producer")
+    
+    # Check if ANY build mode explicitly requested
+    explicit_build_requested = any(getattr(args, flag, False) for flag in BUILD_FLAGS)
+    
+    if not explicit_build_requested:
+        # Query-only run: skip heavy deps if store is already complete
+        store_complete = DB_PATH.exists() and PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists()
+        if store_complete:
+            return  # fast path for queries - no heavy deps needed
+        # Store incomplete but no explicit build mode → fall through to load deps
+        # and attempt to detect if we need to build (backward compat for bare runs)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # HEAVY DEPS: only loaded if we actually have build work to do
+    # ═══════════════════════════════════════════════════════════════════════════
+    d = deps()  # loads torch, transformers, lxml, etc.
+    _require_faiss("building/updating indices")
+    from litkit.build import (
+        BuildConfig,
+        init_empty_indices as build_init_empty_indices,
+        run_consume_only_mode as build_run_consume_only_mode,
+        load_or_create_paper_index as build_load_or_create_paper_index,
+        load_or_create_chunk_index as build_load_or_create_chunk_index,
+        train_ivfpq_index as build_train_ivfpq_index,
+        process_tar_files as build_process_tar_files,
     )
-    if not need and not args.update and not args.build_only and not args.consume_only and not args.init_indices_only:
-        # nothing to do
-        return
+    from litkit.index import faiss_save_force, kind_and_core
 
     # Validate build mode and shard count consistency BEFORE any work begins
     # Determine the build mode based on args
@@ -2936,124 +1103,98 @@ def build_or_update_indices(args):
     seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
     
     # Always validate if segment directory exists with prior work
-    if _has_segment_files(seg_dir) or _read_build_meta(seg_dir) is not None:
-        _validate_shard_consistency(seg_dir, args.num_shards, current_mode=build_mode)
+    if d.seg_has_segment_files(seg_dir) or d.seg_read_build_meta(seg_dir) is not None:
+        d.seg_validate_shard_consistency(seg_dir, args.num_shards, current_mode=build_mode)
     
     # Write build metadata if this is a fresh start
     # For multi-node: producer 0 writes it; for single-node: the writer writes it
     if is_multi_node:
         if args.embed_producer and args.shard_id == 0:
-            meta = _read_build_meta(seg_dir)
+            meta = d.seg_read_build_meta(seg_dir)
             if meta is None:
                 manifest_path = str(args.tar_manifest) if args.tar_manifest else None
-                _write_build_meta(seg_dir, args.num_shards, manifest_path, mode="multi")
+                d.seg_write_build_meta(seg_dir, args.num_shards, manifest_path, mode="multi")
     else:
         # Single-node mode: write metadata if fresh start
         if args.faiss_writer:
-            meta = _read_build_meta(seg_dir)
+            meta = d.seg_read_build_meta(seg_dir)
             if meta is None and not args.init_indices_only:
                 manifest_path = str(args.tar_manifest) if args.tar_manifest else None
-                _write_build_meta(seg_dir, args.num_shards, manifest_path, mode="single")
+                d.seg_write_build_meta(seg_dir, args.num_shards, manifest_path, mode="single")
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # DATABASE CONCURRENCY CONTRACT
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 
+    # SQLite concurrency model for litkit builds:
+    #
+    #   1. PRODUCERS (--embed-producer): Each gets its own shard-specific DB file.
+    #      No external locking needed; SQLite handles single-writer internally.
+    #
+    #   2. CONSUMER/WRITER (--faiss-writer): Uses the main DB exclusively.
+    #      Pure-DB writes (INSERT, UPDATE) rely on SQLite busy_timeout.
+    #      Cross-resource ops (DB + FAISS) use FileLock(DB_LOCK) + FileLock(FAISS_LOCK).
+    #
+    #   3. QUERIES (search path): Read-only; no locking required.
+    #
+    # ⚠️  DO NOT run multiple --faiss-writer processes against the same DB!
+    #     SQLite handles concurrent readers, but concurrent writers to the same
+    #     file WILL cause SQLITE_BUSY errors, especially on NFS/Lustre.
+    #
+    # See README.md "Concurrency Model" for the correct multi-node setup.
+    # ═══════════════════════════════════════════════════════════════════════════
+    
     # Use shard-specific DB for producers (lock-free parallel writes)
     if args.embed_producer and not args.faiss_writer:
         _eprint(f"[build] Producer mode: using shard-specific DB for shard {args.shard_id}")
-        conn = init_shard_db(args.shard_id, args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
+        conn = d.db_init_shard_db(d.db_shard_db_path(SQLITE_DIR, args.shard_id), args.shard_id, args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
     else:
         _eprint(f"[build] using DB at {DB_PATH}")
-        conn = init_db(args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
+        conn = d.db_init_db(DB_PATH, args.sqlite_journal_mode, args.sqlite_busy_timeout_ms)
     cur = conn.cursor()
 
     if args.init_indices_only:
-        if not args.faiss_writer:
-            raise ValueError("--init-indices-only requires --faiss-writer")
-        _eprint("[bootstrap] Creating empty FAISS indices...")
-        
-        paper_dim = 768  # SPECTER2 dimension
-        chunk_dim = 768  # SBERT dimension
-        
-        # Create paper index (always HNSW for papers)
-        paper_index = _hnsw_index(
-            paper_dim,
-            M=args.hnsw_m,
-            ef_construction=args.efconstruction,
-            ef_search=args.efsearch,
+        # Build a minimal config for the module function
+        cfg = BuildConfig(
+            faiss_writer=args.faiss_writer,
+            papers_index=args.papers_index,
+            chunks_index=args.chunks_index,
+            hnsw_m=args.hnsw_m,
+            efconstruction=args.efconstruction,
+            efsearch=args.efsearch,
+            ivf_nlist=args.ivf_nlist,
+            pq_m=args.pq_m,
+            paper_index_path=PAPER_INDEX_PATH,
+            chunk_index_path=CHUNK_INDEX_PATH,
+            faiss_lock=FAISS_LOCK,
         )
-        paper_index = faiss.IndexIDMap2(paper_index)
-        _ensure_parent(PAPER_INDEX_PATH)
-        with FileLock(FAISS_LOCK):
-            _faiss_save_force(paper_index, PAPER_INDEX_PATH)
-        
-        # Create chunk index (FLAT or IVF-PQ based on args)
-        if args.chunks_index == "flat":
-            chunk_index = _flat_ip_index(chunk_dim)
-        else:  # ivfpq
-            m_safe = _safe_pq_m(chunk_dim, args.pq_m)
-            chunk_index = _ivfpq_index(chunk_dim, nlist=args.ivf_nlist, m=m_safe)
-        
-        chunk_index = faiss.IndexIDMap2(chunk_index)
-        _ensure_parent(CHUNK_INDEX_PATH)
-        with FileLock(FAISS_LOCK):
-            _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
-        
-        _eprint("[bootstrap] Empty indices created. Exiting.")
+        build_init_empty_indices(cfg, FileLock=FileLock)
+        conn.close()
         return
 
     if args.consume_only:
         if not args.faiss_writer:
             raise ValueError("--consume-only requires --faiss-writer")
-        _eprint("[consumer] Starting consume-only mode")
+        
         seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
-        paper_index = _faiss_load(PAPER_INDEX_PATH)
-        chunk_index = _faiss_load(CHUNK_INDEX_PATH)
-        
-        consumer_coordinator = ConsumerCoordinator(seg_dir, args.num_shards)
-        
-        def progress_callback(complete, total):
-            _eprint(f"[consumer] Progress: {complete}/{total} producers complete")
-        
-        # Wait for all producers to complete WITHOUT ingesting segments yet.
-        # We cannot ingest segments until the DB merge is complete, because
-        # segment files use doc_id (content-addressed) which must be resolved
-        # against the merged main database, not the empty initial DB.
-        while not consumer_coordinator.all_producers_complete():
-            _eprint("[consumer] Waiting for producers to complete...")
-            
-            # Wait for completion or timeout
-            # Timeout set to 10 hours (36000s) to match the cluster's max job time
-            if consumer_coordinator.wait_for_completion(poll_interval=30, timeout=36000, progress_callback=progress_callback):
-                _eprint("[consumer] All producers have completed")
-                break
-        
-        # Merge all shard databases into the main database FIRST.
-        # This populates the main DB with all papers/chunks so that
-        # doc_id → paper_id resolution works during segment ingestion.
-        _eprint("[consumer] All producers complete, merging shard databases...")
-        merge_stats = merge_shard_databases(conn, delete_after_merge=True)
-        if merge_stats["shards"] > 0:
-            _eprint(f"[consumer] Merged {merge_stats['shards']} shard DB(s): "
-                    f"{merge_stats['papers']} papers, {merge_stats['chunks']} chunks, {merge_stats['files']} files")
-        
-        # NOW ingest segments - the main DB has all the data for doc_id resolution
-        _eprint("[consumer] Ingesting embedding segments...")
-        p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
-        c_added = _ingest_chunk_segments(conn, chunk_index, seg_dir)
-        _eprint(f"[consumer] Ingested {p_added} paper vectors and {c_added} chunk vectors")
-        
-        # Force save indices after ingestion
-        with FileLock(FAISS_LOCK):
-            _faiss_save_force(paper_index, PAPER_INDEX_PATH)
-            _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
-        with FileLock(DB_LOCK):
-            _flush_pending_marks(conn.cursor())
-            conn.commit()
-        
-        _eprint("[consumer] Consume-only mode completed")
-        return  # End consume-only mode
+        completed = build_run_consume_only_mode(
+            conn,
+            seg_dir=seg_dir,
+            num_shards=args.num_shards,
+            paper_index_path=PAPER_INDEX_PATH,
+            chunk_index_path=CHUNK_INDEX_PATH,
+            faiss_lock_path=FAISS_LOCK,
+            db_lock_path=DB_LOCK,
+            FileLock=FileLock,
+        )
+        conn.close()
+        if not completed:
+            return  # Timeout - already logged in module
+        return  # Success - end consume-only mode
 
     # Embedders
-    paper_embedder, _paper_cfg = make_paper_embedder()
-    chunk_embedder, _chunk_cfg = make_chunk_embedder(
+    paper_embedder, _paper_cfg = d.make_paper_embedder()
+    chunk_embedder, _chunk_cfg = d.make_chunk_embedder(
         devices=args.embed_devices,
         workers=args.embed_workers,
         force_devices=args.force_embed_devices,
@@ -3064,6 +1205,44 @@ def build_or_update_indices(args):
 
     # Prepare / open FAISS indices
     if args.rebuild:
+        # Guard: --rebuild with unconsumed segments or active producers can corrupt data
+        # This check is here (not in main()) because it requires heavy deps for segment functions
+        if not getattr(args, "force_rebuild", False):
+            seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
+            conflict_reasons = []
+            
+            # Check for unconsumed segment files
+            if d.seg_has_segment_files(seg_dir):
+                conflict_reasons.append(f"Segment directory {seg_dir} contains unconsumed segment files")
+            
+            # Check for producer completion markers (indicates multi-node run)
+            # Use shard count from build_meta.json (if exists) to correctly interpret markers.
+            meta = d.seg_read_build_meta(seg_dir)
+            effective_num_shards = meta.get("num_shards", args.num_shards) if meta else args.num_shards
+            
+            coordinator = d.SegConsumerCoordinator(seg_dir, effective_num_shards)
+            completed = coordinator.completed_shards()
+            if completed:
+                if len(completed) < effective_num_shards:
+                    conflict_reasons.append(
+                        f"Prior multi-node run (incomplete): {len(completed)}/{effective_num_shards} producer shards marked done"
+                    )
+                else:
+                    conflict_reasons.append(
+                        f"Prior multi-node run (not consumed): all {effective_num_shards} producer shards done"
+                    )
+            
+            if conflict_reasons:
+                reasons_str = "\n  • ".join(conflict_reasons)
+                raise SystemExit(
+                    f"[rebuild] BLOCKED: Unconsumed multi-node artifacts detected:\n  • {reasons_str}\n\n"
+                    "A rebuild would discard these pending segments/markers.\n"
+                    "Options:\n"
+                    "  • First consume pending segments: --faiss-writer --consume-only\n"
+                    f"  • Or clean up manually: rm -rf {seg_dir}/*\n"
+                    "  • Or force (DATA LOSS WARNING): --force-rebuild"
+                )
+        
         # Confirm before destructive actions
         _confirm_rebuild(conn)
         _eprint(
@@ -3076,435 +1255,110 @@ def build_or_update_indices(args):
         if CKPT_PATH.exists():
             CKPT_PATH.unlink()
 
-        # wipe tables
-        cur.executescript("DELETE FROM chunks; DELETE FROM papers; DELETE FROM files; VACUUM;")
+        # wipe tables (DELETE in transaction, VACUUM outside)
+        cur.executescript("DELETE FROM chunks; DELETE FROM papers; DELETE FROM files;")
         conn.commit()
+        
+        # VACUUM must run outside any transaction (autocommit mode)
+        # Without this, sqlite3.OperationalError: cannot VACUUM from within a transaction
+        old_isolation = conn.isolation_level
+        conn.isolation_level = None  # autocommit
+        try:
+            conn.execute("VACUUM")
+        finally:
+            conn.isolation_level = old_isolation  # restore
         _eprint("[rebuild] done")
 
-    # PAPER index
-    if PAPER_INDEX_PATH.exists():
-        paper_index = _faiss_load(PAPER_INDEX_PATH)
-
-        # --- Verify papers index family/metric (kind-aware; tolerate FlatIP) ---
-        kind, core, _ = _unwrap_core_and_kind(paper_index)
-        mt = getattr(core, "metric_type", None)
-        if kind == "hnsw":
-            if mt != faiss.METRIC_INNER_PRODUCT:
-                raise RuntimeError(
-                    "Papers HNSW index is L2; IP required for cosine-equivalent retrieval."
-                )
-        elif kind == "flat":
-            # Accept FlatIP; reject FlatL2 wheels explicitly
-            if core.__class__.__name__.lower().endswith("flatl2"):
-                raise RuntimeError("Papers FLAT index is L2; IP required.")
-        else:
-            # IVF not expected for papers; leave as-is (no-op)
-            pass
-
-        # Ensure IDMap2 wrapper even for legacy files
-        if not isinstance(paper_index, faiss.IndexIDMap2):
-            paper_index = faiss.IndexIDMap2(paper_index)
-            if args.faiss_writer:
-                with FileLock(FAISS_LOCK):
-                    _faiss_save(paper_index, PAPER_INDEX_PATH)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # FAISS INDEX LOADING: Skip for producers (they write segments, not FAISS)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Producers have LITKIT_WORKSPACE set to local SSD (/local_stage), so
+    # PAPER_INDEX_PATH and CHUNK_INDEX_PATH point to /local_stage/indices/*.
+    # But bootstrap created indices on NFS at /workspace/indices/.
+    # Producers don't need indices at all - they only write embedding segments.
+    # ═══════════════════════════════════════════════════════════════════════════
+    if args.embed_producer:
+        paper_index = None
+        chunk_index = None
+        needs_training = False
     else:
-        # Create base (HNSW or FLAT) and wrap in IDMap2
-        if args.papers_index == "flat":
-            base = _flat_ip_index(paper_dim)
-        else:
-            base = _hnsw_index(
-                paper_dim,
-                M=args.hnsw_m,
-                ef_construction=args.efconstruction,
-                ef_search=args.efsearch,
-            )
-            # Minimal, stable start signal for HNSW (one line; not a live progress bar)
-            _eprint(
-                f"[progress] Building HNSW (papers): started  M={args.hnsw_m}  "
-                f"efConstruction={args.efconstruction}  efSearch={args.efsearch}"
-            )
+        # PAPER index (load existing or create new)
+        paper_index = build_load_or_create_paper_index(
+            paper_index_path=PAPER_INDEX_PATH,
+            faiss_lock_path=FAISS_LOCK,
+            db_lock_path=DB_LOCK,
+            FileLock=FileLock,
+            paper_dim=paper_dim,
+            papers_index=args.papers_index,
+            hnsw_m=args.hnsw_m,
+            efconstruction=args.efconstruction,
+            efsearch=args.efsearch,
+            is_faiss_writer=args.faiss_writer,
+        )
 
-        paper_index = faiss.IndexIDMap2(base)
-        _ensure_parent(PAPER_INDEX_PATH)
-        if args.faiss_writer:
-            with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                _faiss_save(paper_index, PAPER_INDEX_PATH)
-        else:
-            raise RuntimeError(
-                "PAPER index does not exist. Start a writer with --faiss-writer or precreate the index."
-            )
+        # CHUNK index - load existing or create new
+        chunk_index, needs_training = build_load_or_create_chunk_index(
+            chunk_index_path=CHUNK_INDEX_PATH,
+            chunk_trained_flag=CHUNK_TRAINED_FLAG,
+            faiss_lock_path=FAISS_LOCK,
+            db_lock_path=DB_LOCK,
+            FileLock=FileLock,
+            chunk_dim=chunk_dim,
+            chunks_index=args.chunks_index,
+            ivf_nlist=args.ivf_nlist,
+            pq_m=args.pq_m,
+            is_faiss_writer=args.faiss_writer,
+        )
 
-    # CHUNK index
-    if CHUNK_INDEX_PATH.exists():
-        chunk_index = _faiss_load(CHUNK_INDEX_PATH)
-        _, core = _kind_and_core(chunk_index)
-        mt = getattr(core, "metric_type", faiss.METRIC_INNER_PRODUCT)
-        if mt != faiss.METRIC_INNER_PRODUCT:
-            raise RuntimeError(
-                "Chunks index metric is not IP; cosine/IP required for normalized SBERT."
-            )
-
-        if not isinstance(chunk_index, faiss.IndexIDMap2):
-            chunk_index = faiss.IndexIDMap2(chunk_index)
-            if args.faiss_writer:
-                with FileLock(FAISS_LOCK):
-                    _faiss_save(chunk_index, CHUNK_INDEX_PATH)
-
-        ivf = _extract_ivf(chunk_index)
-        if isinstance(ivf, faiss.IndexIVFPQ) and not getattr(ivf, "is_trained", False):
-            _eprint(
-                "[train] WARNING: chunks index is IVFPQ but untrained; ignoring stale trained flag and retraining."
-            )
-            _clear_chunk_trained_flag()
-    else:
-        if args.chunks_index == "flat":
-            base = _flat_ip_index(chunk_dim)
-            chunk_index = faiss.IndexIDMap2(base)
-            _clear_chunk_trained_flag()
-            _ensure_parent(CHUNK_INDEX_PATH)
-            if args.faiss_writer:
-                with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                    _faiss_save(chunk_index, CHUNK_INDEX_PATH)
-            else:
-                raise RuntimeError(
-                    "CHUNK index does not exist. Start a writer with --faiss-writer or precreate the index."
-                )
-        else:
-            m_safe = _safe_pq_m(chunk_dim, args.pq_m)
-            if m_safe != args.pq_m:
-                _eprint(
-                    f"[train] note: adjusted pq_m {args.pq_m} -> {m_safe} to divide dim={chunk_dim}"
-                )
-
-            # Placeholder IVFPQ (will be replaced after training)
-            eff_nlist = 16
-            chunk_index = _ivfpq_index(chunk_dim, nlist=eff_nlist, m=m_safe)
-
-            _ensure_parent(CHUNK_INDEX_PATH)
-            if not args.faiss_writer:
-                raise RuntimeError(
-                    "CHUNK index does not exist. Start a writer with --faiss-writer or precreate the index."
-                )
-
-    # If IVF-PQ and not trained, run training pass (one-time)
-    ivf_core = _extract_ivf(chunk_index)  # unwrap common wrappers (e.g., IndexIDMap2)
-    if (
-        isinstance(ivf_core, faiss.IndexIVFPQ)
-        and getattr(ivf_core, "ntotal", 0) == 0
-        and not getattr(ivf_core, "is_trained", False)
-    ):
+    # If IVF-PQ needs training, run training pass (one-time)
+    if needs_training:
         if not args.faiss_writer:
-            _eprint("[train] ERROR: chunks index requires training; start a writer with --faiss-writer.")
-            sys.exit(2)
-        train_samples = TRAIN_CHUNK_SAMPLES
-        texts_buf: list[str] = []
-
-        # for tracking training progress
-        samples_collected = 0
-        _phase("IVF-PQ: learn IVF centroids and PQ codebooks")
-        samples_prog = _Progress(
-            f"Current number of embeddings of randomly selected text chunks (desired number of vectors={train_samples})",
-            total=train_samples,
-            emit_final_line=False,
-        )
-
-        def _flush_train(buf: list[str]) -> np.ndarray:
-            """Embed buffered texts and return their embeddings; clear handled by caller."""
-            nonlocal samples_collected, samples_prog
-            if not buf:
-                return np.zeros((0, chunk_dim), dtype="float32")
-            # Verbose logging: show per-batch progress while collecting training samples.
-            X = chunk_embedder.encode(
-                buf,
-                progress_label=f"Generating a batch of embeddings for use in IVF-PQ training (batch size is {len(buf)})",
-                batch_size=args.chunk_embed_bs,
-                progress_done_summary=False,  # silence the [done] message for this render
+            _eprint(
+                "[train] ERROR: chunks index requires training; "
+                "start a writer with --faiss-writer."
             )
-
-            samples_collected += int(X.shape[0])
-            # clamp to target so % doesn't exceed 100
-            samples_prog.done = min(train_samples, samples_collected)
-            samples_prog.tick(inc=0, force=True)
-            _progress_newline(samples_prog.stream)
-            return X
-
-        # Stream text chunks from tar.gz files (randomly) -> embed in mini-batches -> accumulate until we hit budget / target
-        texts_buf: list[str] = []
-        X_train_list: list[np.ndarray] = []
-        use_tar = (getattr(args, "tar_dir", None) is not None) or (
-            getattr(args, "tar_manifest", None) is not None
+            sys.exit(2)
+        
+        chunk_index = build_train_ivfpq_index(
+            chunk_dim=chunk_dim,
+            chunk_embedder=chunk_embedder,
+            tar_dir=args.tar_dir,
+            tar_manifest=args.tar_manifest,
+            ivf_nlist=args.ivf_nlist,
+            pq_m=args.pq_m,
+            nprobe=args.nprobe,
+            ivf_nlist_forced=getattr(args, "_ivf_nlist_forced", False),
+            chunk_target_chars=int(
+                getattr(args, "chunk_target_chars", CHUNK_TARGET_CHARS)
+            ),
+            chunk_min_chars=int(getattr(args, "chunk_min_chars", BODY_MIN_CHARS)),
+            chunk_overlap=int(getattr(args, "chunk_overlap", CHUNK_OVERLAP_CHARS)),
+            chunk_embed_bs=args.chunk_embed_bs,
+            train_samples=TRAIN_CHUNK_SAMPLES,
+            batch_train_flush=BATCH_TRAIN_FLUSH,
+            chunk_index_path=CHUNK_INDEX_PATH,
+            chunk_trained_flag=CHUNK_TRAINED_FLAG,
+            faiss_lock_path=FAISS_LOCK,
+            db_lock_path=DB_LOCK,
+            FileLock=FileLock,
+            is_faiss_writer=args.faiss_writer,
         )
-
-        if use_tar:
-            tar_paths_list = list(iter_tar_paths(args.tar_dir, args.tar_manifest))
-            rng = random.Random(int(os.environ.get("LITKIT_TRAIN_SEED", "314159")))
-            rng.shuffle(tar_paths_list)
-
-            _env_cap = int(os.environ.get("LITKIT_TRAIN_PER_PAPER", "0"))
-            if _env_cap > 0:
-                train_per_paper = _env_cap
-            else:
-                est_papers = 0
-                for _p in tar_paths_list:
-                    try:
-                        est_papers += count_tar_xml_members(_p)
-                    except Exception:
-                        pass
-                est_papers = max(1, est_papers)
-                train_per_paper = max(8, min(64, math.ceil(train_samples / est_papers)))
-
-            target_papers = max(1, train_samples // max(1, train_per_paper))
-            papers_used = 0
-            train_total = sum(int(x.shape[0]) for x in X_train_list)  # likely 0 here, but robust
-
-            for tpath in tar_paths_list:
-                for _member, fobj in iter_tar_xml_streams(tpath):
-                    try:
-                        meta = parse_xml_fileobj(fobj)
-                        if not meta:
-                            continue
-                        paras = meta["paragraphs"] or (
-                            [meta["abstract"]] if meta["abstract"] else []
-                        )
-
-                        chunks = (
-                            pack_paragraphs(
-                                paras,
-                                max_chars=int(
-                                    getattr(args, "chunk_target_chars", CHUNK_TARGET_CHARS)
-                                ),
-                                min_chars=int(getattr(args, "chunk_min_chars", BODY_MIN_CHARS)),
-                                overlap_chars=int(
-                                    getattr(args, "chunk_overlap", CHUNK_OVERLAP_CHARS)
-                                ),
-                            )
-                            if paras
-                            else []
-                        )
-
-                        if chunks and papers_used < target_papers:
-                            sel = (
-                                chunks
-                                if len(chunks) <= train_per_paper
-                                else rng.sample(chunks, train_per_paper)
-                            )
-                            for ch in sel:
-                                texts_buf.append(ch)
-                                if len(texts_buf) >= BATCH_TRAIN_FLUSH:
-                                    Xb = _flush_train(texts_buf)
-                                    X_train_list.append(Xb)
-                                    train_total += int(Xb.shape[0])
-                                    texts_buf.clear()
-                                    if train_total >= train_samples:
-                                        break
-                            papers_used += 1
-
-                        if papers_used >= target_papers or train_total >= train_samples:
-                            break
-
-                    finally:
-                        try:
-                            fobj.close()
-                        except Exception:
-                            pass
-
-                if papers_used >= target_papers or train_total >= train_samples:
-                    break
-
-        if texts_buf and sum(x.shape[0] for x in X_train_list) < train_samples:
-            Xb = _flush_train(texts_buf)
-            X_train_list.append(Xb)
-            texts_buf.clear()
-
-        samples_prog.finish()
-        if not X_train_list:
-            _eprint("[train] WARNING: no chunk texts found for training; falling back to FLAT index")
-            base = _flat_ip_index(chunk_dim)
-            chunk_index = faiss.IndexIDMap2(base)
-            _clear_chunk_trained_flag()
-            _faiss_save(chunk_index, CHUNK_INDEX_PATH)
-        else:
-            X_train = np.vstack(X_train_list)
-            if X_train.shape[0] > train_samples:
-                X_train = X_train[:train_samples]
-
-            n_train = int(X_train.shape[0])
-
-            _eprint(f"[train] chunk training samples: target={train_samples} collected={n_train}")
-            _ensure_parent(CHUNK_INDEX_PATH)
-
-            pq_bits = PQ_BITS
-            k = (1 << pq_bits)
-            min_for_micro = 256
-            min_for_pq = 39 * k  # FAISS guidance ~39*k
-            m_candidate = _safe_pq_m(chunk_dim, args.pq_m)
-
-            # Early floor: require enough data for codebooks and subquantizers
-            if n_train < max(min_for_micro, min_for_pq, 100 * m_candidate):
-                _eprint(f"[train] not enough samples for IVF-PQ (n={n_train}); using FLAT IP")
-                base = _flat_ip_index(chunk_dim)
-                chunk_index = faiss.IndexIDMap2(base)
-                if args.faiss_writer:
-                    with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                        _faiss_save(chunk_index, CHUNK_INDEX_PATH)
-                _clear_chunk_trained_flag()
-            else:
-                # 2) Choose nlist with data-aware caps
-                eff_nlist = _effective_nlist(
-                    n_train, args.ivf_nlist, user_forced=getattr(args, "_ivf_nlist_forced", False)
-                )
-                max_by_samples = max(1, n_train // 40)  # ~40 samples per centroid
-                if eff_nlist > max_by_samples:
-                    _eprint(f"[train] note: reducing nlist {eff_nlist} -> {max_by_samples} due to limited samples (n={n_train})")
-                    eff_nlist = max_by_samples
-
-                # Re-check adequacy now that nlist is known
-                if eff_nlist < 8 or n_train < max(min_for_pq, 50 * eff_nlist, 100 * m_candidate):
-                    _eprint(f"[train] nlist/m under-sampled (n={n_train}, nlist={eff_nlist}, m={m_candidate}); using FLAT IP")
-                    base = _flat_ip_index(chunk_dim)
-                    chunk_index = faiss.IndexIDMap2(base)
-                    if args.faiss_writer:
-                        with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                            _faiss_save(chunk_index, CHUNK_INDEX_PATH)
-                    _clear_chunk_trained_flag()
-                else:
-                    # 3) Train IVF-PQ with safe parameters
-                    m = m_candidate  # already a safe divisor from _safe_pq_m
-                    if m != args.pq_m:
-                        _eprint(f"[train] note: adjusted pq_m {args.pq_m} -> {m} to divide dim={chunk_dim}")
-                    _eprint(f"[train] training IVF-PQ: nlist={eff_nlist} m={m} (dim={chunk_dim})")
-
-                    try:
-                        # after successful training
-                        new_chunk_index = _ivfpq_index(
-                            chunk_dim, nlist=eff_nlist, m=m, bits=pq_bits
-                        )
-                        # best-effort verbosity
-                        try:
-                            if hasattr(new_chunk_index, "verbose"):
-                                new_chunk_index.verbose = False
-                            if hasattr(faiss, "cvar") and hasattr(faiss.cvar, "verbose"):
-                                faiss.cvar.verbose = False
-                        except Exception:
-                            pass
-                        _phase(
-                            "IVF-PQ: train centroids and PQ codebooks using collected embeddings"
-                        )
-                        pulse = _Pulse(
-                            f"[train] IVF-PQ (nlist={eff_nlist}, m={m}): k-means/codebook fitting",
-                            period=float(os.environ.get("LITKIT_TRAIN_HEARTBEAT_SEC", "0.5")),
-                        )
-                        try:
-                            faiss.normalize_L2(X_train)  # normalize IVF-PQ training vectors
-                            new_chunk_index.train(X_train)
-                        finally:
-                            pulse.stop()
-
-                        # Verify training actually succeeded
-                        if not getattr(new_chunk_index, "is_trained", False):
-                            raise RuntimeError("IVF-PQ index not trained (is_trained=False)")
-
-                        # set nprobe (no mutation elsewhere)
-                        _auto_set_nprobe(new_chunk_index, args.nprobe)
-                        chunk_index = faiss.IndexIDMap2(new_chunk_index)
-
-                        if args.faiss_writer:
-                            with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                                _faiss_save(chunk_index, CHUNK_INDEX_PATH)
-                                # Only now write the trained flag (we have valid nlist/m)
-                                _tf_tmp = CHUNK_TRAINED_FLAG.with_suffix(".tmp")
-                                with open(_tf_tmp, "w") as fh:
-                                    fh.write(json.dumps({"trained_on": int(time.time()), "n": n_train,
-                                                        "nlist": eff_nlist, "m": m}, indent=2))
-                                    fh.flush(); os.fsync(fh.fileno())
-                                os.replace(_tf_tmp, CHUNK_TRAINED_FLAG)
-                                _maybe_fsync_dir(CHUNK_TRAINED_FLAG)
-
-                    except Exception as e:
-                        _eprint(
-                            f"[train] WARNING: IVF-PQ training failed ({e}); falling back to FLAT"
-                        )
-                        chunk_index = faiss.IndexIDMap2(_flat_ip_index(chunk_dim))
-                        if args.faiss_writer:
-                            with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                                _faiss_save(chunk_index, CHUNK_INDEX_PATH)
-                        _clear_chunk_trained_flag()
-
-    def _shard_filter(paths, shard_id, num_shards):
-        """Deterministically assign tar files to shards using size-aware bin-packing
-        to balance load across producers.
-        
-        Algorithm:
-        1. Stat each tar file from the manifest to get sizes
-        2. Sort by size (largest first) for better packing
-        3. Greedy bin-packing: assign each tar to the shard with smallest current load
-        4. Yield only the tars assigned to this shard
-        
-        Falls back to hash-based sharding if stat fails (errors out loudly per user request).
-        """
-        # Materialize the path list for sorting
-        paths_list = list(paths)
-        
-        if not paths_list:
-            return
-        
-        # Collect sizes for load balancing
-        paths_with_sizes = []
-        for p in paths_list:
-            try:
-                size = p.stat().st_size
-                paths_with_sizes.append((p, size))
-            except Exception as e:
-                # User requested: fail loudly if a manifest file is unreadable
-                raise RuntimeError(f"Cannot stat tar file {p}: {e}") from e
-        
-        if not paths_with_sizes:
-            return  # all files failed stat (already raised above)
-        
-        # Sort by size (largest first) for better bin-packing
-        paths_with_sizes.sort(key=lambda x: x[1], reverse=True)
-        
-        # Greedy bin-packing: assign each tar to the shard with smallest current load
-        shard_loads = [0] * num_shards
-        shard_assignments = [[] for _ in range(num_shards)]
-        
-        for tar_path, size in paths_with_sizes:
-            # Find shard with minimum load
-            min_shard = min(range(num_shards), key=lambda i: shard_loads[i])
-            shard_assignments[min_shard].append((tar_path, size))
-            shard_loads[min_shard] += size
-        
-        # Log shard assignments (shows load balance across all shards)
-        if not QUIET:
-            _eprint(f"\n[shard] Load-balanced tar distribution across {num_shards} shard(s):")
-            for i in range(num_shards):
-                count = len(shard_assignments[i])
-                load_gb = shard_loads[i] / (1024**3)
-                marker = " <-- THIS SHARD" if i == shard_id else ""
-                _eprint(f"[shard]   Shard {i}/{num_shards}: {count} tar files, {load_gb:.2f} GB{marker}")
-                
-                # Show first few files for this shard if it's the current one
-                if i == shard_id and shard_assignments[i]:
-                    _eprint(f"[shard]   Files assigned to shard {shard_id}:")
-                    for j, (tar_p, tar_sz) in enumerate(shard_assignments[i][:5]):
-                        sz_gb = tar_sz / (1024**3)
-                        _eprint(f"[shard]     - {tar_p.name} ({sz_gb:.2f} GB)")
-                    if len(shard_assignments[i]) > 5:
-                        remaining = len(shard_assignments[i]) - 5
-                        _eprint(f"[shard]     ... and {remaining} more file(s)")
-        
-        # Yield only the tars assigned to this shard
-        for tar_path, _ in shard_assignments[shard_id]:
-            yield tar_path
 
     use_tar = (getattr(args, "tar_dir", None) is not None) or (
         getattr(args, "tar_manifest", None) is not None
     )
 
     # ----- TAR SHARD PATH (NO EXTRACTION) -----
+    # NOTE: We materialize the tar_paths iterator into a list here for two reasons:
+    # 1. Progress reporting needs len(tar_paths) for "N of M tars processed"
+    # 2. Checkpoint resume logic benefits from knowing total shard count
+    #
+    # Memory impact is negligible: even 10,000 Path objects ≈ 2MB, compared to
+    # FAISS indices (1-10GB), embedding batches (100-500MB), SQLite (10-50MB).
+    # PMC-OA corpus has ~600-2000 shard files, so ~200-400KB total.
     tar_paths = list(
-        _shard_filter(
-            iter_tar_paths(args.tar_dir, args.tar_manifest), args.shard_id, args.num_shards
+        d.shard_filter(
+            d.iter_tar_paths(args.tar_dir, args.tar_manifest), args.shard_id, args.num_shards
         )
     )
 
@@ -3513,495 +1367,43 @@ def build_or_update_indices(args):
     # NOTE: The global --rebuild handling already reset DB/indices/checkpoint
     # near the start of build_or_update_indices(). No extra resets here.
 
-    ckpt = load_checkpoint()
-    ckpt_stream = ckpt.get("build_stream", {})
+    # Use per-shard checkpoint for producers (multi-process safe)
+    # Single-node and consumer use shared checkpoint (backward compatible)
+    ckpt_shard_id = args.shard_id if args.embed_producer else None
 
-    paper_ids_buf, paper_texts_buf = [], []
-    paper_doc_ids_buf: list[str] = []  # Track doc_ids for content-addressed segments
-    chunk_ids_buf, chunk_texts_buf = [], []
-    chunk_paper_doc_ids_buf: list[str] = []  # Track parent paper doc_ids for chunks
-    chunk_ords_buf: list[int] = []  # Track chunk ordinals within papers
-    papers_added_total = 0
-    chunks_added_total = 0
-    
-    # Track current paper's doc_id for chunk association
-    current_paper_doc_id: str | None = None
-
-    for tpath in tar_paths:
-        # Number of *persisted* members previously processed for this tar shard
-        start_persisted = int(ckpt_stream.get(str(tpath), 0))
-        processed_count = start_persisted  # increments after each successfully handled member
-        persisted_count = start_persisted  # last value safely fsynced via commit + checkpoint
-
-        # Set LITKIT_TAR_PRESCAN=0 to skip counting members
-        total_members = (
-            count_tar_xml_members(tpath)
-            if os.environ.get("LITKIT_TAR_PRESCAN", "1") == "1"
-            else None
-        )
-
-        if total_members is not None:
-            _eprint(
-                f"[scan] shard {tpath} (resume=#{start_persisted}{'' if total_members is None else f', total≈{total_members}'})"
-            )
-
-        # ---- compact single-line progress for large shards ----
-        start_ts = time.time()
-        last_render = 0.0
-        render_every = TAR_RENDER_SEC
-        # Optional % gate (0 => off). Also respects alias LITKIT_TAR_RENDER_PCT_STP via module constant.
-        render_pct_step = TAR_RENDER_PCT_STEP
-        next_pct = 0.0  # next threshold to print (0, 1, 2, ... if step=1)
-
-        def _render(force: bool = False):
-            nonlocal last_render, next_pct
-            now = time.time()
-            done = processed_count
-
-            # time gate
-            if not force and (now - last_render) < render_every:
-                # allow percent gate to break the time gate if we crossed a threshold
-                if not (render_pct_step > 0 and total_members):
-                    return
-
-            # percent gate (optional)
-            if (not force) and render_pct_step > 0 and total_members:
-                cur_pct = 100.0 * done / max(1, total_members)
-                if cur_pct + 1e-9 < next_pct and (now - last_render) < render_every:
-                    return
-                while cur_pct + 1e-9 >= next_pct:
-                    next_pct += render_pct_step
-
-            elapsed = max(1e-3, now - start_ts)
-            total_str = str(total_members) if total_members is not None else "?"
-            pct_str = f"  ({100.0*done/total_members:.1f}%)" if total_members else ""
-            msg = (
-                f"[progress] [scan] {tpath.name}: {done}/{total_str}{pct_str}  {done/elapsed:.1f}/s"
-            )
-            # Print scan progress as a discrete line to avoid fighting with other
-            # in-place tickers (embedder, heartbeats).
-            _progress_newline(sys.stderr)         # break any half-rendered line
-            _progress_write(msg, sys.stderr)      # write the line
-            _progress_newline(sys.stderr)         # and terminate it
-            last_render = now
-
-        # show initial 0/N state (or ? if unknown)
-        _render(force=True)
-
-        # Skip exactly 'start_persisted' members (they are guaranteed persisted)
-        skipped = 0
-
-        for m, fobj in iter_tar_xml_streams(tpath):
-            if skipped < start_persisted:
-                skipped += 1
-                try:
-                    fobj.close()
-                except Exception:
-                    pass
-                if skipped == start_persisted:
-                    _render(force=True)  # render resume point
-                continue
-
-            handled_ok = False
-            f = f"tar://{tpath}!/{m.name}"
-            st = SimpleNamespace(
-                st_size=int(getattr(m, "size", 0)), st_mtime=float(getattr(m, "mtime", 0.0) or 0.0)
-            )
-
-            try:
-                # inline heartbeat/progress refresh
-                _render()
-
-                # Fast path: unchanged (count as handled)
-                if not args.rebuild and already_processed(cur, str(f), st):
-                    handled_ok = True
-
-                else:
-                    # Parse the member; treat unparsable as handled to avoid infinite retries
-                    try:
-                        meta = parse_xml_fileobj(fobj)
-                    finally:
-                        try:
-                            fobj.close()
-                        except Exception:
-                            pass
-
-                    if not meta:
-                        handled_ok = True  # permanently skip bad member next time
-                    else:
-                        # ---------- BEGIN INGEST BODY (same semantics; no member-based checkpointing here) ----------
-                        pmcid = (meta["pmcid"] or "").strip()
-                        pmid = (meta["pmid"] or "").strip()
-                        
-                        # Use file path as doc_id for deduplication across shards
-                        # Each tar member is unique, and load-balanced sharding ensures
-                        # each tar file goes to exactly one producer, so no cross-shard dupes.
-                        # The path is already in f = "tar://tpath!/m.name" format.
-                        doc_id = str(f)
-
-                        pid_row = None
-                        if pmcid:
-                            pid_row = cur.execute(
-                                "SELECT id FROM papers WHERE pmcid=?", (pmcid,)
-                            ).fetchone()
-                        if (pid_row is None) and pmid:
-                            pid_row = cur.execute(
-                                "SELECT id FROM papers WHERE pmid=?", (pmid,)
-                            ).fetchone()
-                        if pid_row:
-                            pid = pid_row[0]
-                            # Update doc_id if missing (for legacy rows)
-                            cur.execute(
-                                "UPDATE papers SET doc_id = ? WHERE id = ? AND (doc_id IS NULL OR doc_id = '')",
-                                (doc_id, pid)
-                            )
-                        else:
-                            cur.execute(
-                                "INSERT INTO papers(doc_id, pmid, pmcid, title, abstract) VALUES (?,?,?,?,?)",
-                                (doc_id, pmid, pmcid, meta["title"], meta["abstract"]),
-                            )
-                            pid = cur.lastrowid
-
-                        seen_this_path = (
-                            cur.execute("SELECT 1 FROM files WHERE path=?", (str(f),)).fetchone()
-                            is not None
-                        )
-                        if seen_this_path:
-                            if args.faiss_writer:
-                                with FileLock(FAISS_LOCK):
-                                    if not isinstance(paper_index, faiss.IndexIDMap2):
-                                        paper_index = faiss.IndexIDMap2(paper_index)
-                                    selp = _make_id_selector([pid])
-                                    _safe_remove_ids(paper_index, selp)
-                                    _faiss_save_force(paper_index, PAPER_INDEX_PATH)
-
-                                old_ids = [
-                                    row[0]
-                                    for row in cur.execute(
-                                        "SELECT id FROM chunks WHERE paper_id=?", (pid,)
-                                    )
-                                ]
-                                if old_ids:
-                                    with FileLock(FAISS_LOCK):
-                                        if not isinstance(chunk_index, faiss.IndexIDMap2):
-                                            chunk_index = faiss.IndexIDMap2(chunk_index)
-                                        selc = _make_id_selector(old_ids)
-                                        _safe_remove_ids(chunk_index, selc)
-                                        _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
-                            with FileLock(DB_LOCK):
-                                cur.execute("DELETE FROM chunks WHERE paper_id=?", (pid,))
-                                cur.execute("UPDATE papers SET in_index=0 WHERE id=?", (pid,))
-
-                        register_file(cur, str(f), pid, st)
-
-                        ta = (meta["title"] or "").strip()
-                        ab = (meta["abstract"] or "").strip()
-                        ta_ab = (ta + " " + ab).strip() or (
-                            meta["paragraphs"][0][:800] if meta["paragraphs"] else "untitled"
-                        )
-                        paper_ids_buf.append(pid)
-                        paper_texts_buf.append(ta_ab)
-                        paper_doc_ids_buf.append(doc_id)
-
-                        proposed_chunks = []
-                        if ta_ab:
-                            proposed_chunks.append((-1, ta_ab))
-
-                        paras = meta["paragraphs"] or ([ab] if ab else [])
-                        chunks = (
-                            pack_paragraphs(
-                                paras,
-                                max_chars=int(
-                                    getattr(args, "chunk_target_chars", CHUNK_TARGET_CHARS)
-                                ),
-                                min_chars=int(getattr(args, "chunk_min_chars", BODY_MIN_CHARS)),
-                                overlap_chars=int(
-                                    getattr(args, "chunk_overlap", CHUNK_OVERLAP_CHARS)
-                                ),
-                            )
-                            if paras
-                            else []
-                        )
-                        for ord_i, ch in enumerate(chunks):
-                            proposed_chunks.append((ord_i, ch))
-
-                        for ord_i, text_i in proposed_chunks:
-                            cur.execute(
-                                "INSERT INTO chunks(paper_id, ord, text) VALUES (?,?,?)",
-                                (pid, ord_i, text_i),
-                            )
-                            cid = cur.lastrowid
-                            chunk_ids_buf.append(cid)
-                            chunk_texts_buf.append(text_i)
-                            chunk_paper_doc_ids_buf.append(doc_id)
-                            chunk_ords_buf.append(ord_i)
-
-                        if len(paper_ids_buf) >= PAPER_BATCH:
-                            u_ids, u_texts, u_doc_ids = _dedupe_papers_with_doc_ids(
-                                paper_ids_buf, paper_texts_buf, paper_doc_ids_buf
-                            )
-
-                            if paper_seg_writer is not None:
-                                Xp = paper_embedder.encode(
-                                    u_texts,
-                                    progress_label=f"Embedding papers (producer, {len(u_texts)})",
-                                    batch_size=args.paper_embed_bs,
-                                    progress_done_summary=False,
-                                )
-                                paper_seg_writer.write(doc_ids=u_doc_ids, vecs=Xp)
-                                conn.commit()
-                                papers_added_total += len(u_ids)
-
-                            elif args.faiss_writer:
-                                Xp = paper_embedder.encode(
-                                    u_texts,
-                                    progress_label=f"Embedding papers (batch of {len(u_texts)})",
-                                    batch_size=args.paper_embed_bs,
-                                    progress_done_summary=False,
-                                )
-                                # mutate & save FAISS without holding DB_LOCK
-                                prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
-                                sel = _make_id_selector(u_ids)
-                                with FileLock(FAISS_LOCK):
-                                    _safe_remove_ids(paper_index, sel)
-                                    added, ids_added = _add_with_ids_dedup(paper_index, u_ids, Xp)
-                                    saved = False
-                                    if added:
-                                        if prior_ntotal == 0:
-                                            saved = _faiss_save_force(paper_index, PAPER_INDEX_PATH)
-                                        else:
-                                            saved = _faiss_save(paper_index, PAPER_INDEX_PATH)
-                                if added:
-                                    if saved:
-                                        with FileLock(DB_LOCK):
-                                            _mark_in_index(cur, "papers", [int(i) for i in ids_added])
-                                            _flush_pending_marks(cur)
-                                            conn.commit()
-                                    else:
-                                        _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
-                                papers_added_total += int(added) 
-
-                            else:
-                                conn.commit()
-                                papers_added_total += len(u_ids)
-
-                            paper_ids_buf.clear()
-                            paper_texts_buf.clear()
-                            paper_doc_ids_buf.clear()
-
-                        if len(chunk_ids_buf) >= CHUNK_BATCH:
-                            u_ids, u_texts, u_paper_doc_ids, u_ords = _dedupe_chunks_with_doc_ids(
-                                chunk_ids_buf, chunk_texts_buf, chunk_paper_doc_ids_buf, chunk_ords_buf
-                            )
-
-                            if chunk_seg_writer is not None:
-                                Xc = chunk_embedder.encode(
-                                    u_texts,
-                                    progress_label=f"Embedding chunks (producer, {len(u_texts)})",
-                                    batch_size=args.chunk_embed_bs,
-                                    progress_done_summary=False,
-                                )
-                                chunk_seg_writer.write(
-                                    paper_doc_ids=u_paper_doc_ids, ords=u_ords, vecs=Xc
-                                )
-                                conn.commit()
-                                chunks_added_total += len(u_ids)
-
-                            elif args.faiss_writer:
-                                Xc = chunk_embedder.encode(
-                                    u_texts,
-                                    progress_label=f"Embedding chunks (batch of {len(u_texts)})",
-                                    batch_size=args.chunk_embed_bs,
-                                    progress_done_summary=False,
-                                )
-                                # mutate & save FAISS without holding DB_LOCK
-                                prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
-                                sel = _make_id_selector(u_ids)
-                                with FileLock(FAISS_LOCK):
-                                    _safe_remove_ids(chunk_index, sel)
-                                    added, ids_added = _add_with_ids_dedup(chunk_index, u_ids, Xc)
-                                    saved = False
-                                    if added:
-                                        if prior_ntotal == 0:
-                                            saved = _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
-                                        else:
-                                            saved = _faiss_save(chunk_index, CHUNK_INDEX_PATH)
-                                if added:
-                                    if saved:
-                                        with FileLock(DB_LOCK):
-                                            _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
-                                            _flush_pending_marks(cur)
-                                            conn.commit()
-                                    else:
-                                        _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
-
-                                chunks_added_total += int(added)
-
-                            else:
-                                conn.commit()
-                                chunks_added_total += len(u_ids)
-
-                            chunk_ids_buf.clear()
-                            chunk_texts_buf.clear()
-                            chunk_paper_doc_ids_buf.clear()
-                            chunk_ords_buf.clear()
-
-                        # ---------- END INGEST BODY ----------
-
-                        handled_ok = True
-
-            except Exception as e:
-                _eprint(f"[ingest] ERROR tar://{tpath}!/{m.name}: {e.__class__.__name__}: {e}")
-                try:
-                    with FileLock(DB_LOCK):
-                        conn.rollback()
-                except Exception:
-                    pass
-                handled_ok = False  # do not advance processed_count; retry next run
-
-            # Update progress & checkpoint only after a successful handle
-            if handled_ok:
-                processed_count += 1
-                _render()
-
-                # Persist every CKPT_EVERY handled members (commit + checkpoint)
-                if (processed_count - persisted_count) >= CKPT_EVERY:
-                    conn.commit()
-                    ckpt_stream[str(tpath)] = processed_count
-                    ckpt["build_stream"] = ckpt_stream
-                    save_checkpoint(ckpt)
-                    persisted_count = processed_count
-                    _render(force=True)
-
-        # End of this tar: final commit + checkpoint at the *processed* count
-        _render(force=True)
-        _progress_newline(sys.stderr)
-        conn.commit()
-        ckpt_stream[str(tpath)] = processed_count
-        ckpt["build_stream"] = ckpt_stream
-        save_checkpoint(ckpt)
-
-    if args.faiss_writer:
-
-        if paper_ids_buf:
-            u_ids, u_texts = _dedupe_ids_and_texts(paper_ids_buf, paper_texts_buf)
-            Xp = paper_embedder.encode(
-                u_texts,
-                progress_label=f"Embedding papers (batch of {len(u_texts)})",
-                batch_size=args.paper_embed_bs,
-                progress_done_summary=False,
-            )
-            if not isinstance(paper_index, faiss.IndexIDMap2):
-                paper_index = faiss.IndexIDMap2(paper_index)
-
-            with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                try:
-                    prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
-                    added, ids_added = _add_with_ids_dedup(paper_index, u_ids, Xp)
-                    if added:
-                        if prior_ntotal == 0:
-                            _faiss_save_force(paper_index, PAPER_INDEX_PATH)
-                            _mark_in_index(cur, "papers", [int(i) for i in ids_added])
-                        else:
-                            if _faiss_save(paper_index, PAPER_INDEX_PATH):
-                                _mark_in_index(cur, "papers", [int(i) for i in ids_added])
-                                _flush_pending_marks(cur)
-                            else:
-                                _PENDING_MARKS["papers"].extend(int(i) for i in ids_added)
-                except RuntimeError:
-                    added = _add_ids_union_compat(
-                        paper_index, u_ids, Xp, table="papers", cur=cur, save_path=PAPER_INDEX_PATH
-                    )
-                conn.commit()
-            papers_added_total += int(added)
-
-        paper_ids_buf.clear()
-        paper_texts_buf.clear()
-
-        if chunk_ids_buf:
-            u_ids, u_texts = _dedupe_ids_and_texts(chunk_ids_buf, chunk_texts_buf)
-            Xc = chunk_embedder.encode(
-                u_texts,
-                progress_label=f"Embedding chunks (batch of {len(u_texts)})",
-                batch_size=args.chunk_embed_bs,
-                progress_done_summary=False,
-            )
-            if not isinstance(chunk_index, faiss.IndexIDMap2):
-                chunk_index = faiss.IndexIDMap2(chunk_index)
-
-            with FileLock(DB_LOCK), FileLock(FAISS_LOCK):
-                try:
-                    prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
-                    added, ids_added = _add_with_ids_dedup(chunk_index, u_ids, Xc)
-                    if added:
-                        if prior_ntotal == 0:
-                            _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
-                            _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
-                        else:
-                            if _faiss_save(chunk_index, CHUNK_INDEX_PATH):
-                                _mark_in_index(cur, "chunks", [int(i) for i in ids_added])
-                                _flush_pending_marks(cur)
-                            else:
-                                _PENDING_MARKS["chunks"].extend(int(i) for i in ids_added)
-                except RuntimeError:
-                    added = _add_ids_union_compat(
-                        chunk_index, u_ids, Xc, table="chunks", cur=cur, save_path=CHUNK_INDEX_PATH
-                    )
-                conn.commit()
-            chunks_added_total += int(added)
-
-        chunk_ids_buf.clear()
-        chunk_texts_buf.clear()
-
-    elif getattr(args, "embed_producer", False) and not getattr(args, "faiss_writer", False):
-        # ---- producer: DO NOT touch FAISS, DO NOT set in_index=1 ----
-
-        # papers: embed and write segment file(s)
-        if paper_ids_buf:
-            u_ids, u_texts, u_doc_ids = _dedupe_papers_with_doc_ids(
-                paper_ids_buf, paper_texts_buf, paper_doc_ids_buf
-            )
-            Xp = paper_embedder.encode(
-                u_texts,
-                progress_label=f"Embedding papers (producer, {len(u_texts)})",
-                batch_size=args.paper_embed_bs,
-            )
-            assert paper_seg_writer is not None, "producer mode requires paper_seg_writer"
-            paper_seg_writer.write(doc_ids=u_doc_ids, vecs=Xp)
-            conn.commit()
-            papers_added_total += len(u_ids)
-        paper_ids_buf.clear()
-        paper_texts_buf.clear()
-        paper_doc_ids_buf.clear()
-
-        # chunks: embed and write segment file(s)
-        if chunk_ids_buf:
-            u_ids, u_texts, u_paper_doc_ids, u_ords = _dedupe_chunks_with_doc_ids(
-                chunk_ids_buf, chunk_texts_buf, chunk_paper_doc_ids_buf, chunk_ords_buf
-            )
-            Xc = chunk_embedder.encode(
-                u_texts,
-                progress_label=f"Embedding chunks (producer, {len(u_texts)})",
-                batch_size=args.chunk_embed_bs,
-            )
-            assert chunk_seg_writer is not None, "producer mode requires chunk_seg_writer"
-            chunk_seg_writer.write(paper_doc_ids=u_paper_doc_ids, ords=u_ords, vecs=Xc)
-            conn.commit()
-            chunks_added_total += len(u_ids)
-        chunk_ids_buf.clear()
-        chunk_texts_buf.clear()
-        chunk_paper_doc_ids_buf.clear()
-        chunk_ords_buf.clear()
-
-    else:
-        # ---- plain reader: DB only ----
-        conn.commit()
-        papers_added_total += len(paper_ids_buf)
-        paper_ids_buf.clear()
-        paper_texts_buf.clear()
-        chunks_added_total += len(chunk_ids_buf)
-        chunk_ids_buf.clear()
-        chunk_texts_buf.clear()
+    # Process all tar files using the extracted module function
+    paper_index, chunk_index, papers_added_total, chunks_added_total = build_process_tar_files(
+        tar_paths=tar_paths,
+        conn=conn,
+        paper_embedder=paper_embedder,
+        chunk_embedder=chunk_embedder,
+        paper_index=paper_index,
+        chunk_index=chunk_index,
+        paper_seg_writer=paper_seg_writer,
+        chunk_seg_writer=chunk_seg_writer,
+        ckpt_path=CKPT_PATH,
+        ckpt_lock=CKPT_LOCK,
+        faiss_lock=FAISS_LOCK,
+        db_lock=DB_LOCK,
+        paper_index_path=PAPER_INDEX_PATH,
+        chunk_index_path=CHUNK_INDEX_PATH,
+        sqlite_dir=SQLITE_DIR,
+        FileLock=FileLock,
+        rebuild=args.rebuild,
+        embed_producer=args.embed_producer,
+        faiss_writer=args.faiss_writer,
+        strict_ingest=getattr(args, "strict_ingest", False),
+        paper_batch=PAPER_BATCH,
+        chunk_batch=CHUNK_BATCH,
+        ckpt_every=CKPT_EVERY,
+        paper_embed_bs=args.paper_embed_bs,
+        chunk_embed_bs=args.chunk_embed_bs,
+        chunk_target_chars=int(getattr(args, "chunk_target_chars", CHUNK_TARGET_CHARS)),
+        chunk_min_chars=int(getattr(args, "chunk_min_chars", BODY_MIN_CHARS)),
+        chunk_overlap=int(getattr(args, "chunk_overlap", CHUNK_OVERLAP_CHARS)),
+        ckpt_shard_id=ckpt_shard_id,
+        parse_workers=args.parse_workers,
+    )
 
     # Final commit + ensure on-disk indices are current *before* sanity
     conn.commit()
@@ -4009,7 +1411,7 @@ def build_or_update_indices(args):
     # Write completion marker for producer
     if args.embed_producer:
         seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
-        producer_coordinator = ProducerCoordinator(seg_dir, args.shard_id, args.num_shards)
+        producer_coordinator = d.SegProducerCoordinator(seg_dir, args.shard_id, args.num_shards)
         producer_coordinator.mark_complete()
         _eprint(f"[producer] Shard {args.shard_id}/{args.num_shards} marked complete")
 
@@ -4017,17 +1419,44 @@ def build_or_update_indices(args):
         seg_dir = args.embed_outdir or EMBED_SEGMENTS_DIR
 
         if args.consume_segments and seg_dir and Path(seg_dir).exists():
-            if not isinstance(chunk_index, faiss.IndexIDMap2):
-                chunk_index = faiss.IndexIDMap2(chunk_index)
-            c_added = _ingest_chunk_segments(conn, chunk_index, seg_dir)
-            if not isinstance(paper_index, faiss.IndexIDMap2):
-                paper_index = faiss.IndexIDMap2(paper_index)
-            p_added = _ingest_paper_segments(conn, paper_index, seg_dir)
+            # Ingest segments - functions handle IDMap2 wrapping and return the (possibly wrapped) index
+            paper_index, p_added = d.seg_ingest_paper_segments(
+                conn, paper_index, seg_dir, FAISS_LOCK, PAPER_INDEX_PATH, DB_LOCK,
+                FileLock=FileLock
+            )
+            chunk_index, c_added = d.seg_ingest_chunk_segments(
+                conn, chunk_index, seg_dir, FAISS_LOCK, CHUNK_INDEX_PATH, DB_LOCK,
+                FileLock=FileLock
+            )
             if c_added or p_added:
                 _eprint(
                     f"[segments] ingested {p_added} paper vectors and {c_added} chunk vectors from segments"
                 )
 
+        # ═══════════════════════════════════════════════════════════════════════════
+        # SAFETY INVARIANT: reconcile+backfill runs on EVERY faiss_writer startup
+        # ═══════════════════════════════════════════════════════════════════════════
+        # This is the critical repair step that makes os._exit(1) in signal handlers
+        # safe (see _create_writer_guard_or_exit). No matter how the previous run
+        # terminated (normal exit, SIGINT, SIGTERM, crash, OOM kill), this sequence:
+        #
+        #   1. reconcile_sqlite_flags_with_faiss() - finds rows with in_index=1 that
+        #      are NOT in FAISS (e.g., DB committed but FAISS not saved before kill)
+        #      and resets their flags to in_index=0
+        #
+        #   2. backfill_unindexed_vectors() - re-embeds and re-adds any rows with
+        #      in_index=0 to FAISS, then marks them in_index=1
+        #
+        # guarantees the vector store is consistent before any new work begins.
+        #
+        # This runs in ALL relevant modes:
+        #   - --faiss-writer (normal build): here
+        #   - --reconcile-only: explicitly runs reconcile+backfill, then exits
+        #   - --consume-only: calls run_consume_only_mode() which has its own guards
+        #
+        # Producers (--embed-producer) don't touch FAISS, so no reconcile needed.
+        # ═══════════════════════════════════════════════════════════════════════════
+        
         # Reset any rows marked in_index=1 that are missing from FAISS
         p_reset, c_reset = reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index)
         if p_reset or c_reset:
@@ -4047,14 +1476,14 @@ def build_or_update_indices(args):
 
         # Respect lock order while forcing saves and flushing marks
         with FileLock(FAISS_LOCK):
-            _faiss_save_force(paper_index, PAPER_INDEX_PATH)
-            _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+            faiss_save_force(paper_index, PAPER_INDEX_PATH)
+            faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
         with FileLock(DB_LOCK):
-            _flush_pending_marks(conn.cursor())
+            d.db_flush_pending_marks(conn.cursor())
             conn.commit()
 
         try:
-            k, _ = _kind_and_core(paper_index)
+            k, _ = kind_and_core(paper_index)
             if k == "hnsw":
                 _eprint(
                     f"[done] HNSW (papers): build complete — ntotal={int(getattr(paper_index, 'ntotal', 0) or 0)}"
@@ -4068,11 +1497,14 @@ def build_or_update_indices(args):
         if not args.quiet:
             _eprint("=================================================================")
     else:
-        if not args.quiet:
-            _eprint("\n=== SUMMARY ================================================")
-        _post_build_sanity_check(conn, args)
-        if not args.quiet:
-            _eprint("=================================================================")
+        # Skip sanity check for producers - they don't have FAISS indices locally
+        # (LITKIT_WORKSPACE=/local_stage but indices are on NFS at /workspace)
+        if not args.embed_producer:
+            if not args.quiet:
+                _eprint("\n=== SUMMARY ================================================")
+            _post_build_sanity_check(conn, args)
+            if not args.quiet:
+                _eprint("=================================================================")
 
     _eprint(f"[done] indexed {papers_added_total} papers and {chunks_added_total} chunks (this run)")
     conn.close()
@@ -4082,170 +1514,15 @@ def build_or_update_indices(args):
 # -------------------- Retrieval helpers --------------------
 
 
-def _faiss_present_ids(index) -> set | None:
-    """Return the set of external IDs present in an IndexIDMap2-wrapped index.
-    Returns None if we cannot enumerate (e.g., not IDMap2).
-    """
-    try:
-        if isinstance(index, faiss.IndexIDMap2):
-            # LongVector -> numpy -> python set
-            return set(int(x) for x in faiss.vector_to_array(index.id_map))
-        # Try to unwrap one layer if caller handed us a wrapper
-        base = getattr(index, "index", None)
-        if isinstance(base, faiss.IndexIDMap2):
-            return set(int(x) for x in faiss.vector_to_array(base.id_map))
-    except Exception:
-        pass
-    return None
 
 
 def reconcile_sqlite_flags_with_faiss(conn, paper_index, chunk_index) -> tuple[int, int]:
-    """For each table, if FAISS lacks some IDs that SQLite thinks are in the index,
-    reset those rows to in_index=0 so the normal backfill can re-add them.
-    Returns (papers_reset, chunks_reset).
-    """
-    cur = conn.cursor()
-    reset_p = reset_c = 0
-
-    # Papers
-    ids_present = _faiss_present_ids(paper_index)
-    if ids_present is not None:
-        cur.execute("SELECT id, in_index FROM papers")
-        bad = [row[0] for row in cur.fetchall() if row[0] not in ids_present and row[1] == 1]
-        good_missing_flag = [
-            row[0]
-            for row in cur.execute("SELECT id FROM papers WHERE in_index=0").fetchall()
-            if row[0] in ids_present
-        ]
-        if bad:
-            cur.executemany("UPDATE papers SET in_index=0 WHERE id=?", [(i,) for i in bad])
-            reset_p = len(bad)
-        if good_missing_flag:
-            cur.executemany(
-                "UPDATE papers SET in_index=1 WHERE id=?", [(i,) for i in good_missing_flag]
-            )
-
-    # Chunks
-    ids_present = _faiss_present_ids(chunk_index)
-    if ids_present is not None:
-        cur.execute("SELECT id, in_index FROM chunks")
-        bad = [row[0] for row in cur.fetchall() if row[0] not in ids_present and row[1] == 1]
-        good_missing_flag = [
-            row[0]
-            for row in cur.execute("SELECT id FROM chunks WHERE in_index=0").fetchall()
-            if row[0] in ids_present
-        ]
-        if bad:
-            cur.executemany("UPDATE chunks SET in_index=0 WHERE id=?", [(i,) for i in bad])
-            reset_c = len(bad)
-        if good_missing_flag:
-            cur.executemany(
-                "UPDATE chunks SET in_index=1 WHERE id=?", [(i,) for i in good_missing_flag]
-            )
-
-    conn.commit()
-    return reset_p, reset_c
+    """Thin wrapper: delegates to litkit.build.backfill."""
+    _load_heavy_deps()  # litkit.build pulls in faiss/numpy
+    from litkit.build import reconcile_sqlite_flags_with_faiss as build_reconcile_sqlite_flags
+    return build_reconcile_sqlite_flags(conn, paper_index, chunk_index)
 
 
-_TL_FAISS_CACHE = threading.local()
-
-def _faiss_load_cached(path: Path):
-    p = Path(path)
-    try:
-        st = p.stat()
-    except FileNotFoundError:
-        return _faiss_load(path)
-    mt_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
-    key = (str(p), mt_ns, int(st.st_size))
-
-    cache = getattr(_TL_FAISS_CACHE, "faiss", None)
-    if cache is None:
-        cache = {}
-        _TL_FAISS_CACHE.faiss = cache
-
-    idx = cache.get(key)
-    if idx is None:
-        # Clear this thread’s cache to avoid unbounded growth on file rotations
-        cache.clear()
-        cache[key] = faiss.read_index(str(p))
-        idx = cache[key]
-    return idx
-
-
-def _add_with_ids_dedup(index, ids: list[int], X: np.ndarray) -> tuple[int, np.ndarray]:
-    """Add (ids, X) to a possibly-wrapped FAISS index, removing stale ids first
-    when supported. Falls back to union-dedup when IDSelector is missing.
-    Returns (added_count, ids_added_array).
-    """
-    ids_arr = np.ascontiguousarray(ids, dtype=np.int64)
-    X = np.ascontiguousarray(X.astype("float32"))
-    faiss.normalize_L2(X)  # unit norm docs for IP == cosine
-    # Ensure IDMap2 for safe external id semantics everywhere
-    if not isinstance(index, faiss.IndexIDMap2):
-        index = faiss.IndexIDMap2(index)
-
-    try:
-        sel = _make_id_selector(ids_arr)
-        _safe_remove_ids(index, sel)
-        index.add_with_ids(X, ids_arr)
-        return int(ids_arr.size), ids_arr
-    except RuntimeError:
-        present = _faiss_present_ids(index) or set()
-        mask = np.array([int(i) not in present for i in ids_arr], dtype=bool)
-        if not mask.any():
-            return 0, np.empty((0,), dtype=np.int64)
-        ids_new = ids_arr[mask]
-        X_new = X[mask]
-        index.add_with_ids(X_new, ids_new)
-        return int(ids_new.size), ids_new
-
-
-@contextmanager
-def _temporary_search_params(kind, core, *, efSearch=None, nprobe=None):
-    saved = {}
-    try:
-        if kind == "hnsw" and hasattr(core, "hnsw"):
-            if efSearch is not None:
-                saved["efSearch"] = int(core.hnsw.efSearch)
-                core.hnsw.efSearch = int(efSearch)
-        elif kind == "ivf":
-            if nprobe is not None and hasattr(core, "nprobe"):
-                saved["nprobe"] = int(core.nprobe)
-                core.nprobe = int(nprobe)
-        yield
-    finally:
-        try:
-            if kind == "hnsw" and "efSearch" in saved:
-                core.hnsw.efSearch = saved["efSearch"]
-            elif kind == "ivf" and "nprobe" in saved:
-                core.nprobe = saved["nprobe"]
-        except Exception:
-            pass
-
-
-def _faiss_search(index_path: Path, qvec: np.ndarray, k: int, **kwargs):
-    index = _faiss_load_cached(index_path)
-    kind, core = _kind_and_core(index)
-    info = {}
-
-    if kind == "hnsw":
-        ef = int(kwargs.get("efSearch") or 128)
-        info["efSearch"] = ef
-        ctx = _temporary_search_params(kind, core, efSearch=ef)
-    elif kind == "ivf":
-        target = _pick_nprobe(int(core.nlist), kwargs.get("nprobe", None))
-        info["nprobe"] = target
-        info["nlist"] = int(core.nlist)
-        ctx = _temporary_search_params(kind, core, nprobe=target)
-    else:
-        ctx = nullcontext()
-
-    with ctx:
-        D, indices = index.search(qvec.astype("float32"), k)
-
-    ids = [int(x) for x in indices[0] if x != -1]
-    ds  = [float(d) for (d, x) in zip(D[0], indices[0], strict=False) if x != -1]
-    return ids, ds, info
 
 
 def shortlist_papers(
@@ -4253,37 +1530,21 @@ def shortlist_papers(
     k: int,
     efsearch: int = 128,
     *,
-    embedder: Embedder | None = None,
+    embedder: "Embedder | None" = None,
 ) -> list[int]:
-    """Stage 1: encode the question with SPECTER2 and retrieve top-k paper IDs
-    from the paper index (HNSW by default). Returns a list of paper ids.
-    """
-    enc = embedder or make_paper_embedder()[0]
-    q = enc.encode([question]).astype("float32", copy=False)
-    faiss.normalize_L2(q)
-    ids, _, meta = _faiss_search(PAPER_INDEX_PATH, q, k, efSearch=efsearch)
-    try:
-        es = meta.get("efSearch")
-        if es is not None:
-            _eprint(f"[retrieve] papers: HNSW efSearch={es} k={k}")
-    except Exception:
-        pass
-    return ids
+    """Thin wrapper: delegates to litkit.retrieval.shortlist_papers."""
+    _require_faiss("retrieval")  # fail fast if FAISS missing (even if called directly)
+    d = deps()  # ensures loaded + returns namespace (consistent pattern)
+    from litkit.retrieval import shortlist_papers as retrieval_shortlist_papers
+    get_runtime()
+    enc = embedder or d.make_paper_embedder()[0]
+    return retrieval_shortlist_papers(
+        question, k,
+        paper_index_path=PAPER_INDEX_PATH,
+        embedder=enc,
+        efsearch=efsearch,
+    )
 
-
-def chunk_ids_to_paper_ids(conn, chunk_ids: list[int]) -> dict[int, int]:
-    """Resolve chunk_id -> paper_id mapping for a given set of chunk IDs (batched to avoid SQLite var limits)."""
-    if not chunk_ids:
-        return {}
-    out: dict[int, int] = {}
-    B = 800
-    cur = conn.cursor()
-    for s in range(0, len(chunk_ids), B):
-        batch = chunk_ids[s : s + B]
-        marks = ",".join("?" for _ in batch)
-        cur.execute(f"SELECT id, paper_id FROM chunks WHERE id IN ({marks})", batch)
-        out.update({row[0]: row[1] for row in cur.fetchall()})
-    return out
 
 def search_chunks_constrained(
     question: str,
@@ -4295,672 +1556,53 @@ def search_chunks_constrained(
     lexical_cap: int | None = None,
     lexical_limit: int = 200,
     allow_global_lexical: bool | None = None,
-    embedder: Embedder | None = None,
+    embedder: "Embedder | None" = None,
     per_paper_cap: int = 0,
 ) -> tuple[list[int], dict[str, int]]:
-    """Stage 2: SBERT ANN + lexical front-loading.
-    1) Wide ANN search (K = max(k*overshoot, 100)).
-    2) Optional filter to candidate_papers.
-    3) ALWAYS front-load chunks that lexically match rare query terms (e.g., 'rulemonkey').
-    4) Return top-k ids (lexical-first, de-duped, then ANN order).
-
-    Returns:
-    -------
-    (chunk_ids, meta) : Tuple[List[int], Dict[str, int]]
-        chunk_ids: top-k ranked chunk IDs (lexical-first, de-duped, then ANN order).
-        meta: effective FAISS search params for the last query (e.g., {"nprobe": int, "nlist": int}).
-    """
-    enc = embedder or make_chunk_embedder()[0]
-    q = enc.encode([question]).astype("float32", copy=False)
-    faiss.normalize_L2(q)
-    #did_fallback = False  # always define; set True only when we drop the shortlist
-
-    K = max(k * overshoot, 100)
-    ids, dists, meta = _faiss_search(CHUNK_INDEX_PATH, q, K, nprobe=nprobe)
-    if not ids:
-        return [], meta
-
-    # Step 2: candidate-paper filter (if any)
-    ranked = list(zip(ids, dists, strict=False))
-
-    db_conn = _connect_db()
-
-    try:
-        cand: set | None = None
-        did_fallback = False  # default when no candidate_papers
-
-        env_thr = float(os.environ.get("LITKIT_MIN_CHUNKS_PER_PAPER", "2.0"))
-        thr = float(min_chunks_per_paper) if (min_chunks_per_paper is not None) else env_thr
-        if candidate_papers:
-            avg_c = _avg_chunks_for_papers(candidate_papers)
-            if avg_c >= thr:
-                cand = set(candidate_papers)
-            else:
-                # Fallback: global Stage-2 search (no candidate paper filter)
-                src = "param" if (min_chunks_per_paper is not None) else "env"
-                thr_val = thr  # from the AFTER patch above
-                _eprint(
-                    f"[retrieve] global Stage-2 fallback: def shortlist/paper={avg_c:.2f} (<{thr_val} via {src}), "
-                    f"shortlist_papers={len(candidate_papers)}, K={K}, nprobe={meta.get('nprobe','?')}"
-                )
-                cand = None
-            did_fallback = cand is None
-
-        if cand:
-            ann_chunk_to_paper = chunk_ids_to_paper_ids(db_conn, ids)
-            ranked = [(cid, dist) for cid, dist in ranked if ann_chunk_to_paper.get(cid) in cand]
-
-        # Step 3: lexical front-loading  (LIKE + ESCAPE ? + normalization + guard)
-        ALLOW_GLOBAL_LEXICAL = (
-            allow_global_lexical
-            if allow_global_lexical is not None
-            else os.environ.get("LITKIT_ALLOW_GLOBAL_LEXICAL", "0") == "1"
-        ) or did_fallback  # force global lexical on Stage-2 fallback
-        if did_fallback:
-            _eprint("[lexical] enabling global lexical front-load (Stage-2 fallback).")
-
-        terms = _query_terms(question)
-        # Extend the trigger to catch LIKE-sensitive chars too: %, \
-        rare_terms = [
-            t for t in terms if any(ch.isdigit() for ch in t) or any(ch in "-_%\\" for ch in t)
-        ]
-        if not rare_terms:
-            rare_terms = [t for t in terms if len(t) >= 9]  # long alpha tokens
-
-        # Choose a title “hint” token (prefer a rare term)
-        title_hint = _normalize_for_search_py(
-            rare_terms[0] if rare_terms else (terms[0] if terms else "")
-        )
-        title_like_param = (
-            f"%{_escape_like(title_hint)}%" if title_hint else "%"
-        )  # always bind something
-
-        lexical_ids: list[int] = []
-        # if rare_terms and not DISABLE_LEXICAL:
-        if rare_terms and not DISABLE_LEXICAL and ((cand is not None) or ALLOW_GLOBAL_LEXICAL):
-            norm = _sqlite_norm_expr("text")
-
-            # Inline the ESCAPE char literally; only bind the LIKE patterns.
-            like_parts = [f"{norm} LIKE ? ESCAPE '\\'"] * len(rare_terms)
-            like_clause = " OR ".join(like_parts)
-
-            # Normalize + escape once per term; no ESCAPE param bindings needed.
-            params = [f"%{_escape_like(_normalize_for_search_py(t))}%" for t in rare_terms]
-
-            cur = db_conn.cursor()
-            scope_is_global = bool(ALLOW_GLOBAL_LEXICAL or did_fallback)
-            try:
-                # If the user asked for global lexical (flag) or we fell back,
-                # do NOT restrict to the Stage-1 shortlist.
-                if scope_is_global:
-                    cur.execute(
-                        f"""
-                        SELECT c.id
-                        FROM chunks c
-                        JOIN papers p ON p.id = c.paper_id
-                        WHERE ({like_clause.replace('text','c.text')})
-                        ORDER BY (c.ord = -1) DESC,
-                                ({_sqlite_norm_expr('p.title')} LIKE ? ESCAPE '\\') DESC,
-                                (p.pmid IS NOT NULL) DESC,      -- prefer items indexed in PubMed
-                                (p.pmcid IS NOT NULL) DESC,     -- then PMCID presence
-                                c.id ASC
-                        LIMIT ?
-                        """,
-                        params + [title_like_param] + [int(lexical_limit)],
-                    )
-                else:
-                    _load_temp_candidates(db_conn, list(cand))
-                    cur.execute(
-                        f"""
-                        SELECT c.id
-                        FROM chunks c
-                        JOIN papers p ON p.id = c.paper_id
-                        WHERE ({like_clause.replace('text','c.text')})
-                        AND c.paper_id IN (SELECT id FROM cand_papers)
-                        ORDER BY (c.ord = -1) DESC,
-                                ({_sqlite_norm_expr('p.title')} LIKE ? ESCAPE '\\') DESC,
-                                (p.pmid IS NOT NULL) DESC,      -- prefer items indexed in PubMed
-                                (p.pmcid IS NOT NULL) DESC,     -- then PMCID presence
-                                c.id ASC
-                        LIMIT ?
-                        """,
-                        params + [title_like_param] + [int(lexical_limit)],
-                    )
-                lexical_ids = [row[0] for row in cur.fetchall()]
-            except sqlite3.OperationalError as e:
-                global _LEXICAL_WARN_ONCE
-                msg = f"[lexical] disabled: {e.__class__.__name__}: {e}"
-                if not _LEXICAL_WARN_ONCE:
-                    _LEXICAL_WARN_ONCE = True
-                    where = (
-                        "candidate papers only"
-                        if (cand is not None and not scope_is_global)
-                        else "global"
-                    )
-                    logging.warning(
-                        "%s (scope=%s). Tip: set --allow-global-lexical to widen matches if your shortlist is sparse.",
-                        msg,
-                        where,
-                    )
-                lexical_ids = []
-
-        # Merge with a cap + interleave so lexical can't swamp ANN
-        LEX_CAP = (
-            lexical_cap if lexical_cap is not None else max(5, k // 3)
-        )  # at most ~1/3 from lexical
-        lexical_ids = lexical_ids[:LEX_CAP]
-
-        seen = set()
-        merged: list[int] = []
-        i = j = 0
-        while len(merged) < k and (i < len(lexical_ids) or j < len(ranked)):
-            if i < len(lexical_ids):
-                cid = lexical_ids[i]
-                i += 1
-                if cid not in seen:
-                    seen.add(cid)
-                    merged.append(cid)
-            if len(merged) >= k:
-                break
-            if j < len(ranked):
-                cid, _ = ranked[j]
-                j += 1
-                if cid not in seen:
-                    seen.add(cid)
-                    merged.append(cid)
-
-        out = merged[:k]
-
-     
-        # Apply per-paper cap, then top up to k from remaining ANN order (still respecting the cap)
-        if per_paper_cap:
-            from collections import defaultdict
-
-            def _batched_map(ids_list: list[int]) -> dict[int, int]:
-                """Chunked id->paper_id resolver to avoid SQLite's 999-parameter ceiling."""
-                if not ids_list:
-                    return {}
-                out_map: dict[int, int] = {}
-                B = 800  # under SQLite's 999 variable limit
-                cur = db_conn.cursor()
-                for s in range(0, len(ids_list), B):
-                    batch = ids_list[s : s + B]
-                    qmarks = ",".join("?" for _ in batch)
-                    rows = cur.execute(
-                        f"SELECT id AS chunk_id, paper_id FROM chunks WHERE id IN ({qmarks})", batch
-                    ).fetchall()
-                    out_map.update({row[0]: row[1] for row in rows})
-                return out_map
-
-            # 1) Cap what we already selected (if anything)
-            # cmap: dict[int, int] = _batched_map(out) if out else {}
-            selected_chunk_to_paper: dict[int, int] = _batched_map(out) if out else {}
-            if out:
-                out = cap_chunks_per_paper(out, selected_chunk_to_paper, max_per_paper=per_paper_cap)
-
-            # 2) Build a helper that tries to top up from a given ANN candidate list
-            def _top_up_from_ann(ann_ranked: list[tuple[int, float]]) -> None:
-                nonlocal out
-                selected = set(out)
-                ann_pool = [cid for (cid, _) in ann_ranked if cid not in selected]
-                if not ann_pool or len(out) >= k:
-                    return
-                pool_map = _batched_map(ann_pool)
-
-                counts = defaultdict(int)
-                for cid in out:
-                    pid = selected_chunk_to_paper.get(cid)
-                    if pid is not None:
-                        counts[pid] += 1
-
-                for cid in ann_pool:
-                    if len(out) >= k:
-                        break
-                    pid = pool_map.get(cid)
-                    if pid is None:
-                        continue
-                    if counts[pid] < per_paper_cap:
-                        out.append(cid)
-                        counts[pid] += 1
-                        # keep in sync in case we widen again
-                        if cid not in selected_chunk_to_paper and pid is not None:
-                            selected_chunk_to_paper[cid] = pid
-
-            # 2a) Try with the ANN list we already have
-            if len(out) < k:
-                _top_up_from_ann(ranked)
-
-            # 2b) If still short, widen ANN search (up to 2 rounds, each time doubling K)
-            widen_rounds = 2
-            seen_ranked_ids = {cid for (cid, _) in ranked}
-            curK = K
-            for _ in range(widen_rounds):
-                if len(out) >= k:
-                    break
-                curK = min(curK * 2, 10000)  # hard ceiling to avoid unbounded growth
-                more_ids, more_dists, _ = _faiss_search(CHUNK_INDEX_PATH, q, curK, nprobe=nprobe)
-                # append only truly new ids, preserving ANN order
-                new_ranked = [(cid, dist) for cid, dist in zip(more_ids, more_dists, strict=False)
-                            if cid not in seen_ranked_ids]
-                if not new_ranked:
-                    break
-                ranked.extend(new_ranked)
-                seen_ranked_ids.update(cid for cid, _ in new_ranked)
-                _top_up_from_ann(new_ranked)
-
-    finally:
-        db_conn.close()
-
-    return out, meta
+    """Thin wrapper: delegates to litkit.retrieval.search_chunks_constrained."""
+    _require_faiss("retrieval")  # fail fast if FAISS missing (even if called directly)
+    d = deps()  # ensures loaded + returns namespace (consistent pattern)
+    from litkit.retrieval import search_chunks_constrained as retrieval_search_chunks_constrained
+    get_runtime()
+    enc = embedder or d.make_chunk_embedder()[0]
+    return retrieval_search_chunks_constrained(
+        question=question,
+        candidate_papers=candidate_papers,
+        k=k,
+        chunk_index_path=CHUNK_INDEX_PATH,
+        db_path=DB_PATH,
+        embedder=enc,
+        connect_db=d.db_connect_db,
+        load_temp_candidates=d.db_load_temp_candidates,
+        chunk_ids_to_paper_ids=d.db_chunk_ids_to_paper_ids,
+        overshoot=overshoot,
+        nprobe=nprobe,
+        min_chunks_per_paper=min_chunks_per_paper,
+        lexical_cap=lexical_cap,
+        lexical_limit=lexical_limit,
+        allow_global_lexical=allow_global_lexical,
+        per_paper_cap=per_paper_cap,
+    )
 
 
 def get_chunks(conn, ids: list[int]) -> list[dict[str, str]]:
-    """Retrieve chunk rows joined with paper metadata, preserving input `ids` order.
-
-    Returns a list of dicts containing:
-      id, paper_id, ord, text, paper_title, pmid, pmcid
-    """
-    if not ids:
-        return []
-    marks = ",".join("?" for _ in ids)
-    cur = conn.cursor()
-    cur.execute(
-        f"""SELECT c.id, c.paper_id, c.ord, c.text, p.title, p.pmid, p.pmcid
-                    FROM chunks c JOIN papers p ON p.id=c.paper_id
-                    WHERE c.id IN ({marks})""",
-        ids,
-    )
-    rows = cur.fetchall()
-    rowmap = {row[0]: row for row in rows}
-    out = []
-    for cid in ids:  # preserve ranking order
-        row = rowmap.get(cid)
-        if not row:
-            continue
-        out.append(
-            {
-                "id": row[0],
-                "paper_id": row[1],
-                "ord": row[2],
-                "text": row[3],
-                "paper_title": row[4] or "",
-                "pmid": row[5] or "",
-                "pmcid": row[6] or "",
-            }
-        )
-    return out
-
-
-def _avg_chunks_for_papers(pids: list[int]) -> float:
-    """Average number of chunks across the requested paper ids (zeros included)."""
-    if not pids:
-        return 0.0
-    conn = _connect_db()
-    try:
-        _load_temp_candidates(conn, pids)
-        rows = conn.execute(
-            """
-            SELECT cp.id, COUNT(c.id)
-            FROM cand_papers cp
-            LEFT JOIN chunks c ON c.paper_id = cp.id
-            GROUP BY cp.id
-        """
-        ).fetchall()
-        # rows length equals len(pids), with zero-count rows for papers with no chunks
-        return 0.0 if not rows else (sum(n for _, n in rows) / float(len(pids)))
-    finally:
-        conn.close()
-
-
-# -------------------- LLM + token-budgeting --------------------
-# OpenAI client is imported lazily inside LLM paths to keep build-only runs offline-safe.
-
-# Define a single system prompt constant at module scope
-SYS_PROMPT = (
-    "You are a precise scientific assistant. Use ONLY the provided context chunks to answer; "
-    "do not use prior knowledge. You MUST include bracketed citations like [1], [2] that refer "
-    "to the provided chunks. Cite what you use in your answer and prefer multiple sources when "
-    "the claim spans chunks. If context is insufficient, say so briefly."
-)
-
-
-def approx_tokens(s: str) -> int:
-    """Very rough char→token approximation used to enforce context budgets.
-    Uses ≈4 chars per token, returns at least 1.
-    """
-    return max(1, len(s) // 4)
-
-
-def pack_context(
-    chunks: list[dict[str, str]], question: str, model_name: str, *, sys_prompt: str = SYS_PROMPT
-) -> tuple[str, list[int]]:
-    """Assemble a model-aware context window from ranked chunks, respecting an approximate
-    token budget determined by the target model. Uses the *actual* system prompt for
-    budgeting to avoid drift.
-
-    Returns:
-    -------
-    (context_text, used_indices)
-      context_text : str
-          Concatenated context blocks prefixed with [i] and paper metadata.
-      used_indices : List[int]
-          1-based indices of chunks that fit within the budget (in order).
-    """
-    # Choose token budget per model family
-    budget = BUDGET_TOKENS_O3 if model_name.lower().startswith("o3") else BUDGET_TOKENS_OSS20B
-
-    # Budget against exactly what you'll send (prompt + "QUESTION:/CONTEXT:" wrappers)
-    base_cost = (
-        approx_tokens(sys_prompt)
-        + approx_tokens("QUESTION:\n")
-        + approx_tokens(question)
-        + approx_tokens("\n\nCONTEXT:\n")
-        + PROMPT_HEADROOM_TOKENS  # safety buffer for tool/SDK scaffolding and response headroom
-    )
-    remain = max(0, budget - base_cost)
-
-    blocks: list[str] = []
-    used: list[int] = []
-
-    for i, ch in enumerate(chunks, 1):
-        meta = []
-        if ch.get("pmcid"):
-            meta.append(f"PMCID:{ch['pmcid']}")
-        if ch.get("pmid") and not ch.get("pmcid"):
-            meta.append(f"PMID:{ch['pmid']}")
-        meta_str = f" ({', '.join(meta)})" if meta else ""
-
-        block = f"[{i}] {ch.get('paper_title','').strip()}{meta_str}\n{ch['text']}"
-        cost = approx_tokens(block) + 20  # small join/formatting overhead
-
-        if cost <= remain:
-            blocks.append(block)
-            used.append(i)
-            remain -= cost
-        else:
-            break
-
-    ctx_text = "\n\n".join(blocks) if blocks else "(no context)"
-    return ctx_text, used
-
-
-def answer_with_llm(
-    question, chunks, model, base_url, api_key, max_out_tokens=None, *, sys_prompt: str = SYS_PROMPT
-):
-    """Call an OpenAI-compatible endpoint to answer using ONLY the provided context.
-
-    Policy:
-      - "o3*" -> Responses API with reasoning.
-      - otherwise -> Chat Completions.
-      - Fallback: if Responses API is unavailable (e.g., local endpoint), fall back to Chat.
-
-    Overflow handling:
-      - Detect a broader set of context/token-limit errors.
-      - On each retry, trim chunks AND reduce max_out to actually free room.
-    """
-
-    def _clarify_llm_error(model: str, base_url: str, raw: str) -> str:
-        msg = (raw or "").strip()
-        low = msg.lower()
-        # Common local/LM Studio cases
-        if (
-            ("no models loaded" in low)
-            or ("model_not_found" in low)
-            or ("404" in low and "model" in low)
-        ):
-            return (
-                "[llm] ERROR: The endpoint is up but has no model loaded (or does not recognize "
-                f"{model!r}).\n"
-                f"  • Endpoint: {base_url}\n"
-                "  • Fix (LM Studio): open LM Studio, load a chat model, and enable the local server "
-                "(or run: `lms load <model_name>`). Then rerun your command.\n"
-                "  • Alt: use OpenAI — e.g., `--llm-model o3-mini --openai-api-key $OPENAI_API_KEY`.\n"
-                "  • Alt: retrieval only — add `--no-llm`.\n"
-                f"  • Provider message: {msg}\n"
-            )
-        if ("unauthorized" in low) or ("invalid api key" in low) or ("401" in low):
-            return (
-                "[llm] ERROR: Authentication failed for the LLM endpoint.\n"
-                f"  • Endpoint: {base_url}\n"
-                "  • Fix: pass a valid `--openai-api-key` (OpenAI), or for local servers set a dummy token or none, "
-                "depending on the server’s requirements.\n"
-                f"  • Provider message: {msg}\n"
-            )
-        return (
-            "[llm] ERROR: LLM call failed.\n"
-            f"  • Endpoint: {base_url}\n"
-            f"  • Model: {model}\n"
-            "  • Try: load a local model, switch to an OpenAI model with a valid API key, "
-            "or run with `--no-llm`.\n"
-            f"  • Provider message: {msg}\n"
-        )
-
-    # Lazy import to avoid hard dependency during build-only runs.
-    try:
-        import openai
-        from openai import OpenAI
-    except Exception as e:
-        raise RuntimeError(
-            "[llm] OpenAI client not installed; use --build-only or install 'openai'."
-        ) from e
-
-    client = OpenAI(base_url=base_url, api_key=api_key, timeout=OPENAI_TIMEOUT_SEC)
-    m = (model or "").lower()
-    is_o3 = m.startswith("o3")
-
-    # Preflight check: local servers often support `models.list`.
-    # If it returns empty, surface a clear error before the main call.
-    try:
-        models_resp = client.models.list()
-        available = [
-            getattr(x, "id", str(x)) for x in getattr(models_resp, "data", list(models_resp) or [])
-        ]
-        if ("localhost" in base_url or "127.0.0.1" in base_url) and not available:
-            raise RuntimeError("No models loaded. Please load an LLM.")
-        if (
-            available
-            and (model not in available)
-            and ("localhost" in base_url or "127.0.0.1" in base_url)
-        ):
-            raise RuntimeError(
-                f"Model {model!r} not found on the local endpoint. Available: {', '.join(available[:8])}{' …' if len(available) > 8 else ''}"
-            )
-    except Exception:
-        # Not fatal: some providers don’t implement models.list; proceed to the main call.
-        pass
-
-    # Default output budgets (conservative)
-    max_out = int(max_out_tokens) if max_out_tokens is not None else 3000
-
-    # Work on a local copy so we can trim safely on retry
-    working_chunks = list(chunks)
-
-    # Up to 4 tries: progressively trim the number of chunks *and* reduce max_out
-    for attempt in range(4):
-        ctx_text, _used_idxs = pack_context(working_chunks, question, model, sys_prompt=sys_prompt)
-        sys_msg = sys_prompt
-
-        try:
-            if is_o3:
-                # Primary: Responses API (use string `input` + `instructions`)
-                try:
-                    resp = client.responses.create(
-                        model=model,
-                        input=f"QUESTION:\n{question}\n\nCONTEXT:\n{ctx_text}",
-                        instructions=sys_msg,
-                        max_output_tokens=max_out,
-                        reasoning={"effort": "medium"},
-                    )
-                    text = getattr(resp, "output_text", None)
-                    if text is None:
-                        # Older SDKs: synthesize from content if needed
-                        try:
-                            parts = []
-                            for item in getattr(resp, "output", []) or []:
-                                for c in getattr(item, "content", []) or []:
-                                    if getattr(c, "type", "") == "output_text":
-                                        parts.append(getattr(c, "text", ""))
-                            text = "".join(parts).strip() if parts else ""
-                        except Exception:
-                            text = ""
-                    return (text or "").strip()
-                except Exception as ee:
-                    # If the endpoint doesn't support Responses, surface a clear error.
-                    msg = (str(ee) or "").lower()
-                    if any(
-                        s in msg
-                        for s in (
-                            "404",
-                            "not found",
-                            "405",
-                            "method not allowed",
-                            "responses.create",
-                            "unknown parameter",
-                            "unexpected argument",
-                            "unrecognized field",
-                            "invalid request body",
-                            "schema validation",
-                            "unsupported field",
-                            "does not support reasoning",
-                            "unsupported parameter 'reasoning'",
-                        )
-                    ):
-                        raise RuntimeError(
-                            f"[llm] The endpoint at {base_url!r} does not support the Responses API "
-                            f"for model {model!r}. Use an OpenAI endpoint for o-series (Responses-only), "
-                            "switch to a chat-compatible local model (e.g., --llm-model gpt-oss:20b), "
-                            "or run retrieval-only with --no-llm on air-gapped systems."
-                        ) from ee
-                    # Otherwise, bubble up for the outer overflow handler
-                    raise
-
-            else:
-                # Local/OSS endpoints: Chat Completions
-                resp = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": sys_msg},
-                        {
-                            "role": "user",
-                            "content": f"QUESTION:\n{question}\n\nCONTEXT:\n{ctx_text}",
-                        },
-                    ],
-                    temperature=0.2,
-                    max_tokens=max_out,
-                )
-                text = getattr(resp.choices[0].message, "content", "") or ""
-                return text.strip()
-
-        except Exception as e:
-            # Broader overflow detection across providers/SDKs
-            msg = (str(e) or "").lower()
-
-            is_overflow = (
-                isinstance(e, getattr(openai, "BadRequestError", tuple()))
-                or "context length" in msg
-                or "maximum context length" in msg
-                or "exceeds context window" in msg
-                or "token limit" in msg
-                or "too many tokens" in msg
-                or "reduce the length of the messages" in msg
-                or "max tokens" in msg
-                or "prompt too long" in msg
-                or "input too long" in msg
-                or "payload too large" in msg
-                or "413" in msg
-            )
-
-            if is_overflow and attempt < 3:
-                # Trim chunks harder each time and reduce max_out to free space
-                if len(working_chunks) > 1:
-                    if attempt == 0:
-                        new_len = max(1, int(len(working_chunks) * 0.7))
-                    else:
-                        new_len = max(1, len(working_chunks) // 2)
-                    working_chunks = working_chunks[:new_len]
-                # reduce output allowance by 25% each retry (floor at 128)
-                max_out = max(128, int(max_out * 0.75))
-                continue
-
-            # Not an overflow, or no sensible retry left
-            raise RuntimeError(_clarify_llm_error(model, base_url, str(e))) from e
-
-
-# -------------------- Citations: normalize + print only cited --------------------
-
-# Keep these for potential downstream uses (harmless if unused)
-_CITATION_BR = re.compile(
-    r"(\[(?:\s*\d+(?:\s*,\s*\d+)*\s*)\])"  # [1] or [1, 3]
-    r"|"
-    r"(【(?:\s*\d+(?:\s*[,、，]\s*\d+)*\s*)】)"  # 【2】 or 【1, 3】 (Chinese/JP commas allowed)
-)
-
-# We’ll normalize by extracting only the leading numeric list inside a bracket and
-# discarding any trailing “†L1–L8” or similar. Accept -, – or — in those tails.
-_CITATION_LINELOC = re.compile(r"([\[【]\s*\d+)\s*†L\d+(?:[–—-]\d+)?(\s*[】\]])")
-
-# General bracket grabber; we’ll rebuild the contents canonically.
-_CITATION_ANYBR = re.compile(r"(?P<open>[\[【])(?P<inside>[^\[\]【】]{0,200}?)(?P<close>[】\]])")
-
-# Leading numeric list only (before any tails); supports ASCII/CJK commas.
-_LEADING_NUM_LIST = re.compile(r"^\s*(\d+(?:\s*[，、,]\s*\d+)*)")
-
-def _normalize_and_strip_citations(text: str) -> str:
-    """Canonically normalize bracketed numeric citations so downstream matching works:
-       1) Convert fullwidth brackets to ASCII [ ].
-       2) Remove '†Lx–Ly' / location tails by only keeping the leading numeric list.
-       3) Normalize commas/spacing, de-duplicate while preserving order.
-    """
-    try:
-        s = unicodedata.normalize("NFKC", text)
-    except Exception:
-        s = text
-
-    # Strip common zero-width junk that can sneak in
-    for z in ("\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"):
-        s = s.replace(z, "")
-
-    # Unify bracket style so later regexes see ASCII brackets
-    s = s.replace("【", "[").replace("】", "]")
-
-    # Collapse explicit †L tails like “[2†L1–L8]” -> “[2]” (still leave contents to the next pass)
-    s = _CITATION_LINELOC.sub(r"\1\2", s)
-
-    # Rebuild each bracketed group canonically from just the *leading* numeric list
-    def _rebuild(m: re.Match) -> str:
-        inside = m.group("inside")
-        lead = _LEADING_NUM_LIST.match(inside)
-        if not lead:
-            # Not a numeric citation; leave untouched (e.g., [Note])
-            return m.group(0)
-
-        nums_str = lead.group(1)
-        parts = [p.strip() for p in re.split(r"[，、,]", nums_str) if p.strip()]
-
-        out, seen = [], set()
-        for p in parts:
-            if p.isdigit():
-                n = int(p)
-                if n not in seen:
-                    seen.add(n)
-                    out.append(n)
-
-        if not out:
-            # Nothing numeric survived; drop the brackets entirely
-            return ""
-
-        return "[" + ", ".join(str(n) for n in out) + "]"
-
-    return _CITATION_ANYBR.sub(_rebuild, s)
-
-# Back-compat for existing call sites that invoke _strip_citation_linelocs()
-def _strip_citation_linelocs(text: str) -> str:
-    return _normalize_and_strip_citations(text)
+    """Thin wrapper: delegates to litkit.retrieval.get_chunks."""
+    _load_heavy_deps()  # litkit.retrieval pulls in faiss/numpy
+    from litkit.retrieval import get_chunks as retrieval_get_chunks
+    return retrieval_get_chunks(conn, ids)
 
 
 # -------------------- Main --------------------
 def main():
     """CLI entry point."""
+    # Check Python version at runtime (moved from import-time for import purity)
+    if sys.version_info < (3, 10):
+        sys.stderr.write("[env] Python >= 3.10 required.\n")
+        sys.exit(2)
+    
+    # NOTE: get_runtime() is called AFTER --offline handling so that HF_HUB_OFFLINE
+    # is set before setup_environment() runs. See below after parse_args().
+    
     # declare BEFORE any references to these names in this function (to satisfy Python rule)
     global PAPER_BATCH, CHUNK_BATCH, CKPT_EVERY
     global DEFAULT_BUSY_TIMEOUT_MS
@@ -4983,9 +1625,8 @@ def main():
         MIN_CPP_DEFAULT = float(min_cpp_env) if min_cpp_env is not None else 2.0
     except ValueError:
         MIN_CPP_DEFAULT = 2.0
-        logging.warning(
-            "[args] Ignoring invalid LITKIT_MIN_CHUNKS_PER_PAPER=%r; using 2.0", min_cpp_env
-        )
+        # logging deferred to main(); use stderr for early warnings
+        sys.stderr.write(f"[args] WARNING: Ignoring invalid LITKIT_MIN_CHUNKS_PER_PAPER={min_cpp_env!r}; using 2.0\n")
     ap.add_argument(
         "--min-chunks-per-paper",
         type=float,
@@ -5125,10 +1766,24 @@ def main():
         help="Wipe DB & indices; full rebuild (asks for confirmation in TTY)",
     )
     ap.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Force --rebuild even if unconsumed segments or active producers exist. "
+        "WARNING: This can cause data corruption if producers are still active.",
+    )
+    # NOTE: --yes only takes effect AFTER parse_args() returns. If you ever add
+    # pre-parse prompts (before argparse runs), check "-y" in sys.argv directly
+    # instead of relying on os.environ["LITKIT_ASSUME_YES"].
+    ap.add_argument(
         "-y",
         "--yes",
         action="store_true",
         help="Skip confirmation prompts (for automation). Equivalent to LITKIT_ASSUME_YES=1.",
+    )
+    ap.add_argument(
+        "--strict-ingest",
+        action="store_true",
+        help="Fail fast on ingest errors instead of mark-and-skip (default: skip failed members and continue)",
     )
 
     # index types / params
@@ -5193,7 +1848,9 @@ def main():
     ap.add_argument(
         "--faiss-writer",
         action="store_true",
-        help="This process is allowed to mutate and save FAISS indices.",
+        help="This process is allowed to mutate and save FAISS indices. "
+        "NOTE: Writer sessions use hard-exit (os._exit) on SIGINT/SIGTERM to avoid "
+        "deadlocks; partial state is repaired by reconcile+backfill on next startup.",
     )
     ap.add_argument(
         "--embed-producer",
@@ -5266,44 +1923,99 @@ def main():
         help="Run retrieval only and print selected context; do not call an LLM.",
     )
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # INVARIANT: parse_args() MUST come before _load_heavy_deps()
+    # ═══════════════════════════════════════════════════════════════════════════
+    # argparse automatically exits on --version, -h, --help BEFORE returning.
+    # This guarantees fast --help/--version even if heavy dependencies (faiss,
+    # torch, transformers) are missing or broken.
+    #
+    # DO NOT move _load_heavy_deps() or any heavy import above this line.
+    # ═══════════════════════════════════════════════════════════════════════════
     args = ap.parse_args()
 
     # ivf_nlist_forced = "--ivf-nlist" in sys.argv
     seen_flags = {s.split("=", 1)[0] for s in sys.argv}
     args._ivf_nlist_forced = ("--ivf-nlist" in seen_flags)
 
-    # logging + device threads
-    logging.basicConfig(
-        level=(logging.ERROR if args.quiet else logging.WARNING),
-        format="%(levelname)s %(name)s: %(message)s",
-        force=True,
-    )
-    configure_threads()
-    device = detect_device()
-    if not (args.quiet or _SUPPRESS_EARLY):
-        _eprint(f"[version] {_version_banner()}")
-        _eprint(f"[device] using {device}")
+    # Honor --offline FIRST (before any heavy imports that touch transformers/HF)
+    # Transformers checks HF_HUB_OFFLINE at import time, so this MUST come before _load_heavy_deps()
+    if args.offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # DEFERRED HEAVY IMPORTS: _load_heavy_deps() is NOT called here!
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Heavy dependencies (faiss, torch, transformers) are loaded ONLY when needed:
+    # - build_or_update_indices() calls _load_heavy_deps() internally
+    # - --reconcile-only calls _require_faiss() which loads deps
+    # - Retrieval pipeline calls _require_faiss() which loads deps
+    #
+    # This ensures fast exits for validation errors (missing tar shards, flag
+    # conflicts, etc.) without paying the 2-5 second import penalty.
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # Trigger lazy runtime initialization - populates path globals like WORKSPACE, DB_PATH, etc.
+    # This must happen before any code that uses path globals (e.g., _vector_store_exists).
+    get_runtime()
 
     # Do we have a vector store?
     def _vector_store_exists() -> bool:
+        """Return True only if ALL three required paths exist:
+        - PAPER_INDEX_PATH (FAISS paper index)
+        - CHUNK_INDEX_PATH (FAISS chunk index)
+        - DB_PATH (SQLite database)
+        
+        If any component is missing, returns False (treat as "no vector store").
+        This is intentional: a partial store (e.g., DB exists but one index missing)
+        requires a fresh build or --init-indices-only to bootstrap.
+        
+        Note: Path.exists() returns False for missing files (doesn't raise).
+        OSError can occur for permission denied, path too long, etc.
+        """
         try:
             return PAPER_INDEX_PATH.exists() and CHUNK_INDEX_PATH.exists() and DB_PATH.exists()
-        except Exception:
-            return False
+        except OSError as e:
+            # Permission denied, path too long, etc. - fail fast with clear message
+            _eprint(
+                f"[error] cannot access vector store paths: {e.__class__.__name__}: {e}\n"
+                f"  DB_PATH: {DB_PATH}\n"
+                f"  PAPER_INDEX_PATH: {PAPER_INDEX_PATH}\n"
+                f"  CHUNK_INDEX_PATH: {CHUNK_INDEX_PATH}"
+            )
+            raise SystemExit(2)
 
-    # Make all later _connect_db() calls honor the user's timeout setting:
-    DEFAULT_BUSY_TIMEOUT_MS = int(args.sqlite_busy_timeout_ms)
+    # Early guard for --consume-only with missing indices
+    if args.consume_only and not _vector_store_exists():
+        raise SystemExit(
+            "[consumer] FAISS indices/DB not found. Run an initial build "
+            "or --init-indices-only first before using --consume-only."
+        )
+
+    # Make all later db_connect_db() calls honor the user's timeout setting
+    # by setting the env var that litkit.db.connection reads.
+    #
+    # NOTE: This works because litkit.db.connection reads the env var at CALL TIME
+    # (via _get_busy_timeout() inside connect_db()), not at import time. Importing
+    # the module just loads function definitions; the env var isn't read until
+    # connect_db() is actually invoked. Safe to set here after parse_args().
+    os.environ["LITKIT_SQLITE_BUSY_TIMEOUT_MS"] = str(args.sqlite_busy_timeout_ms)
 
     # Do we need tar shards?
     # Note: --consume-only doesn't need corpus (it only ingests pre-computed segments)
+    # Note: --reconcile-only doesn't need corpus (it only fixes in_index flags)
+    # Note: --faiss-writer is a role flag (may mutate indices), not "must scan tars"
     needs_corpus = (
-        args.rebuild
-        or args.update
-        or args.build_only
-        or args.embed_producer
-        or (args.faiss_writer and not args.consume_only)  # consume-only skips tar scanning
-        or (not _vector_store_exists())
+        not args.consume_only
+        and not args.reconcile_only
+        and (
+            args.rebuild
+            or args.update
+            or args.build_only
+            or args.embed_producer
+            or (not _vector_store_exists())
+        )
     ) and not args.init_indices_only  # Bootstrap doesn't need corpus
 
     # --- helper: determine if a directory contains .tar.gz files ---
@@ -5353,6 +2065,17 @@ def main():
     if needs_corpus and args.tar_manifest is not None and not args.tar_manifest.exists():
         raise SystemExit(f"Manifest not found: {args.tar_manifest}")
 
+    # Guard: building from scratch requires a writer/producer role
+    # Without this, we'd create in-memory indices, do all the DB work, but never persist FAISS.
+    if needs_corpus and not args.faiss_writer and not args.embed_producer and not _vector_store_exists():
+        raise SystemExit(
+            "[build] No vector store found. A fresh build requires one of:\n"
+            "  • --faiss-writer           (single-node build, or writer node in multi-node)\n"
+            "  • --embed-producer         (producer node in multi-node setup)\n"
+            "  • --init-indices-only --faiss-writer (bootstrap empty indices first)\n\n"
+            "For query-only usage, first run a build with one of the above flags."
+        )
+
     # No source error
     if needs_corpus and args.tar_dir is None and args.tar_manifest is None:
         raise SystemExit(
@@ -5377,7 +2100,17 @@ def main():
         if needs_corpus:
             _report_paths(args.tar_dir, WORKSPACE, args.tar_manifest, args.tar_dir_origin)
         else:
-            _eprint(f"[paths] skipping tar shards: existing vector store found")
+            # Report the specific reason why tar shards are being skipped
+            if args.reconcile_only:
+                _eprint("[paths] skipping tar shards: --reconcile-only mode")
+            elif args.consume_only:
+                _eprint("[paths] skipping tar shards: --consume-only mode")
+            elif args.init_indices_only:
+                _eprint("[paths] skipping tar shards: --init-indices-only mode")
+            elif _vector_store_exists():
+                _eprint("[paths] skipping tar shards: existing vector store found")
+            else:
+                _eprint("[paths] skipping tar shards: no build action requested")
             _eprint(f"[paths] using {WORKSPACE} as writable directory for job artifacts/outputs")
 
     # Wire CLI --quiet into the early env-based guard for the rest of the run
@@ -5406,19 +2139,52 @@ def main():
             # allow read-only flows, --version, help, etc.
             pass
 
-    # Post-init advisory-lock status line
-    if (not FLOCK_AVAILABLE and sys.platform.startswith("win")) or _ADVISORY_LOCK_DISABLED:
-        global _ADVISORY_LOCK_NOTICE_PRINTED
-        if not _ADVISORY_LOCK_NOTICE_PRINTED:
-            _eprint("[lock] advisory locking disabled on this filesystem; proceeding best-effort")
-            _ADVISORY_LOCK_NOTICE_PRINTED = True
+    # ---- Validate mutually exclusive flag combinations ----
+    if args.embed_producer and args.faiss_writer:
+        sys.exit(
+            "[args] ERROR: --embed-producer and --faiss-writer are mutually exclusive.\n"
+            "  • Producers write embedding segments to disk (not FAISS).\n"
+            "  • Writers mutate FAISS indices directly (or ingest segments with --consume-only).\n"
+            "Use --embed-producer for producer nodes, --faiss-writer for the single writer/consumer."
+        )
+    if args.consume_only and args.embed_producer:
+        sys.exit(
+            "[args] ERROR: --consume-only and --embed-producer are mutually exclusive.\n"
+            "  • Consumers ingest pre-computed segments; they don't produce embeddings.\n"
+            "Use --embed-producer on producer nodes, --consume-only on the writer node."
+        )
+    if args.init_indices_only and args.embed_producer:
+        sys.exit(
+            "[args] ERROR: --init-indices-only and --embed-producer are mutually exclusive.\n"
+            "  • --init-indices-only only creates empty FAISS indices (bootstrap step).\n"
+            "Run --init-indices-only first, then start producers separately."
+        )
+    
+    # Destructive / store-defining operations require writer role
+    if args.rebuild and not args.faiss_writer:
+        sys.exit(
+            "[args] ERROR: --rebuild requires --faiss-writer.\n"
+            "  • --rebuild wipes DB and indices; only a writer can rebuild them.\n"
+            "  • Without --faiss-writer, you'd have a wiped store with no rebuilt indices."
+        )
+    if args.rebuild and args.consume_only:
+        sys.exit(
+            "[args] ERROR: --rebuild and --consume-only are mutually exclusive.\n"
+            "  • --rebuild performs a full wipe-and-rebuild from tar shards.\n"
+            "  • --consume-only only ingests pre-computed segments."
+        )
+    if args.init_indices_only and not args.faiss_writer:
+        sys.exit(
+            "[args] ERROR: --init-indices-only requires --faiss-writer.\n"
+            "  • --init-indices-only creates empty FAISS indices.\n"
+            "  • Only a writer can create/save FAISS index files."
+        )
+
+    # NOTE: Segment conflict check for --rebuild moved to build_or_update_indices()
+    # where _load_heavy_deps() is already called. This allows fast exits for other
+    # validation errors without paying the import penalty.
 
     _create_writer_guard_or_exit(args)
-
-    # Honor --offline explicitly
-    if args.offline:
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
     if args.hnsw_recall == "high" and args.papers_index == "hnsw":
         args.hnsw_m = max(args.hnsw_m, 48)
@@ -5426,11 +2192,16 @@ def main():
         args.efsearch = max(args.efsearch, 256)
 
     if args.reconcile_only:
-        conn = _connect_db()
+        _require_faiss("reconcile-only mode")
+        d = deps()  # ensures loaded + returns namespace (consistent pattern)
+        # Lazy import for reconcile-only path
+        from litkit.index import faiss_load, faiss_save_force
+        
+        conn = d.db_connect_db(DB_PATH)
         try:
             try:
-                paper_index = _faiss_load(PAPER_INDEX_PATH)
-                chunk_index = _faiss_load(CHUNK_INDEX_PATH)
+                paper_index = faiss_load(PAPER_INDEX_PATH)
+                chunk_index = faiss_load(CHUNK_INDEX_PATH)
             except FileNotFoundError:
                 sys.stderr.write(
                     "[reconcile] FAISS index files not found; run a build first (e.g., --faiss-writer --build-only)\n"
@@ -5440,8 +2211,8 @@ def main():
             if p_reset or c_reset:
                 _eprint(f"[reconcile] reset flags — papers={p_reset} chunks={c_reset}")
             # backfill (uses current embedders)
-            paper_embedder, _ = make_paper_embedder()
-            chunk_embedder, _ = make_chunk_embedder(
+            paper_embedder, _ = d.make_paper_embedder()
+            chunk_embedder, _ = d.make_chunk_embedder(
                 devices=args.embed_devices,
                 workers=args.embed_workers,
                 force_devices=args.force_embed_devices,
@@ -5456,24 +2227,24 @@ def main():
                 chunk_bs=args.chunk_embed_bs,
             )
             with FileLock(FAISS_LOCK):
-                _faiss_save_force(paper_index, PAPER_INDEX_PATH)
-                _faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
+                faiss_save_force(paper_index, PAPER_INDEX_PATH)
+                faiss_save_force(chunk_index, CHUNK_INDEX_PATH)
         finally:
             conn.close()
         return
 
     if args.embed_producer:
+        d = deps()  # <-- ensures heavy deps are loaded before accessing writers
         outdir = args.embed_outdir or EMBED_SEGMENTS_DIR
-        # producer_id = f"{socket.gethostname()}-{os.getpid()}"
 
-        paper_seg_writer = _SegmentWriter(
+        paper_seg_writer = d.SegmentWriter(
             outdir=outdir,
             segment_size=DEFAULT_EMBED_SEGMENT_SIZE,
             dtype=DEFAULT_EMBED_SEGMENT_DTYPE,
             shard_id=args.shard_id,
             kind="papers",
         )
-        chunk_seg_writer = _ChunkSegmentWriter(
+        chunk_seg_writer = d.ChunkSegmentWriter(
             outdir=outdir,
             segment_size=DEFAULT_EMBED_SEGMENT_SIZE,
             dtype=DEFAULT_EMBED_SEGMENT_DTYPE,
@@ -5486,7 +2257,7 @@ def main():
         os.environ["LITKIT_ASSUME_YES"] = "1"
     build_or_update_indices(args)
     # True "build-only": stop after indexing even if a question was provided
-    if args.build_only:
+    if args.build_only or args.init_indices_only:
         return
 
     # Resolve question (positional arg or --question-file)
@@ -5499,6 +2270,7 @@ def main():
         return
 
     # -------- Retrieval pipeline --------
+    _require_faiss("retrieval")
     # Stage 1: shortlist candidate papers (HNSW on SPECTER2)
     k_papers = args.top_papers if args.top_papers is not None else _auto_top_papers()
     papers = shortlist_papers(
@@ -5533,7 +2305,8 @@ def main():
         )
         return
 
-    conn = _connect_db()
+    d = deps()  # ensures loaded + returns namespace (consistent pattern)
+    conn = d.db_connect_db(DB_PATH)
     try:
         chunks = get_chunks(conn, chunk_ids)
     finally:
@@ -5541,59 +2314,96 @@ def main():
 
     # If the user asked for retrieval only, print the context and exit
     if args.no_llm:
-        ctx_text, used_idx = pack_context(chunks, question, args.llm_model)
+        from litkit.llm import pack_context as llm_pack_context, LLMConfig
+        llm_cfg = LLMConfig.from_env_and_args(
+            model=args.llm_model,
+            base_url=args.openai_base_url,
+            api_key=args.openai_api_key,
+        )
+        ctx_text, used_idx, token_meta = llm_pack_context(
+            chunks, question, llm_cfg, max_out_tokens=args.max_out_tokens
+        )
         print("CONTEXT")
         print("=" * 80)
         print(ctx_text)
         print("=" * 80)
+        if not args.quiet:
+            _eprint(
+                f"[context] packed ~{token_meta['approx_tokens']} tokens "
+                f"(budget={token_meta['budget']}, "
+                f"input_budget={token_meta['input_budget']})"
+            )
         _eprint(f"[info] used {len(used_idx)} chunks; meta={meta}")
         return
 
-    # Fail fast for o-series when no API key is available (unless retrieval-only)
-    # Only enforce this when targeting OpenAI cloud; local/on-prem endpoints may not need auth.
+    # Fail fast for o-series when no API key available (unless retrieval-only)
+    # Only enforce on OpenAI cloud; local endpoints may not need auth.
     base_url = args.openai_base_url or _default_base_url_for(args.llm_model)
-    api_key  = args.openai_api_key if args.openai_api_key is not None else _default_api_key_for(args.llm_model)
-    if args.llm_model.lower().startswith("o3") and _is_openai_cloud(base_url) and not api_key:
+    api_key = (
+        args.openai_api_key
+        if args.openai_api_key is not None
+        else _default_api_key_for(args.llm_model)
+    )
+    if (
+        args.llm_model.lower().startswith("o3")
+        and _is_openai_cloud(base_url)
+        and not api_key
+    ):
         raise SystemExit(
             "[llm] o-series on OpenAI cloud requires an API key. "
             "Either pass --openai-api-key, set OPENAI_API_KEY, "
             "or point --openai-base-url at your on-prem endpoint."
         )
 
-    # -------- LLM call (strict RAG prompt) --------
-    # (re-use the resolved base_url/api_key for the call below)
-    # base_url = args.openai_base_url or _default_base_url_for(args.llm_model)
-    # api_key = args.openai_api_key or _default_api_key_for(args.llm_model)
+    # -------- LLM call (using litkit.llm module) --------
+    from litkit.llm import LLMConfig, answer_question, LLMError
+    from litkit.formatting import normalize_citations
 
-    ctx_text, used_idx = pack_context(chunks, question, args.llm_model)
-    selected_chunks = [chunks[i - 1] for i in used_idx]  # 0-based indexing
+    llm_cfg = LLMConfig.from_env_and_args(
+        model=args.llm_model,
+        base_url=base_url,
+        api_key=api_key,
+    )
+
     try:
-        answer = answer_with_llm(
+        # answer_question returns (answer_text, final_chunks_sent, token_meta)
+        # to avoid citation desync when overflow retry trims chunks internally
+        answer, final_chunks, token_meta = answer_question(
             question=question,
-            chunks=selected_chunks,  # pass only packed subset
-            model=args.llm_model,
-            base_url=base_url,
-            api_key=api_key,
+            ranked_chunks=chunks,
+            config=llm_cfg,
             max_out_tokens=args.max_out_tokens,
-            sys_prompt=SYS_PROMPT,
         )
-    except Exception as e:
+        if not args.quiet:
+            _eprint(
+                f"[context] packed ~{token_meta['approx_tokens']} tokens "
+                f"(budget={token_meta['budget']}, "
+                f"input_budget={token_meta['input_budget']})"
+            )
+    except LLMError as e:
         sys.stderr.write(str(e).rstrip() + "\n")
         # Fall back to printing context to unblock usage
         _eprint("\n[llm] Falling back to retrieval-only output.\n")
         answer = ""
+        final_chunks = chunks  # fallback uses all chunks
 
     if answer:
         # Normalize oddball citation shapes the model may emit
-        answer = _strip_citation_linelocs(answer)
-        # Collapse chunk-level citations to doc-level and render a clean bibliography
-        answer, doc_refs = normalize_answer_and_build_refs(answer, selected_chunks)
+        answer = normalize_citations(answer)
+        # Collapse chunk-level citations to doc-level and render bibliography
+        # CRITICAL: Use final_chunks (what was actually sent after any overflow
+        # trimming), not chunks, to avoid citation/bibliography desync bugs.
+        answer, doc_refs = d.normalize_answer_and_build_refs(answer, final_chunks)
         print(answer)
         print()
-        print(render_references(doc_refs))
+        print(d.render_references(doc_refs))
         print()
     else:
         # No model output -> print the context
+        from litkit.llm import pack_context as llm_pack_context
+        ctx_text, used_idx, _ = llm_pack_context(
+            chunks, question, llm_cfg, max_out_tokens=args.max_out_tokens
+        )
         print("CONTEXT")
         print("=" * 80)
         print(ctx_text)

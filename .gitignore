@@ -3,6 +3,7 @@ __pycache__/
 .DS_Store
 dist/
 build/
+!src/litkit/build/
 *.egg-info/
 .venv/
 .pytest_cache/
@@ -31,6 +32,7 @@ workspace/sqlite/
 workspace/hf_cache/
 workspace/pmcoa_links/
 workspace/.ch-mnt/
+workspace/tar_files/
 
 # SLURM logs (all patterns)
 litkit-build.*.out
@@ -41,4 +43,4 @@ litkit_multi_*.err
 *.err
 
 # Generated documentation
-*.pdf
+#*.pdf

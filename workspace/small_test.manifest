@@ -1,9 +1,11 @@
-# PMC-OA Manifest for 4-Node Scale Test
-# Estimated: 10,000-15,000 papers, ~15-20 minutes processing time
-# Mix of commercial, non-commercial, and other types for diversity
+# Manifest (selected tar files in PMC-OA) 
+# filesizes:
+# 12M
+# 125M
+# 187M
+# 435M
 
-/path/to/PMC-OA/oa_comm_xml.PMC000xxxxxx.baseline.2025-06-26.tar.gz
-/path/to/PMC-OA/oa_comm_xml.PMC001xxxxxx.baseline.2025-06-26.tar.gz
-/path/to/PMC-OA/oa_noncomm_xml.PMC000xxxxxx.baseline.2025-06-26.tar.gz
-/path/to/PMC-OA/oa_noncomm_xml.PMC001xxxxxx.baseline.2025-06-26.tar.gz
-/path/to/PMC-OA/oa_other_xml.PMC000xxxxxx.baseline.2025-06-26.tar.gz
+/path/to/PMC-OA/oa_noncomm_xml.PMC000xxxxxx.baseline.2025-06-26.tar
+/path/to/PMC-OA/oa_noncomm_xml.PMC001xxxxxx.baseline.2025-06-26.tar
+/path/to/PMC-OA/oa_comm_xml.PMC000xxxxxx.baseline.2025-06-26.tar
+/path/to/PMC-OA/oa_other_xml.PMC000xxxxxx.baseline.2025-06-26.tar

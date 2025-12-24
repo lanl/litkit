@@ -1,0 +1,58 @@
+# LitKit Mac Development Cheatsheet
+# ==================================
+
+# --- ONE-TIME SETUP ---
+
+# Create virtual environment
+uv venv --python 3.12 ~/.venvs/litkit_dev
+source ~/.venvs/litkit_dev/bin/activate
+
+# Install PyTorch first (MPS support + security fixes)
+uv pip install "torch>=2.6"
+
+# Install dependencies (order matters for faiss compatibility)
+uv pip install "numpy<2"
+uv pip install "faiss-cpu>=1.8,<1.9"
+uv pip install "lxml>=5.2,<6" "safetensors>=0.4,<1" "sentence-transformers>=3.1,<4"
+uv pip install "transformers>=4.44,<5" "openai>=1,<2" "sympy==1.13.1"
+
+# Install litkit (editable, skip deps to avoid torch downgrade)
+cd ~/Code/litkit
+uv pip install -e . --no-deps
+
+
+# --- DAILY WORKFLOW ---
+
+source ~/.venvs/litkit_dev/bin/activate
+cd ~/Code/litkit
+
+# After code changes, reinstall
+uv pip install -e . --no-deps
+
+# Run test build (requires --clean if data exists)
+./test_build.sh --clean
+
+# With full log output
+./test_build.sh --clean --verbose
+
+# Submit a prompt to the local LM Studio endpoint
+litkit @workspace/question.txt --llm-model openai/gpt-oss-20b --openai-base-url http://localhost:1234/v1
+
+
+# --- VERIFY INSTALLATION ---
+
+# Test FAISS
+python -c "import faiss; print(f'FAISS OK')"
+
+# Test MPS
+python -c "import torch; print(f'MPS: {torch.backends.mps.is_available()}')"
+
+# Test litkit device detection
+python -c "from litkit.embeddings.devices import detect_device; print(detect_device())"
+
+
+# --- TROUBLESHOOTING ---
+
+# FAISS segfaults → reinstall in fresh env with uv
+# torch downgraded → uv pip install "torch>=2.6" --force-reinstall
+# FAISS hangs → test_build.sh sets FAISS_NUM_THREADS=1 automatically

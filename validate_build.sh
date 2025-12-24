@@ -2,13 +2,18 @@
 # validate_build.sh - Validate litkit vector store build results
 #
 # Usage:
-#   ./validate_build.sh                     # Uses default workspace path
-#   ./validate_build.sh /path/to/workspace  # Use custom workspace path
+#   ./validate_build.sh                         # Uses default workspace path
+#   ./validate_build.sh /path/to/workspace      # Use custom workspace path
 #
 # Run this after a multi-node build completes to verify:
 #   1. All segment files were consumed
 #   2. FAISS indices exist with non-trivial size
 #   3. SQLite database has all papers/chunks indexed
+#
+# Exit codes:
+#   0 - All checks passed
+#   1 - Validation errors detected
+#   2 - Usage error or missing prerequisites
 #
 # Note: Duplicate detection for chunks
 #   When the same paper appears in multiple tar files (e.g., cross-referenced),
@@ -18,8 +23,34 @@
 
 set -euo pipefail
 
-# Default workspace path (HPC)
-WORKSPACE="${1:-/path/to/litkit/workspace}"
+# --- Parse arguments ---
+WORKSPACE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h)
+            echo "Usage: ./validate_build.sh [workspace_path]"
+            echo ""
+            echo "Validates a litkit vector store build."
+            echo ""
+            echo "Arguments:"
+            echo "  workspace_path    Path to workspace (default: /path/to/litkit/workspace)"
+            echo ""
+            echo "Checks performed:"
+            echo "  1. Segment files consumed (emb_segments/ empty)"
+            echo "  2. FAISS indices exist and have reasonable size"
+            echo "  3. SQLite papers and chunks fully indexed"
+            exit 0
+            ;;
+        *)
+            WORKSPACE="$1"
+            shift
+            ;;
+    esac
+done
+
+# Default workspace path for cluster
+WORKSPACE="${WORKSPACE:-/path/to/litkit/workspace}"
 
 echo "========================================"
 echo "LitKit Build Validation"
@@ -28,6 +59,7 @@ echo "Workspace: $WORKSPACE"
 echo ""
 
 ERRORS=0
+WARNINGS=0
 
 # --- Check 1: Segment directory should be empty ---
 echo "=== Check 1: Segment Files ==="
@@ -35,8 +67,9 @@ EMB_DIR="${WORKSPACE}/emb_segments"
 
 if [[ ! -d "$EMB_DIR" ]]; then
     echo "  ⚠️  Segment directory not found: $EMB_DIR"
+    echo "     (This is OK for single-node builds)"
 else
-    SEGMENT_COUNT=$(find "$EMB_DIR" -name "*.npz" -type f 2>/dev/null | wc -l)
+    SEGMENT_COUNT=$(find "$EMB_DIR" -name "*.npz" -type f 2>/dev/null | wc -l | tr -d ' ')
     if [[ "$SEGMENT_COUNT" -eq 0 ]]; then
         echo "  ✅ All segments consumed (directory empty)"
     else
@@ -52,6 +85,16 @@ echo ""
 echo "=== Check 2: FAISS Indices ==="
 INDICES_DIR="${WORKSPACE}/indices"
 
+get_file_size_bytes() {
+    local file="$1"
+    if [[ -f "$file" ]]; then
+        # Try stat -f%z (macOS) then stat -c%s (Linux)
+        stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null || echo 0
+    else
+        echo 0
+    fi
+}
+
 if [[ ! -d "$INDICES_DIR" ]]; then
     echo "  ❌ Indices directory not found: $INDICES_DIR"
     ERRORS=$((ERRORS + 1))
@@ -60,11 +103,12 @@ else
     PAPERS_INDEX="${INDICES_DIR}/papers.faiss"
     if [[ -f "$PAPERS_INDEX" ]]; then
         SIZE=$(ls -lh "$PAPERS_INDEX" | awk '{print $5}')
-        BYTES=$(stat -f%z "$PAPERS_INDEX" 2>/dev/null || stat -c%s "$PAPERS_INDEX" 2>/dev/null || echo 0)
+        BYTES=$(get_file_size_bytes "$PAPERS_INDEX")
         if [[ "$BYTES" -gt 1000 ]]; then
-            echo "  ✅ papers.faiss exists ($SIZE)"
+            echo "  ✅ papers.faiss exists ($SIZE, $BYTES bytes)"
         else
             echo "  ⚠️  papers.faiss exists but is very small ($SIZE)"
+            WARNINGS=$((WARNINGS + 1))
         fi
     else
         echo "  ❌ papers.faiss not found"
@@ -75,11 +119,12 @@ else
     CHUNKS_INDEX="${INDICES_DIR}/chunks.faiss"
     if [[ -f "$CHUNKS_INDEX" ]]; then
         SIZE=$(ls -lh "$CHUNKS_INDEX" | awk '{print $5}')
-        BYTES=$(stat -f%z "$CHUNKS_INDEX" 2>/dev/null || stat -c%s "$CHUNKS_INDEX" 2>/dev/null || echo 0)
+        BYTES=$(get_file_size_bytes "$CHUNKS_INDEX")
         if [[ "$BYTES" -gt 1000 ]]; then
-            echo "  ✅ chunks.faiss exists ($SIZE)"
+            echo "  ✅ chunks.faiss exists ($SIZE, $BYTES bytes)"
         else
             echo "  ⚠️  chunks.faiss exists but is very small ($SIZE)"
+            WARNINGS=$((WARNINGS + 1))
         fi
     else
         echo "  ❌ chunks.faiss not found"
@@ -123,6 +168,7 @@ else
         echo "  ✅ All papers indexed"
     elif [[ "$PAPER_TOTAL" -eq 0 ]]; then
         echo "  ⚠️  No papers in database"
+        WARNINGS=$((WARNINGS + 1))
     else
         UNINDEXED=$((PAPER_TOTAL - PAPER_INDEXED))
         echo "  ❌ $UNINDEXED papers not indexed"
@@ -137,6 +183,7 @@ else
         fi
     elif [[ "$CHUNK_TOTAL" -eq 0 ]]; then
         echo "  ⚠️  No chunks in database"
+        WARNINGS=$((WARNINGS + 1))
     else
         # Some chunks are not indexed - check if it's just duplicates or a real problem
         UNINDEXED_UNIQUE=$((CHUNK_UNIQUE - CHUNK_INDEXED))
@@ -152,17 +199,54 @@ else
             ERRORS=$((ERRORS + 1))
         fi
     fi
+    
+    # --- Check 4: Minimum expected counts (for regression detection) ---
+    echo ""
+    echo "=== Check 4: Regression Baseline ==="
+    
+    # These are minimum expected counts; adjust based on your corpus
+    MIN_PAPERS=1
+    MIN_CHUNKS=1
+    
+    if [[ "$PAPER_TOTAL" -ge "$MIN_PAPERS" ]]; then
+        echo "  ✅ Paper count ($PAPER_TOTAL) meets minimum ($MIN_PAPERS)"
+    else
+        echo "  ❌ Paper count ($PAPER_TOTAL) below minimum ($MIN_PAPERS) - possible regression"
+        ERRORS=$((ERRORS + 1))
+    fi
+    
+    if [[ "$CHUNK_UNIQUE" -ge "$MIN_CHUNKS" ]]; then
+        echo "  ✅ Chunk count ($CHUNK_UNIQUE unique) meets minimum ($MIN_CHUNKS)"
+    else
+        echo "  ❌ Chunk count ($CHUNK_UNIQUE unique) below minimum ($MIN_CHUNKS) - possible regression"
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+echo ""
+
+# --- Check 5: CLI is importable (syntax check) ---
+echo "=== Check 5: CLI Import Test ==="
+if python -c "from litkit import cli" 2>/dev/null; then
+    echo "  ✅ litkit.cli imports successfully"
+else
+    echo "  ❌ litkit.cli failed to import"
+    echo "     This likely indicates a syntax error or missing dependency"
+    ERRORS=$((ERRORS + 1))
 fi
 echo ""
 
 # --- Summary ---
 echo "========================================"
 if [[ "$ERRORS" -eq 0 ]]; then
-    echo "✅ BUILD VALIDATION PASSED"
+    if [[ "$WARNINGS" -gt 0 ]]; then
+        echo "✅ BUILD VALIDATION PASSED ($WARNINGS warnings)"
+    else
+        echo "✅ BUILD VALIDATION PASSED"
+    fi
     echo "========================================"
     exit 0
 else
-    echo "❌ BUILD VALIDATION FAILED ($ERRORS errors)"
+    echo "❌ BUILD VALIDATION FAILED ($ERRORS errors, $WARNINGS warnings)"
     echo "========================================"
     exit 1
 fi

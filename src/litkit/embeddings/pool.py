@@ -54,6 +54,7 @@ class EmbeddingPool:
         self.workers: list[mp.Process] = []
         self._closed = False
         self._prev_signals: tuple | None = None
+        self._devices_used: dict[str, int] = {}  # Track actual device utilization
 
         for rank, dev in enumerate(self.devices):
             p = self.ctx.Process(
@@ -82,6 +83,7 @@ class EmbeddingPool:
         from sentence_transformers import SentenceTransformer
 
         model = SentenceTransformer(model_path, device=device)
+        
         while True:
             task = q_in.get()
             if task is None:
@@ -95,9 +97,11 @@ class EmbeddingPool:
                     convert_to_numpy=True,
                     normalize_embeddings=True,
                 ).astype("float32")
-                q_out.put((task_id, arr))
+                
+                # Return device info for utilization tracking (silent)
+                q_out.put((task_id, arr, device))
             except Exception as e:
-                q_out.put((task_id, e))
+                q_out.put((task_id, e, device))
 
         # best-effort cleanup
         try:
@@ -134,9 +138,18 @@ class EmbeddingPool:
             submitted.append(worker_id)
 
         results: dict[int, np.ndarray | Exception] = {}
+        devices_used: dict[str, int] = {}  # Track device utilization
+        
         for _ in submitted:
-            tid, payload = self.q_out.get()
+            tid, payload, device = self.q_out.get()
             results[tid] = payload
+            # Track which devices actually processed batches
+            if not isinstance(payload, Exception):
+                devices_used[device] = devices_used.get(device, 0) + 1
+
+        # Update instance-level utilization tracking
+        for dev, count in devices_used.items():
+            self._devices_used[dev] = self._devices_used.get(dev, 0) + count
 
         # propagate first error (after draining)
         for tid in submitted:
