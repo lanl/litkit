@@ -1,6 +1,7 @@
 # Litkit Multi-Node Build Performance Optimization
 
 **Date:** 2025-12-24 (Updated)  
+**Version:** 0.3.35  
 **Cluster:** HPC (gpu-v100 partition, V100 nodes for testing)  
 **Production Target:** H100 nodes with 4 GPUs each  
 
@@ -15,7 +16,9 @@
 | Phase 2: Instrumentation | ✅ COMPLETE | Instantaneous rate + per-cycle timing added |
 | Phase 3: Output Staging | ✅ COMPLETE | Stage SQLite + segments to local SSD |
 | Phase 3.1: Segment Naming | ✅ FIXED | `_pending` now BEFORE `.npz` (critical bug) |
-| Phase 4: Tar Input Staging | 🔲 NEXT | Stage tar files to local SSD for 2.8× read speedup |
+| Phase 3.2: Single-Node Build | ✅ TESTED | vector_build_single.sbatch with local staging |
+| Phase 3.3: Periodic Rsync | 🔲 NEXT | Checkpoint-safe local staging for long jobs |
+| Phase 4: Tar Input Staging | 🔲 TODO | Stage tar files to local SSD for 2.8× read speedup |
 | Phase 5: Scale to Production | 🔲 TODO | 16+ producers on H100 nodes |
 
 **Commits (2025-12-23):**
@@ -34,6 +37,17 @@
 - `9572f71` - Default to 3 nodes + `USE_LOCAL_STAGING=1` in vector_build_multi
 - `6273865` - Add local staging support to vector_build_single.sbatch
 - `3b439ac` - **CRITICAL:** Fix segment file naming bug (see below)
+- `61d55b8` - Add CUDA/GPU bindings to `just ask-file` target
+- `03e56bd` - Fix vector store filenames in ask-file diagnostics
+- `c200620` - Bump version 0.3.34 → 0.3.35
+
+**Tested (2025-12-24, Job 16822876):**
+- **Single-node build** with local SSD staging: ✅ SUCCESS
+- **Corpus:** tiny_test.manifest (~40MB uncompressed)
+- **Results:** 1,015 papers, 13,724 chunks indexed
+- **Throughput:** 107.6 chunks/sec embedding (single V100)
+- **Local staging:** 444GB free on `/local/scratch`, rsync back succeeded
+- **End-to-end RAG:** `just ask-file` query with LLM response working
 
 ---
 
@@ -630,6 +644,161 @@ wait "$WATCHDOG_PID" 2>/dev/null || true
 - [ ] Track tar progress in checkpoint file for per-tar resume
 
 **Priority:** Medium. For production, use shorter manifests or accept occasional full restarts.
+
+---
+
+## Phase 3.3: Periodic Rsync (PROPOSED)
+
+### Problem
+
+Local SSD staging is **essential** for performance (47× metadata speedup), but creates a fault tolerance problem:
+
+| Scenario | Without Periodic Rsync | With Periodic Rsync |
+|----------|------------------------|---------------------|
+| Job completes | ✅ Rsync at end | ✅ Rsync at end |
+| Job times out (10hr limit) | ❌ All work lost | ✅ Lose max 30 min |
+| Producer crashes | ❌ All work lost | ✅ Lose max 30 min |
+| Restart with `--update` | ❌ Cannot resume | ✅ Resumes from last rsync |
+
+**Disabling local staging is NOT viable** - NFS metadata storm makes tar processing ~47× slower.
+
+### Solution: Background Rsync Loop
+
+Add a background process that rsyncs to NFS every N minutes during the build:
+
+```bash
+# Start background rsync loop (runs every 30 min)
+rsync_checkpoint_loop() {
+    while true; do
+        sleep 1800  # 30 minutes
+        /usr/bin/rsync -a --delay-updates "$LOCAL_STAGE_DIR/sqlite/" "$WORKSPACE/sqlite/" 2>/dev/null || true
+        /usr/bin/rsync -a --delay-updates "$LOCAL_STAGE_DIR/indices/" "$WORKSPACE/indices/" 2>/dev/null || true
+        /usr/bin/rsync -a --delay-updates "$LOCAL_STAGE_DIR/emb_segments/" "$WORKSPACE/emb_segments/" 2>/dev/null || true
+        echo "[checkpoint] rsync to NFS at $(date)"
+    done
+}
+
+rsync_checkpoint_loop &
+RSYNC_LOOP_PID=$!
+
+# Run litkit as normal...
+"${CHR[@]}" "$IMG" -- litkit "${LITKIT_ARGS[@]}"
+BUILD_RC=$?
+
+# Kill background rsync loop
+kill $RSYNC_LOOP_PID 2>/dev/null || true
+
+# Final rsync (as before)
+if [[ "$BUILD_RC" -eq 0 ]]; then
+    rsync -a --delay-updates "$LOCAL_STAGE_DIR/" "$WORKSPACE/"
+fi
+```
+
+### Why This Works
+
+1. **rsync is incremental** - After first sync, subsequent syncs only transfer changed files
+2. **SQLite/FAISS grow monotonically** - rsync handles appends efficiently
+3. **`--delay-updates`** - Atomic file replacement, safe for concurrent readers
+4. **30-min interval** - Balances checkpoint frequency vs I/O overhead
+
+### Overhead Estimate
+
+| Item | First Sync | Subsequent Syncs |
+|------|------------|------------------|
+| SQLite (~25MB) | ~1s | <1s (delta) |
+| Indices (~50MB) | ~2s | <1s (delta) |
+| Segments (~100MB) | ~3s | <1s (delta) |
+| **Total** | ~6s | ~3s |
+
+For a 10-hour job with 20 checkpoints: **~60s total overhead** (negligible vs 47× metadata storm).
+
+### Restart After Timeout
+
+```bash
+# After job timeout, NFS has data up to last checkpoint
+# Restart with --update (appends to existing index)
+REBUILD=0 sbatch vector_build_single.sbatch
+```
+
+Litkit's `--update` mode:
+1. Loads existing FAISS indices from NFS
+2. Reads checkpoint file to find last processed tar
+3. Continues from where it left off
+
+### Implementation Status
+
+- [ ] Add `RSYNC_CHECKPOINT_INTERVAL` knob (default 1800s = 30min)
+- [ ] Add rsync loop to `vector_build_single.sbatch`
+- [ ] Add rsync loop to `vector_build_multi.sbatch` (per-producer)
+- [ ] Test restart after simulated timeout
+- [ ] Document in README
+
+---
+
+## Constrained Environment Strategy
+
+### Constraints
+
+Some clusters have strict limits:
+- **Storage:** 500GB quota
+- **Job time:** 10 hours max
+- **Cannot decompress full corpus** at once
+
+### Solution: Batch Processing with Incremental Builds
+
+**Step 1: Split corpus into batches**
+```bash
+# Create batch manifests (~100GB uncompressed each)
+ls /path/to/*.tar | head -20 > batch1.manifest
+ls /path/to/*.tar | tail -n +21 | head -20 > batch2.manifest
+# etc.
+```
+
+**Step 2: Decompress-process-delete cycle**
+```bash
+# For each batch:
+# 1. Decompress this batch's tar.gz → tar (to temp storage)
+for f in $(cat batchN.manifest.gz); do gunzip -k "$f"; done
+
+# 2. Run litkit with --update (not --rebuild) to append
+sbatch --export=MANIFEST=batchN.manifest,REBUILD=0 vector_build_single.sbatch
+
+# 3. Delete decompressed tars after successful embedding
+rm /path/to/temp/*.tar
+```
+
+**Step 3: Use periodic rsync for checkpoint safety**
+
+With periodic rsync enabled:
+- Each 10-hour job can be interrupted safely
+- Restart continues from last checkpoint
+- Progress accumulates across jobs
+
+### Storage Budget
+
+| Item | Size | Notes |
+|------|------|-------|
+| Decompressed batch | ~100GB | Rotated per batch |
+| SQLite DB | ~50-100MB | Grows with corpus |
+| FAISS indices | ~100-500MB | Grows with corpus |
+| Working headroom | ~50GB | For checkpoints, temp files |
+| **Total** | ~250GB | Well under 500GB limit |
+
+### Time Budget
+
+| Operation | Time | Notes |
+|-----------|------|-------|
+| Decompress batch | ~30 min | One-time per batch |
+| Process batch (8 GPUs) | ~2-3 hours | With local staging |
+| Checkpoint rsync | ~3s | Every 30 min |
+| **Total per batch** | ~3 hours | Fits 10hr limit easily |
+
+### Full Corpus Estimate
+
+- 160GB compressed → ~500-800GB uncompressed
+- Split into 5-8 batches
+- Each batch: ~3 hours
+- **Total: ~15-24 hours** across 3-4 job submissions
 
 ---
 
