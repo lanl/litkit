@@ -376,25 +376,26 @@ sleep 5
 NUM_PRODUCERS=$((SLURM_NNODES - 1))
 echo "Starting $NUM_PRODUCERS producers on nodes: ${NODELIST[@]:0:$NUM_PRODUCERS}"
 
-# Capture producer PIDs for failure tracking
+# ═══════════════════════════════════════════════════════════════════════════════
+# START PRODUCERS (background, track PIDs and roles)
+# ═══════════════════════════════════════════════════════════════════════════════
 PRODUCER_PIDS=()
-for ((i=0; i<NUM_PRODUCERS; i++))
-do
-    run_producer $i "${NODELIST[$i]}" &
-    PRODUCER_PIDS+=($!)
-    echo "[main] Producer $i started with PID ${PRODUCER_PIDS[$i]}"
+declare -A PID_ROLE   # associative array: PID_ROLE[pid]="producer:N" or "consumer"
+
+for ((i=0; i<NUM_PRODUCERS; i++)); do
+    run_producer "$i" "${NODELIST[$i]}" &
+    pid=$!
+    PRODUCER_PIDS+=("$pid")
+    PID_ROLE[$pid]="producer:$i"
+    echo "[main] Producer $i started (PID $pid)"
 done
 
 # Wait a bit for producers to start
 sleep 10
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CONSUMER: Run in background so main shell can wait on producers
+# START CONSUMER (background, track PID and role)
 # ═══════════════════════════════════════════════════════════════════════════════
-# Main shell owns producer PIDs, so it can correctly wait on them.
-# If any producer fails, we kill the consumer and cancel the job.
-# This avoids the bash subshell wait limitation that broke the old watchdog.
-
 # Run consumer on the last node (already set above in bootstrap)
 # NOTE: Producers rsync to FLAT directories (filenames are shard-unique):
 #   sqlite/litkit_shard_XX.sqlite3
@@ -403,7 +404,7 @@ sleep 10
 echo "Starting consumer on node: $CONSUMER_NODE (background)"
 # --exclusive: prevent step resource overlap (serial step, safe)
 # NOTE: GPUs inherited from job-level allocation (no step-level --gres to avoid conflicts)
-# NOTE: Consumer runs in background so main shell can wait on producers first
+# NOTE: Consumer runs in background; unified monitor handles all children
 srun -N1 -n1 -w "$CONSUMER_NODE" \
     --cpus-per-task="$SLURM_CPUS_PER_TASK" \
     --cpu-bind=cores \
@@ -448,46 +449,74 @@ srun -N1 -n1 -w "$CONSUMER_NODE" \
             --num-shards '"$((SLURM_NNODES - 1))"'
     ' &
 CONSUMER_PID=$!
-echo "[main] Consumer started with PID $CONSUMER_PID"
+PID_ROLE[$CONSUMER_PID]="consumer"
+echo "[main] Consumer started (PID $CONSUMER_PID)"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN SHELL WAITS ON PRODUCERS (correct bash wait semantics)
+# UNIFIED MONITOR: Abort on first failure from ANY child (producer OR consumer)
 # ═══════════════════════════════════════════════════════════════════════════════
-# The main shell owns the producer PIDs, so `wait` works correctly here.
-# If any producer fails, we kill the consumer and cancel the job immediately.
-# This achieves the "early abort" behavior without the subshell wait bug.
-echo "Waiting for all producers to complete..."
-FAILED_PRODUCERS=()
-for ((i=0; i<NUM_PRODUCERS; i++))
-do
-    pid=${PRODUCER_PIDS[$i]}
-    if wait $pid; then
-        echo "[main] Producer $i (PID $pid) completed successfully"
+# Using wait -n to wait for whichever child finishes first. This provides
+# symmetric early abort: if consumer dies early, we stop producers too.
+# Main shell owns all PIDs, so wait returns correct exit codes.
+
+ALL_PIDS=("${PRODUCER_PIDS[@]}" "$CONSUMER_PID")
+remaining=${#ALL_PIDS[@]}
+
+abort_all() {
+    local why="$1"
+    echo "[main] FATAL: $why" >&2
+    # Best-effort kill local children
+    for p in "${ALL_PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+    # Hard stop the allocation/steps
+    scancel "$SLURM_JOB_ID" 2>/dev/null || true
+}
+
+# Ensure cleanup on any exit path
+trap 'abort_all "job exiting (trap)"' EXIT
+
+echo "[main] Monitoring $remaining processes (${NUM_PRODUCERS} producers + 1 consumer)..."
+
+while (( remaining > 0 )); do
+    # Wait for ANY child to finish. Bash returns that child's exit status.
+    if wait -n; then
+        rc=0
     else
         rc=$?
-        echo "[main] ERROR: Producer $i (PID $pid) failed with exit code $rc" >&2
-        FAILED_PRODUCERS+=($i)
-        # Early abort: kill consumer and cancel job on first producer failure
-        echo "[main] FATAL: Producer $i failed; killing consumer and cancelling job" >&2
-        kill "$CONSUMER_PID" 2>/dev/null || true
-        scancel "${SLURM_JOB_ID}" 2>/dev/null || true
-        exit "$rc"
     fi
+
+    # Identify which PID finished (wait -n doesn't tell us which one)
+    for p in "${ALL_PIDS[@]}"; do
+        # kill -0 fails if process is gone
+        if ! kill -0 "$p" 2>/dev/null; then
+            # Reap to get its real rc (may already be reaped, ignore errors)
+            if wait "$p" 2>/dev/null; then
+                prc=0
+            else
+                prc=$?
+            fi
+            role="${PID_ROLE[$p]}"
+            echo "[main] $role finished (PID $p) rc=$prc"
+
+            # Remove PID from ALL_PIDS
+            new=()
+            for q in "${ALL_PIDS[@]}"; do [[ "$q" != "$p" ]] && new+=("$q"); done
+            ALL_PIDS=("${new[@]}")
+            remaining=${#ALL_PIDS[@]}
+
+            # Failure? abort immediately.
+            if (( prc != 0 )); then
+                abort_all "$role failed with rc=$prc"
+                exit "$prc"
+            fi
+
+            break
+        fi
+    done
 done
 
-echo "[main] All $NUM_PRODUCERS producers completed successfully"
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# WAIT FOR CONSUMER (producers succeeded)
-# ═══════════════════════════════════════════════════════════════════════════════
-echo "[main] Waiting for consumer to complete..."
-if wait "$CONSUMER_PID"; then
-    echo "[main] Consumer completed successfully"
-else
-    CONSUMER_RC=$?
-    echo "[main] FATAL: Consumer failed with exit code $CONSUMER_RC" >&2
-    exit "$CONSUMER_RC"
-fi
+# Success: all children completed with rc=0
+trap - EXIT
+echo "[main] SUCCESS: all $NUM_PRODUCERS producers + consumer completed"
 
 echo "=== Multi-Node Litkit Build Complete ==="
 echo "Check workspace: $LITKIT_WORKSPACE"
