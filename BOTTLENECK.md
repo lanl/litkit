@@ -587,6 +587,52 @@ wait "$WATCHDOG_PID" 2>/dev/null || true
 
 ---
 
+## Known Issues / Future Work
+
+### Partial Failure Recovery (NOT SUPPORTED)
+
+**Problem:** If a job is cancelled or a producer fails mid-run, work is lost and cannot be resumed.
+
+**What happens on cancel/failure:**
+1. Producers write to local SSD (`/local/scratch/litkit_JOBID_shardX/`)
+2. Rsync to NFS happens ONLY on successful producer completion
+3. If producer crashes/cancelled → local staging is deleted → work lost
+
+**Current state after a partial failure:**
+| Component | Status |
+|-----------|--------|
+| Completed producers | ✅ Segments on NFS |
+| Failed/cancelled producers | ❌ Work lost (local staging deleted) |
+| Consumer | ❌ Never ran or incomplete |
+| FAISS indices | ❌ Empty (bootstrap only) |
+
+**Workarounds:**
+
+1. **Clean restart** (simplest)
+   ```bash
+   rm -rf workspace/emb_segments/* workspace/indices/* workspace/sqlite/*
+   sbatch vector_build_multi.sbatch
+   ```
+
+2. **Consumer-only** (partial data)
+   ```bash
+   sbatch vector_resume_consumer.sbatch
+   ```
+   Ingests whatever segments are on NFS. Only gives data from completed producers.
+
+3. **Re-run single producer** (complex)
+   Not currently supported. Would require manual shard configuration.
+
+**Future fix ideas:**
+- [ ] Periodic rsync (every N cycles) - trades off I/O for fault tolerance
+- [ ] Checkpoint to NFS before local staging (startup overhead)
+- [ ] SLURM `--signal=TERM@300` to trigger cleanup rsync on timeout
+- [ ] Track tar progress in checkpoint file for per-tar resume
+
+**Priority:** Medium. For production, use shorter manifests or accept occasional full restarts.
+
+---
+
 ## References
 
 - Slurm CPU binding: https://slurm.schedmd.com/cpu_management.html
