@@ -1,6 +1,6 @@
 # Litkit Multi-Node Build Performance Optimization
 
-**Date:** 2025-12-23 (Updated)  
+**Date:** 2025-12-24 (Updated)  
 **Cluster:** HPC (gpu-v100 partition, V100 nodes for testing)  
 **Production Target:** H100 nodes with 4 GPUs each  
 
@@ -14,10 +14,11 @@
 | Phase 1: GPU Access | ✅ COMPLETE | 2× V100 per producer confirmed via nvidia-smi |
 | Phase 2: Instrumentation | ✅ COMPLETE | Instantaneous rate + per-cycle timing added |
 | Phase 3: Output Staging | ✅ COMPLETE | Stage SQLite + segments to local SSD |
+| Phase 3.1: Segment Naming | ✅ FIXED | `_pending` now BEFORE `.npz` (critical bug) |
 | Phase 4: Tar Input Staging | 🔲 NEXT | Stage tar files to local SSD for 2.8× read speedup |
 | Phase 5: Scale to Production | 🔲 TODO | 16+ producers on H100 nodes |
 
-**Commits:**
+**Commits (2025-12-23):**
 - `c959c19` - Instantaneous scan rate display
 - `a0f40b1` - Per-cycle timing instrumentation
 - `0eb8dba` - Output staging to local SSD (flat rsync to NFS)
@@ -25,6 +26,114 @@
 - `878001c` - Baseline config: `USE_LOCAL_STAGING=0`, no step-level `--gres`
 - `b77fe27` - Producer PID tracking and failure handling
 - `33360ba` - Watchdog to scancel job on early producer failure
+
+**Commits (2025-12-24):**
+- `7d64c55` - Bash 4.4 safe polling monitor (no double-wait SIGCHLD bug)
+- `9931b22` - Handle rc=127 as "already reaped" + kill process groups in abort
+- `fdc2bba` - Safe rsync version logging (quote command substitution)
+- `9572f71` - Default to 3 nodes + `USE_LOCAL_STAGING=1` in vector_build_multi
+- `6273865` - Add local staging support to vector_build_single.sbatch
+- `3b439ac` - **CRITICAL:** Fix segment file naming bug (see below)
+
+---
+
+## CRITICAL BUG FIX: Segment File Naming (3b439ac)
+
+### Problem
+
+After running Job 16822787 with local staging, FAISS indices were empty despite producers successfully generating embeddings:
+
+```
+[segment] Wrote 20031 chunk embeddings to chunk_seg_1_0_ca894822.npz.pending (pending)
+...
+[summary] papers: db=12656 in_index=0 faiss_ntotal=0
+[summary] chunks: db=339716 in_index=0 faiss_ntotal=0
+```
+
+**Evidence on disk:**
+```bash
+$ ls workspace/emb_segments/
+chunk_seg_1_0_ca894822.npz.pending.npz   # WRONG: double .npz!
+producer_1.done
+```
+
+### Root Cause
+
+`np.savez_compressed()` auto-appends `.npz` if the filename doesn't already end with it:
+
+```python
+# OLD (buggy):
+filename = f"{prefix}_{seg_id}{SEGMENT_EXTENSION}{PENDING_SUFFIX}"
+# = chunk_seg_1_0_abc.npz.pending
+# numpy sees ".pending" → adds ".npz" → "chunk_seg_1_0_abc.npz.pending.npz"
+```
+
+Then `finalize()` tried to rename `...npz.pending` (which doesn't exist) → silent failure → consumer never saw segments.
+
+### Fix
+
+Put `_pending` BEFORE `.npz`:
+
+```python
+# NEW (fixed):
+filename = f"{prefix}_{seg_id}{PENDING_SUFFIX}{SEGMENT_EXTENSION}"
+# = chunk_seg_1_0_abc_pending.npz
+# numpy sees ".npz" → leaves it alone
+```
+
+And `finalize()` now renames `*_pending.npz` → `*.npz`.
+
+### Impact
+
+- **All multi-node builds prior to 3b439ac produced empty FAISS indices**
+- Single-node builds worked (no segment protocol)
+- Fix requires container rebuild
+
+---
+
+## Bash 4.4 Polling Monitor (7d64c55)
+
+### Problem
+
+The original watchdog pattern used `wait -n` which:
+1. Relies on Bash 4.3+ (HPC has 4.4, but fragile)
+2. Can race with the main `wait` loop, causing "double-wait" SIGCHLD issues
+3. Automatically reaps processes, confusing later `wait $PID` calls
+
+### Solution: Polling Monitor
+
+```bash
+REAPED=()  # Track which PIDs have already been reaped
+
+monitor_procs() {
+    while true; do
+        for ((i=0; i<${#PRODUCER_PIDS[@]}; i++)); do
+            pid="${PRODUCER_PIDS[$i]}"
+            [[ " ${REAPED[*]} " == *" $pid "* ]] && continue  # Already handled
+            
+            if ! kill -0 "$pid" 2>/dev/null; then
+                wait "$pid" 2>/dev/null; rc=$?
+                REAPED+=("$pid")
+                
+                # rc=127 means already reaped (not an error)
+                if [[ "$rc" -ne 0 && "$rc" -ne 127 ]]; then
+                    echo "[monitor] Producer $i (PID $pid) FAILED (rc=$rc)" >&2
+                    abort_all
+                    return 1
+                fi
+            fi
+        done
+        sleep 15
+    done
+}
+```
+
+### Key Improvements
+
+1. **No `wait -n`** - Uses `kill -0` to poll, then explicit `wait $pid`
+2. **REAPED tracking** - Prevents double-wait race conditions
+3. **rc=127 handling** - Treats "already reaped" as success (Bash quirk)
+4. **Process group kills** - `abort_all` uses `kill -- -$pid` to kill entire process trees
 
 ---
 
@@ -443,13 +552,26 @@ wait "$WATCHDOG_PID" 2>/dev/null || true
 - [x] Rebuild container with instrumentation (in progress)
 - [ ] Collect timing data from test run
 
-### Phase 3 (In Progress)
+### Phase 3 (Complete - Testing)
 - [x] Implement output staging in sbatch (USE_LOCAL_STAGING=1)
 - [x] Fix producer FAISS loading bug (935ef57)
 - [x] Baseline config: USE_LOCAL_STAGING=0 (878001c)
-- [ ] Run baseline test (no staging)
-- [ ] Run staging test (USE_LOCAL_STAGING=1)
-- [ ] Compare `seg=` and `db=` timing between runs
+- [x] Add local staging to vector_build_single.sbatch (6273865)
+- [x] Test run Job 16822787 (staging working, seg=4.4s)
+- [ ] Full test with fixed segment naming
+
+### Phase 3.1: Segment Naming Bug Fix (Complete)
+- [x] Identify bug: `np.savez_compressed` appends `.npz` (3b439ac)
+- [x] Fix: `_pending` suffix now BEFORE `.npz`
+- [x] Update `finalize()` and `cleanup_orphan_pending_files()`
+- [ ] Rebuild container with fix
+- [ ] Re-run multi-node test
+
+### Bash 4.4 Compatibility (Complete)
+- [x] Replace `wait -n` watchdog with polling monitor (7d64c55)
+- [x] Add REAPED tracking to prevent double-wait
+- [x] Handle rc=127 as "already reaped" (9931b22)
+- [x] Kill process groups in abort_all (9931b22)
 
 ### Phase 4 (Deferred)
 - [ ] Implement tar input staging
