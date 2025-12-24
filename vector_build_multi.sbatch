@@ -296,8 +296,10 @@ EOF
                 if [[ "${rc}" -eq 0 ]]; then
                     echo "[Producer ${PRODUCER_NODE_ID}] [staging] Syncing local outputs -> NFS (flat)"
                     mkdir -p "${LITKIT_WORKSPACE}/sqlite" "${LITKIT_WORKSPACE}/emb_segments"
-                    rsync -a --delay-updates "${PRODUCER_LOCAL_STAGE_HOST}/sqlite/" "${LITKIT_WORKSPACE}/sqlite/"
-                    rsync -a --delay-updates "${PRODUCER_LOCAL_STAGE_HOST}/emb_segments/" "${LITKIT_WORKSPACE}/emb_segments/"
+                    # Use absolute path to rsync for deterministic behavior across nodes
+                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] rsync version: $(/usr/bin/rsync --version | head -1)"
+                    /usr/bin/rsync -a --delay-updates "${PRODUCER_LOCAL_STAGE_HOST}/sqlite/" "${LITKIT_WORKSPACE}/sqlite/"
+                    /usr/bin/rsync -a --delay-updates "${PRODUCER_LOCAL_STAGE_HOST}/emb_segments/" "${LITKIT_WORKSPACE}/emb_segments/"
                     echo "[Producer ${PRODUCER_NODE_ID}] [staging] Cleanup local staging dir"
                     rm -rf "${PRODUCER_LOCAL_STAGE_HOST}"
                 else
@@ -455,12 +457,12 @@ echo "[main] Consumer started (PID $CONSUMER_PID)"
 # ═══════════════════════════════════════════════════════════════════════════════
 # UNIFIED MONITOR: Abort on first failure from ANY child (producer OR consumer)
 # ═══════════════════════════════════════════════════════════════════════════════
-# Using wait -n to wait for whichever child finishes first. This provides
-# symmetric early abort: if consumer dies early, we stop producers too.
-# Main shell owns all PIDs, so wait returns correct exit codes.
+# Bash 4.4 safe polling monitor (no wait -n double-wait bug).
+# - Uses REAPED associative array to ensure we never wait twice on same PID
+# - Polls with kill -0 to detect exit, then single wait to collect rc
+# - Symmetric early abort: if any child fails, stop everything
 
 ALL_PIDS=("${PRODUCER_PIDS[@]}" "$CONSUMER_PID")
-remaining=${#ALL_PIDS[@]}
 
 abort_all() {
     local why="$1"
@@ -471,47 +473,48 @@ abort_all() {
     scancel "$SLURM_JOB_ID" 2>/dev/null || true
 }
 
-# Ensure cleanup on any exit path
+# Track which PIDs we have already reaped (so we never wait twice → no bogus 127)
+declare -A REAPED=()
+
+# Ensure cleanup on any exit path (cleared on success or before explicit abort)
 trap 'abort_all "job exiting (trap)"' EXIT
 
-echo "[main] Monitoring $remaining processes (${NUM_PRODUCERS} producers + 1 consumer)..."
+echo "[main] Monitoring ${#ALL_PIDS[@]} processes (${NUM_PRODUCERS} producers + 1 consumer)..."
 
-while (( remaining > 0 )); do
-    # Wait for ANY child to finish. Bash returns that child's exit status.
-    if wait -n; then
-        rc=0
-    else
-        rc=$?
-    fi
+while :; do
+    remaining=0
 
-    # Identify which PID finished (wait -n doesn't tell us which one)
     for p in "${ALL_PIDS[@]}"; do
-        # kill -0 fails if process is gone
-        if ! kill -0 "$p" 2>/dev/null; then
-            # Reap to get its real rc (may already be reaped, ignore errors)
-            if wait "$p" 2>/dev/null; then
-                prc=0
-            else
-                prc=$?
-            fi
-            role="${PID_ROLE[$p]}"
-            echo "[main] $role finished (PID $p) rc=$prc"
+        # Skip already reaped PIDs
+        [[ -n "${REAPED[$p]+x}" ]] && continue
 
-            # Remove PID from ALL_PIDS
-            new=()
-            for q in "${ALL_PIDS[@]}"; do [[ "$q" != "$p" ]] && new+=("$q"); done
-            ALL_PIDS=("${new[@]}")
-            remaining=${#ALL_PIDS[@]}
+        # Still running?
+        if kill -0 "$p" 2>/dev/null; then
+            remaining=$((remaining + 1))
+            continue
+        fi
 
-            # Failure? abort immediately.
-            if (( prc != 0 )); then
-                abort_all "$role failed with rc=$prc"
-                exit "$prc"
-            fi
+        # Exited -> reap exactly once and capture rc
+        if wait "$p"; then
+            rc=0
+        else
+            rc=$?
+        fi
+        REAPED[$p]=1
 
-            break
+        role="${PID_ROLE[$p]:-unknown}"
+        echo "[main] $role finished (PID $p) rc=$rc"
+
+        if (( rc != 0 )); then
+            # Clear trap before explicit abort to avoid double FATAL
+            trap - EXIT
+            abort_all "$role failed with rc=$rc"
+            exit "$rc"
         fi
     done
+
+    (( remaining == 0 )) && break
+    sleep 2   # Poll interval: 2s balances responsiveness vs overhead
 done
 
 # Success: all children completed with rc=0
