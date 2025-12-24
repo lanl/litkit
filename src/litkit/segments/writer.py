@@ -28,7 +28,9 @@ from litkit.segments.constants import (
 )
 
 # Suffix for pending (not-yet-finalized) segment files
-PENDING_SUFFIX = ".pending"
+# NOTE: This goes BEFORE .npz, not after, because np.savez_compressed
+# auto-appends .npz if the filename doesn't already end with it.
+PENDING_SUFFIX = "_pending"
 
 
 def _eprint(msg: str = "", *, end: str = "\n") -> None:
@@ -41,7 +43,7 @@ def _eprint(msg: str = "", *, end: str = "\n") -> None:
 
 
 def cleanup_orphan_pending_files(outdir: Path, kinds: list[str] | None = None) -> int:
-    """Remove orphan .pending files from a previous crashed run.
+    """Remove orphan _pending.npz files from a previous crashed run.
     
     Call this at producer startup to clean up incomplete segments.
     
@@ -50,7 +52,7 @@ def cleanup_orphan_pending_files(outdir: Path, kinds: list[str] | None = None) -
         kinds: List of prefixes to clean (default: ["papers", "chunks"])
     
     Returns:
-        Number of .pending files removed
+        Number of pending files removed
     """
     if kinds is None:
         kinds = [PAPER_SEGMENT_PREFIX, CHUNK_SEGMENT_PREFIX]
@@ -61,7 +63,8 @@ def cleanup_orphan_pending_files(outdir: Path, kinds: list[str] | None = None) -
     
     removed = 0
     for kind in kinds:
-        for p in outdir.glob(f"{kind}_*{SEGMENT_EXTENSION}{PENDING_SUFFIX}"):
+        # Pattern: chunk_seg_*_pending.npz (PENDING_SUFFIX before extension)
+        for p in outdir.glob(f"{kind}_*{PENDING_SUFFIX}{SEGMENT_EXTENSION}"):
             try:
                 p.unlink()
                 removed += 1
@@ -69,7 +72,7 @@ def cleanup_orphan_pending_files(outdir: Path, kinds: list[str] | None = None) -
                 pass
     
     if removed:
-        _eprint(f"[segment] Cleaned up {removed} orphan .pending files")
+        _eprint(f"[segment] Cleaned up {removed} orphan pending files")
     
     return removed
 
@@ -200,10 +203,11 @@ class SegmentWriter:
         else:
             X = X.astype("float32")
         
-        # Generate unique filename with .pending suffix
+        # Generate unique filename with _pending suffix BEFORE .npz
+        # (np.savez_compressed auto-appends .npz if not present)
         seg_id = f"{self.shard_id}_{self._segment_counter}_{uuid.uuid4().hex[:8]}"
         prefix = PAPER_SEGMENT_PREFIX if self.kind == "papers" else self.kind
-        filename = f"{prefix}_{seg_id}{SEGMENT_EXTENSION}{PENDING_SUFFIX}"
+        filename = f"{prefix}_{seg_id}{PENDING_SUFFIX}{SEGMENT_EXTENSION}"
         path = self.outdir / filename
         
         # Save to disk with fsync for durability
@@ -236,9 +240,11 @@ class SegmentWriter:
         return path
     
     def finalize(self) -> int:
-        """Atomically rename all .pending files to final .npz names.
+        """Atomically rename all _pending.npz files to final .npz names.
         
         Call this AFTER conn.commit() succeeds to make segments visible to consumers.
+        
+        Renames: paper_seg_0_0_abc_pending.npz -> paper_seg_0_0_abc.npz
         
         Returns:
             Number of segments finalized
@@ -248,9 +254,10 @@ class SegmentWriter:
             if not pending_path.exists():
                 continue
             
-            # Remove .pending suffix
+            # Remove _pending from the stem (before .npz)
+            # e.g., paper_seg_0_0_abc_pending.npz -> paper_seg_0_0_abc.npz
             final_path = pending_path.with_name(
-                pending_path.name.replace(PENDING_SUFFIX, "")
+                pending_path.name.replace(f"{PENDING_SUFFIX}{SEGMENT_EXTENSION}", SEGMENT_EXTENSION)
             )
             
             try:
@@ -429,9 +436,10 @@ class ChunkSegmentWriter:
         else:
             X = X.astype("float32")
         
-        # Generate unique filename with .pending suffix
+        # Generate unique filename with _pending suffix BEFORE .npz
+        # (np.savez_compressed auto-appends .npz if not present)
         seg_id = f"{self.shard_id}_{self._segment_counter}_{uuid.uuid4().hex[:8]}"
-        filename = f"{CHUNK_SEGMENT_PREFIX}_{seg_id}{SEGMENT_EXTENSION}{PENDING_SUFFIX}"
+        filename = f"{CHUNK_SEGMENT_PREFIX}_{seg_id}{PENDING_SUFFIX}{SEGMENT_EXTENSION}"
         path = self.outdir / filename
         
         # Save to disk with fsync for durability
@@ -466,9 +474,11 @@ class ChunkSegmentWriter:
         return path
     
     def finalize(self) -> int:
-        """Atomically rename all .pending files to final .npz names.
+        """Atomically rename all _pending.npz files to final .npz names.
         
         Call this AFTER conn.commit() succeeds to make segments visible to consumers.
+        
+        Renames: chunk_seg_0_0_abc_pending.npz -> chunk_seg_0_0_abc.npz
         
         Returns:
             Number of segments finalized
@@ -478,9 +488,10 @@ class ChunkSegmentWriter:
             if not pending_path.exists():
                 continue
             
-            # Remove .pending suffix
+            # Remove _pending from the stem (before .npz)
+            # e.g., chunk_seg_0_0_abc_pending.npz -> chunk_seg_0_0_abc.npz
             final_path = pending_path.with_name(
-                pending_path.name.replace(PENDING_SUFFIX, "")
+                pending_path.name.replace(f"{PENDING_SUFFIX}{SEGMENT_EXTENSION}", SEGMENT_EXTENSION)
             )
             
             try:
