@@ -297,7 +297,8 @@ EOF
                     echo "[Producer ${PRODUCER_NODE_ID}] [staging] Syncing local outputs -> NFS (flat)"
                     mkdir -p "${LITKIT_WORKSPACE}/sqlite" "${LITKIT_WORKSPACE}/emb_segments"
                     # Use absolute path to rsync for deterministic behavior across nodes
-                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] rsync version: $(/usr/bin/rsync --version | head -1)"
+                    rsync_ver="$(/usr/bin/rsync --version 2>/dev/null | head -1 || true)"
+                    echo "[Producer ${PRODUCER_NODE_ID}] [staging] rsync version: ${rsync_ver:-unknown}"
                     /usr/bin/rsync -a --delay-updates "${PRODUCER_LOCAL_STAGE_HOST}/sqlite/" "${LITKIT_WORKSPACE}/sqlite/"
                     /usr/bin/rsync -a --delay-updates "${PRODUCER_LOCAL_STAGE_HOST}/emb_segments/" "${LITKIT_WORKSPACE}/emb_segments/"
                     echo "[Producer ${PRODUCER_NODE_ID}] [staging] Cleanup local staging dir"
