@@ -35,7 +35,12 @@ fi
 : "${YES:=1}"                                # 1 = auto-confirm rebuild prompts
 
 # Corpus source (exactly one)
-: "${MANIFEST:=/path/to/litkit/workspace/small_test.manifest}"
+# Available manifests in workspace/:
+#   tiny_test.manifest    (~few MB, 5-10 min)  - debugging merge logic
+#   small_test.manifest   (~760 MB, 15-20 min) - quick validation  
+#   medium_test.manifest  (~7 GB, 30-45 min)   - moderate test
+#   large_test.manifest   (~185 GB, 3-5 hours) - full production
+: "${MANIFEST:=/path/to/litkit/workspace/tiny_test.manifest}"
 : "${TAR_DIR:=}"
 
 # Retrieval/ANN controls

@@ -57,10 +57,11 @@ export LOCAL_SSD="/local/scratch"
 export USE_LOCAL_STAGING="${USE_LOCAL_STAGING:-1}"  # Local SSD staging enabled by default
 
 # MANIFEST selection (edit this ONE LINE to change which manifest is used):
-#   tiny_test.manifest    (~few MB, 5-10 min) - for debugging merge logic
-#   medium_test.manifest  (~7 GB, 30-45 min)
-#   large_test.manifest   (~185 GB, 3-5 hours)
-MANIFEST_FILE="${MANIFEST:-medium_test.manifest}"
+#   tiny_test.manifest    (~few MB, 5-10 min)  - debugging merge logic
+#   small_test.manifest   (~760 MB, 15-20 min) - quick validation  
+#   medium_test.manifest  (~7 GB, 30-45 min)   - moderate test
+#   large_test.manifest   (~185 GB, 3-5 hours) - full production
+MANIFEST_FILE="${MANIFEST:-tiny_test.manifest}"
 export LITKIT_TAR_MANIFEST="${LITKIT_WORKSPACE}/${MANIFEST_FILE}"
 
 # Container and CUDA setup for V100 nodes
