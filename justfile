@@ -257,6 +257,41 @@ ask-nollm +query=default-query:
 	chmod +x "{{ workspace-host }}/.ask_nollm.sh"
 	just -f {{ justfile() }} run /workspace/.ask_nollm.sh
 
+# ======================== Query from file (with diagnostics) ========================
+# Reads question from workspace/question.txt by default
+ask-file file="question.txt":
+	#!/usr/bin/env bash
+	set -euo pipefail
+	
+	# Check for API key
+	if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+	    echo "ERROR: OPENAI_API_KEY not set"
+	    echo ""
+	    echo "To set from a key file:"
+	    echo "  export OPENAI_API_KEY=\"\$(cat ~/.llm_api_key)\""
+	    echo "  just ask-file"
+	    exit 1
+	fi
+	
+	qfile="{{ workspace-host }}/{{ file }}"
+	[ -f "$qfile" ] || { echo "ERROR: $qfile not found"; exit 1; }
+	
+	echo "=== DIAGNOSTIC INFO ==="
+	echo "Model:    {{ llm-model }}"
+	echo "          (override: LLM_MODEL=gpt-4o just ask-file)"
+	echo "Endpoint: {{ openai-base-url }}"
+	echo "          (override: OPENAI_BASE_URL=https://api.openai.com/v1 just ask-file)"
+	echo "API key:  set (${#OPENAI_API_KEY} chars)"
+	echo "          (override: OPENAI_API_KEY=\"\$(cat ~/.llm_api_key)\" just ask-file)"
+	echo "Question: $qfile"
+	echo "          (override: just ask-file file=other.txt)"
+	echo "========================"
+	echo ""
+	
+	printf 'litkit --llm-model={{ llm-model }} --question-file "/workspace/{{ file }}"\n' > "{{ workspace-host }}/.ask.sh"
+	chmod +x "{{ workspace-host }}/.ask.sh"
+	just -f {{ justfile() }} run /workspace/.ask.sh
+
 # ======================== Shell ========================
 shell:
 	just -f {{ justfile() }} run bash
