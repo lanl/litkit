@@ -49,7 +49,17 @@ LitKit uses a **two-stage retrieval** approach:
 
 ### Software
 - **Python 3.12** (exact version required)
-- **pip** or **uv** (Python package installer)
+- **uv** (Python package manager) — recommended
+
+### Install uv
+
+```bash
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Verify installation
+uv --version
+```
 
 ### Check Your Python Version
 ```bash
@@ -66,49 +76,76 @@ brew install python@3.12
 
 ## Installation
 
-You can install LitKit from either a ZIP archive or a Git clone.
-
-### Option A: Install from ZIP Archive (Recommended)
+### Option A: Install from ZIP Archive
 
 If you received LitKit as a ZIP file:
 
 ```bash
 # 1. Extract the archive
-unzip litkit-v0.3.33.zip
+unzip litkit-v0.3.35.zip
 cd litkit
 
 # 2. Create a virtual environment with Python 3.12
-python3.12 -m venv .venv
+uv venv --python 3.12
 
 # 3. Activate the virtual environment
 source .venv/bin/activate
 
-# 4. Install LitKit and dependencies
-pip install -e .
+# 4. Install PyTorch first (MPS support)
+uv pip install "torch>=2.6"
+
+# 5. Install dependencies (order matters for FAISS compatibility)
+uv pip install "numpy<2"
+uv pip install "faiss-cpu>=1.8,<1.9"
+
+# 6. Install LitKit (editable, skip deps to preserve torch version)
+uv pip install -e . --no-deps
 ```
 
-### Option B: Install from Git (If You Have Access)
+### Option B: Install from Git
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/lanl/litkit.git
+git clone https://lanl-git/hlavacek/litkit.git
 cd litkit
 
 # 2. Create a virtual environment
-python3.12 -m venv .venv
+uv venv --python 3.12
 
 # 3. Activate it
 source .venv/bin/activate
 
-# 4. Install
-pip install -e .
+# 4. Install PyTorch first (MPS support)
+uv pip install "torch>=2.6"
+
+# 5. Install dependencies (order matters for FAISS compatibility)
+uv pip install "numpy<2"
+uv pip install "faiss-cpu>=1.8,<1.9"
+
+# 6. Install LitKit (editable, skip deps to preserve torch version)
+uv pip install -e . --no-deps
 ```
+
+### Why This Install Order?
+
+- **PyTorch first**: Ensures you get a version with MPS (Metal) support and latest security fixes
+- **numpy<2**: FAISS-CPU wheels are not yet compatible with NumPy 2.x
+- **--no-deps**: Prevents uv from downgrading PyTorch when installing litkit's dependencies
 
 ### Verify Installation
 
 ```bash
 litkit --version
-# Should output: litkit 0.3.33
+# Should output: litkit 0.3.35
+
+# Verify MPS is available (Apple Silicon)
+python -c "import torch; print('MPS:', torch.backends.mps.is_available())"
+
+# Verify FAISS
+python -c "import faiss; print('FAISS OK')"
+
+# Verify device detection
+python -c "from litkit.embeddings.devices import detect_device; print('Device:', detect_device())"
 ```
 
 ---
@@ -144,19 +181,21 @@ If successful, you'll see a list of available models.
 
 ## Preparing Your Papers
 
-LitKit ingests papers from `.tar.gz` archives containing JATS/NXML XML files. If your papers were converted from PDFs using the `text-fetch` utility, they should already be in the correct format.
+LitKit ingests papers from `.tar` or `.tar.gz` archives containing JATS/NXML XML files. If your papers were converted from PDFs using the `text-fetch` utility, they should already be in the correct format.
 
 ### Expected Structure
 
 Your tar archive should contain XML files at the top level or in subdirectories:
 
 ```
-papers.tar.gz
+papers.tar
 ├── paper1.xml
 ├── paper2.xml
 ├── paper3.xml
 └── ...
 ```
+
+> **Note**: For larger builds, uncompressed `.tar` files are faster than `.tar.gz` because they allow parallel XML parsing. See the performance tips section.
 
 ### Step 1: Create the Workspace Directory
 
@@ -168,7 +207,7 @@ mkdir -p workspace/tar_shards
 ### Step 2: Copy Your Papers Archive
 
 ```bash
-cp /path/to/your/papers.tar.gz workspace/tar_shards/
+cp /path/to/your/papers.tar workspace/tar_shards/
 ```
 
 ### Step 3: Create a Manifest File
@@ -176,16 +215,16 @@ cp /path/to/your/papers.tar.gz workspace/tar_shards/
 The manifest tells LitKit which archives to process:
 
 ```bash
-echo "papers.tar.gz" > workspace/papers.manifest
+echo "papers.tar" > workspace/papers.manifest
 ```
 
 Or if you have multiple archives:
 
 ```bash
 cat > workspace/papers.manifest << 'EOF'
-papers_batch1.tar.gz
-papers_batch2.tar.gz
-papers_batch3.tar.gz
+papers_batch1.tar
+papers_batch2.tar
+papers_batch3.tar
 EOF
 ```
 
@@ -241,6 +280,18 @@ litkit --build-only \
        --chunks-index ivfpq
 ```
 
+### Using the Test Script
+
+For development and testing, use `test_build.sh`:
+
+```bash
+# Clean build with default test data
+./test_build.sh --clean
+
+# With verbose output
+./test_build.sh --clean --verbose
+```
+
 ### What Happens During Build
 
 1. **Scanning**: LitKit streams through your tar archives without extracting
@@ -253,13 +304,13 @@ litkit --build-only \
 ### Expected Output
 
 ```
-[version] litkit 0.3.33
+[version] litkit 0.3.35
 [device] using mps              # or cpu on Intel Macs
 [paths] using workspace/tar_shards as source directory for tar shards
 [paths] using /path/to/litkit/workspace as writable directory
 [build] using DB at workspace/sqlite/litkit.sqlite3
 [scan] found 1 tar shards in shard 0/1
-[progress] [scan] papers.tar.gz: 50/50  (100.0%)  12.3/s
+[progress] [scan] papers.tar: 50/50  (100.0%)  12.3/s
 [done] indexed 50 papers and 847 chunks (this run)
 ```
 
@@ -277,7 +328,7 @@ Once the index is built, you can ask questions about your papers.
 
 ```bash
 litkit "What is the main mechanism described in these papers?" \
-       --llm-model gtp-oss-120b \
+       --llm-model gpt-oss-120b \
        --openai-base-url "https://llm.example.com/v1" \
        --openai-api-key "$(cat ~/.llm_api_key)"
 ```
@@ -288,7 +339,7 @@ Retrieve more chunks for a more comprehensive answer:
 
 ```bash
 litkit "What experimental methods were used?" \
-       --llm-model gtp-oss-120b \
+       --llm-model gpt-oss-120b \
        --openai-base-url "https://llm.example.com/v1" \
        --openai-api-key "$(cat ~/.llm_api_key)" \
        --top-papers 100 \
@@ -303,7 +354,7 @@ For longer questions, save them to a file:
 echo "What are the key findings regarding the relationship between X and Y?" > question.txt
 
 litkit --question-file question.txt \
-       --llm-model gtp-oss-120b \
+       --llm-model gpt-oss-120b \
        --openai-base-url "https://llm.example.com/v1" \
        --openai-api-key "$(cat ~/.llm_api_key)"
 ```
@@ -348,6 +399,7 @@ REFERENCES
 | `--chunks-index {ivfpq,flat}` | Index type for chunks | ivfpq |
 | `--rebuild` | Wipe existing index and rebuild from scratch | - |
 | `--update` | Add new files without reprocessing existing ones | - |
+| `--parse-workers N` | Number of parallel XML parsing threads | 8 |
 
 ### Query Options
 
@@ -377,6 +429,8 @@ REFERENCES
 | `LITKIT_WORKSPACE` | Override workspace directory |
 | `HF_HOME` | HuggingFace cache location |
 | `HF_HUB_OFFLINE=1` | Force offline mode (no model downloads) |
+| `FAISS_NUM_THREADS=1` | Force single-threaded FAISS (fixes hangs) |
+| `LITKIT_DEBUG=1` | Enable verbose debug output |
 
 ---
 
@@ -415,21 +469,63 @@ curl -H "Authorization: Bearer $(cat ~/.llm_api_key)" \
 Ensure your tar file is in the correct location and has a valid extension:
 ```bash
 ls workspace/tar_shards/
-# Should show: papers.tar.gz
+# Should show: papers.tar or papers.tar.gz
 ```
 
-### Slow Embedding Performance
+### FAISS Segfaults
 
-On Apple Silicon Macs, LitKit should automatically use MPS (Metal Performance Shaders). Verify:
+FAISS can segfault if dependencies are mismatched. Reinstall in a fresh environment:
+
 ```bash
-litkit --version
-# Look for: [device] using mps
+# Remove old environment
+rm -rf .venv
+
+# Create fresh environment
+uv venv --python 3.12
+source .venv/bin/activate
+
+# Reinstall in correct order
+uv pip install "torch>=2.6"
+uv pip install "numpy<2"
+uv pip install "faiss-cpu>=1.8,<1.9"
+uv pip install -e . --no-deps
 ```
 
-If it shows `cpu`, check your PyTorch installation:
+### FAISS Hangs During Build
+
+FAISS can hang on some systems. Set single-threaded mode:
+
 ```bash
-python -c "import torch; print(torch.backends.mps.is_available())"
-# Should output: True
+export FAISS_NUM_THREADS=1
+litkit --build-only --faiss-writer ...
+```
+
+The `test_build.sh` script sets this automatically.
+
+### Verifying MPS Setup
+
+On Apple Silicon Macs, LitKit should automatically use MPS (Metal Performance Shaders):
+
+```bash
+# Check MPS availability
+python -c "import torch; print('MPS:', torch.backends.mps.is_available())"
+# Should output: MPS: True
+
+# Check device detection
+python -c "from litkit.embeddings.devices import detect_device; print('Device:', detect_device())"
+# Should output: Device: mps
+```
+
+If MPS shows False but you have Apple Silicon, reinstall PyTorch:
+```bash
+uv pip install "torch>=2.6" --force-reinstall
+```
+
+### Torch Downgraded After Install
+
+If torch gets downgraded and MPS stops working:
+```bash
+uv pip install "torch>=2.6" --force-reinstall
 ```
 
 ### Index Corruption
@@ -463,7 +559,21 @@ For fewer than ~10,000 papers, FLAT indices are simpler and often faster than HN
 --papers-index flat --chunks-index flat
 ```
 
-### 3. Save Common Options in a Script
+### 3. Use Uncompressed Tar Files for Large Builds
+
+For builds with many papers, uncompressed `.tar` files allow parallel XML parsing:
+
+```bash
+# Convert compressed to uncompressed
+gunzip -k papers.tar.gz  # Creates papers.tar, keeps original
+```
+
+Then use `--parse-workers` to control parallelism:
+```bash
+litkit --build-only --faiss-writer --parse-workers 8 ...
+```
+
+### 4. Save Common Options in a Script
 
 Create a helper script for repeated use:
 ```bash
@@ -471,7 +581,7 @@ cat > query.sh << 'EOF'
 #!/bin/bash
 source .venv/bin/activate
 litkit "$1" \
-    --llm-model gtp-oss-120b \
+    --llm-model gpt-oss-120b \
     --openai-base-url "https://llm.example.com/v1" \
     --openai-api-key "$(cat ~/.llm_api_key)"
 EOF
@@ -481,13 +591,13 @@ chmod +x query.sh
 ./query.sh "What is the main finding?"
 ```
 
-### 4. Backup Your Index
+### 5. Backup Your Index
 The built index is stored in `workspace/`. Back it up to avoid rebuilding:
 ```bash
 tar czf litkit-workspace-backup.tar.gz workspace/sqlite workspace/indices
 ```
 
-### 5. Check Retrieved Context First
+### 6. Check Retrieved Context First
 Before relying on LLM answers, use `--no-llm` to verify the right papers/chunks are being retrieved.
 
 ---
@@ -496,16 +606,18 @@ Before relying on LLM answers, use `--no-llm` to verify the right papers/chunks 
 
 ```bash
 # 1. Extract and install
-unzip litkit-v0.3.33.zip && cd litkit
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install -e .
+unzip litkit-v0.3.35.zip && cd litkit
+uv venv --python 3.12 && source .venv/bin/activate
+uv pip install "torch>=2.6"
+uv pip install "numpy<2" && uv pip install "faiss-cpu>=1.8,<1.9"
+uv pip install -e . --no-deps
 
 # 2. Setup API key
 echo "YOUR_KEY" > ~/.llm_api_key && chmod 600 ~/.llm_api_key
 
 # 3. Add your papers
 mkdir -p workspace/tar_shards
-cp /path/to/papers.tar.gz workspace/tar_shards/
+cp /path/to/papers.tar workspace/tar_shards/
 
 # 4. Build index
 litkit --build-only --faiss-writer \
@@ -514,7 +626,7 @@ litkit --build-only --faiss-writer \
 
 # 5. Query
 litkit "What is the main finding?" \
-       --llm-model gtp-oss-120b \
+       --llm-model gpt-oss-120b \
        --openai-base-url "https://llm.example.com/v1" \
        --openai-api-key "$(cat ~/.llm_api_key)"
 ```
@@ -529,4 +641,4 @@ litkit "What is the main finding?" \
 
 ---
 
-*LitKit v0.3.33 — Air-gapped RAG for Scientific Literature*
+*LitKit v0.3.35 — Air-gapped RAG for Scientific Literature*
