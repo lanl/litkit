@@ -1,33 +1,475 @@
-# LitKit: HPC Installation & Usage Guide
+# LitKit: HPC Cluster Guide
 
-A step-by-step guide for running LitKit on an HPC cluster using Charliecloud containers.
+A guide for running LitKit on HPC clusters using Charliecloud containers with GPU passthrough.
 
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [HPC Hardware](#hpc-hardware)
-3. [One-Time Setup](#one-time-setup)
-4. [Building the Container](#building-the-container)
-5. [Running Single-Node Builds](#running-single-node-builds)
-6. [Running Multi-Node Builds](#running-multi-node-builds)
-7. [Querying Your Literature](#querying-your-literature)
-8. [Monitoring GPU Usage](#monitoring-gpu-usage)
-9. [Performance Tuning](#performance-tuning)
-10. [Troubleshooting](#troubleshooting)
-11. [Command Reference](#command-reference)
+2. [Prerequisites](#prerequisites)
+3. [Understanding Multi-Node Builds](#understanding-multi-node-builds)
+4. [Why Uncompressed Tar Files?](#why-uncompressed-tar-files)
+5. [Customizing SLURM Batch Scripts](#customizing-slurm-batch-scripts)
+6. [Running Single-Node Builds](#running-single-node-builds)
+7. [Running Multi-Node Builds](#running-multi-node-builds)
+8. [Querying Your Index](#querying-your-index)
+9. [Troubleshooting](#troubleshooting)
+10. [Command Reference](#command-reference)
+11. [Appendix A: HPC Cluster Reference (Site-Specific)](#appendix-a-hpc-cluster-reference-site-specific)
 
 ---
 
 ## Overview
 
-**LitKit** runs on HPC inside a Charliecloud container with GPU passthrough via NVIDIA CDI (Container Device Interface). This guide covers:
+**LitKit** processes scientific literature corpora (JATS/NXML XML files in tar archives) into searchable vector indices for RAG (Retrieval-Augmented Generation) pipelines.
 
-- **V100 nodes** (`gpu-v100` partition): 4 nodes, 2 GPUs each, 32 CPUs per node
-- **GH200 nodes** (`gpu-gh200` partition): 2 nodes (Grace Hopper), 72 ARM cores + H100 GPU
+On HPC clusters, LitKit runs inside a Charliecloud container with GPU passthrough via NVIDIA CDI (Container Device Interface). This guide covers:
 
-Both node types are ARM64 (aarch64) and share the same container image.
+- **Single-node builds**: For small-to-medium corpora (< 50 GB)
+- **Multi-node builds**: For large corpora (50+ GB) using producer/consumer architecture
+- **Querying**: Natural language questions against your indexed literature
+
+### Architecture
+
+```
+[Tar Archives] → [LitKit Build] → [FAISS Indices + SQLite DB] → [Query]
+                      │
+         ┌───────────┴───────────┐
+    Single-node              Multi-node
+    (one process)       (producers + consumer)
+```
 
 ---
+
+## Prerequisites
+
+### Hardware Requirements
+
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| GPU | 1× CUDA-capable | 2+ GPUs per node |
+| GPU Memory | 16 GB | 32+ GB |
+| System Memory | 64 GB | 128+ GB |
+| Local SSD | 100 GB | 500+ GB (for staging) |
+
+### Software Requirements
+
+- **Charliecloud** 0.37+ with CDI support
+- **CUDA Toolkit** 12.x (for GPU library bindings)
+- **NVIDIA CDI specs** generated for your GPU nodes
+- **uv** package manager (for lockfile regeneration)
+
+### Container Image
+
+LitKit is distributed as a SquashFS container image:
+```
+litkit-v0.3.35-aarch64-lean.sqfs    # ARM64 (aarch64)
+litkit-v0.3.35-x86_64-lean.sqfs     # x86-64 (if available)
+```
+
+---
+
+## Understanding Multi-Node Builds
+
+### When to Use Multi-Node
+
+| Corpus Size | Recommended Mode |
+|-------------|------------------|
+| < 10 GB | Single-node |
+| 10-50 GB | Single-node (or 2-node) |
+| 50-200 GB | 3-4 nodes |
+| 200+ GB | 4+ nodes |
+
+### Producer/Consumer Architecture
+
+For large corpora, LitKit uses a producer/consumer model:
+
+```
+[Producer 0] ──┐
+[Producer 1] ──┼── segments/ ──► [Consumer/Writer] ──► FAISS indices
+[Producer N] ──┘
+```
+
+- **Producers** (`--embed-producer`): Scan tar files, embed text, write segment files
+- **Consumer** (`--consume-only --faiss-writer`): Ingest segments into FAISS indices
+
+> ⚠️ **CRITICAL: Node Count Must Be Consistent**
+> 
+> Once you start a multi-node build with N producer nodes, you **MUST** restart 
+> with exactly N producer nodes. Changing the node count mid-build will corrupt 
+> your vector store.
+>
+> **Why?** Each producer writes to shard-specific files:
+> - SQLite: `litkit_shard_00.sqlite3`, `litkit_shard_01.sqlite3`, ...
+> - Segments: `paper_seg_shard00_*.npz`, `chunk_seg_shard01_*.npz`, ...
+> - Checkpoints: `ckpt_shard_0.json`, `ckpt_shard_1.json`, ...
+>
+> The consumer expects exactly N shards. Adding or removing nodes breaks this mapping.
+
+### Tar Staging to Local SSD
+
+The multi-node batch script (`vector_build_multi.sbatch`) implements **local staging** to avoid NFS bottlenecks:
+
+**Problem**: Writing many small files to NFS/Lustre causes "metadata storms" that slow down all cluster users.
+
+**Solution**: Producers write to node-local SSD, then rsync to NFS at completion.
+
+```
+Producer workflow:
+1. Write segments to /local/ssd/litkit_jobid_shard0/
+2. Write SQLite to /local/ssd/litkit_jobid_shard0/
+3. On success: rsync everything to NFS
+4. Cleanup local staging directory
+```
+
+**Benefits**:
+- 47× faster for small-file creates (vs direct NFS writes)
+- No NFS lock contention between producers
+- Failed producers leave local artifacts for debugging
+
+---
+
+## Why Uncompressed Tar Files?
+
+**LitKit strongly recommends using uncompressed `.tar` files instead of `.tar.gz`.**
+
+### The Problem with Compressed Tars
+
+```
+.tar.gz decompression:  [gz stream] → [single thread] → [tar entries]
+                                           │
+                              Cannot parallelize!
+```
+
+Gzip decompression is inherently **serial**—you cannot seek to random offsets in a compressed stream. This means:
+- Only one CPU can decompress at a time
+- XML parsing must wait for decompression
+- GPUs sit idle during I/O
+
+### Uncompressed Tar Enables Parallelism
+
+```
+.tar file:  [tar entries] → [parallel workers] → [parsed XML]
+                 │                  │
+            Random access    lxml releases GIL
+```
+
+With uncompressed tars:
+- Multiple workers can seek to different tar members simultaneously
+- lxml releases the Python GIL during parsing
+- The `--parse-workers` flag controls parallelism (default: 8)
+
+### Converting Your Archives
+
+```bash
+# Decompress (keeps original)
+gunzip -k corpus.tar.gz
+
+# Or create uncompressed copy
+zcat corpus.tar.gz > corpus.tar
+```
+
+**Trade-off**: Uncompressed files are 3-5× larger, but parsing is 5-10× faster on multi-core systems.
+
+---
+
+## Customizing SLURM Batch Scripts
+
+The batch scripts (`vector_build_single.sbatch`, `vector_build_multi.sbatch`) require customization for your cluster. Key variables to modify:
+
+### Essential Variables
+
+```bash
+# CUSTOMIZE FOR YOUR CLUSTER:
+
+# Where your LitKit installation lives
+export LITKIT_REPO="/path/to/litkit"
+
+# Shared filesystem workspace (NFS/Lustre)
+export LITKIT_WORKSPACE="${LITKIT_REPO}/workspace"
+
+# Node-local fast storage (SSD, NVMe, or tmpfs)
+# Used for staging to avoid NFS bottlenecks
+export LOCAL_SSD="/local/scratch"
+
+# CDI spec directory for GPU passthrough
+export CDI_SPEC_DIR="/path/to/cdi-specs"
+
+# CUDA toolkit libraries (extracted from nvidia/cuda container)
+export CUDA_BASE="/path/to/cuda-12.x"
+export CUDA_LIBA="${CUDA_BASE}/targets/sbsa-linux/lib"   # ARM64
+export CUDA_LIBB="${CUDA_BASE}/lib64"
+
+# HuggingFace model cache (persistent across jobs)
+export HF_HOST="/path/to/hf_cache"
+
+# Container image path
+export IMG="${LITKIT_REPO}/sqfs/litkit-v0.3.35-aarch64-lean.sqfs"
+```
+
+### Manifest Files
+
+Create a manifest file listing tar archive paths (one per line):
+
+```bash
+cat > workspace/corpus.manifest << 'EOF'
+/data/corpus/part_001.tar
+/data/corpus/part_002.tar
+/data/corpus/part_003.tar
+EOF
+```
+
+Set in batch script:
+```bash
+export LITKIT_TAR_MANIFEST="${LITKIT_WORKSPACE}/corpus.manifest"
+```
+
+### SLURM Resource Requests
+
+Adjust for your cluster's hardware:
+
+```bash
+#SBATCH --partition=gpu           # Your GPU partition
+#SBATCH --nodes=3                 # Total nodes (N-1 producers + 1 consumer)
+#SBATCH --ntasks-per-node=1       # One task per node
+#SBATCH --cpus-per-task=32        # CPUs for XML parsing
+#SBATCH --mem=128G                # Memory per node
+#SBATCH --gres=gpu:2              # GPUs per node
+#SBATCH --time=10:00:00           # Wall time
+```
+
+---
+
+## Running Single-Node Builds
+
+### When to Use
+
+- Corpus size < 50 GB
+- Testing and development
+- Quick validation runs
+
+### Basic Command
+
+```bash
+litkit --faiss-writer --build-only --rebuild --yes \
+       --tar-manifest /workspace/corpus.manifest
+```
+
+### Using the Batch Script
+
+```bash
+# Edit vector_build_single.sbatch to set your paths
+sbatch -p YOUR_GPU_PARTITION vector_build_single.sbatch
+```
+
+### Key Options
+
+| Option | Description |
+|--------|-------------|
+| `--faiss-writer` | Enable FAISS index writes (required) |
+| `--build-only` | Build without running a query |
+| `--rebuild` | Wipe and rebuild from scratch |
+| `--update` | Append new files only |
+| `--tar-manifest FILE` | Path to manifest file |
+| `--tar-dir DIR` | Directory containing tar files (alternative to manifest) |
+
+---
+
+## Running Multi-Node Builds
+
+### When to Use
+
+- Corpus size > 50 GB
+- Need faster builds via parallelism
+- Multiple GPUs across multiple nodes
+
+### Architecture
+
+With N nodes:
+- Nodes 0 to N-2: **Producers** (embed text, write segments)
+- Node N-1: **Consumer** (ingest segments, write FAISS indices)
+
+### Using the Batch Script
+
+```bash
+# Edit vector_build_multi.sbatch to set your paths
+# Adjust --nodes=N as needed
+
+sbatch -p YOUR_GPU_PARTITION vector_build_multi.sbatch
+```
+
+### Bootstrap Phase
+
+The script automatically creates empty FAISS indices before producers start:
+
+```bash
+litkit --faiss-writer --init-indices-only \
+       --papers-index hnsw --chunks-index flat
+```
+
+### Monitoring Progress
+
+```bash
+# Watch job output
+tail -f litkit_multi_*.out
+
+# Check GPU utilization across nodes
+JOB=$(squeue --me -h -o %i | head -1)
+for n in $(scontrol show hostnames $(squeue -j $JOB -h -o %N)); do
+  srun --jobid=$JOB --overlap -N1 -n1 -w $n \
+    nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader
+done
+```
+
+---
+
+## Querying Your Index
+
+### Using a Question File
+
+For long or complex questions, use `--question-file`:
+
+```bash
+# Create question file
+cat > workspace/question.txt << 'EOF'
+What molecular mechanisms have been proposed to explain
+the interaction between protein X and protein Y in the
+context of cellular signaling pathways?
+EOF
+
+# Query (retrieval + LLM)
+litkit --question-file /workspace/question.txt
+
+# Query (retrieval only, no LLM)
+litkit --no-llm --question-file /workspace/question.txt
+```
+
+### Interactive Queries
+
+```bash
+litkit "What is the role of autophagy in cancer?"
+```
+
+### With External LLM API
+
+```bash
+litkit --llm-model gpt-4 \
+       --openai-base-url "https://api.example.com/v1" \
+       --openai-api-key "$API_KEY" \
+       --question-file /workspace/question.txt
+```
+
+### Key Query Options
+
+| Option | Description |
+|--------|-------------|
+| `--question-file FILE` | Read question from file |
+| `--no-llm` | Retrieval only (print context, skip LLM) |
+| `--top-papers N` | Stage 1 shortlist size (default: 500) |
+| `--top-chunks N` | Chunks for LLM context (default: 30) |
+| `--per-paper-cap N` | Max chunks per paper (default: 3) |
+| `--llm-model MODEL` | LLM model name |
+
+---
+
+## Troubleshooting
+
+### "CUDA not available" inside container
+
+1. Verify CDI spec exists:
+   ```bash
+   ls $CDI_SPEC_DIR/nvidia.json
+   ```
+
+2. Check CDI flags in ch-run:
+   ```bash
+   --cdi-dirs="$CDI_SPEC_DIR" --cdi=nvidia.com/gpu=all
+   ```
+
+3. Verify CUDA library bindings:
+   ```bash
+   ls "$CUDA_LIBA"/libcuda*
+   ls "$CUDA_LIBB"/libcudart*
+   ```
+
+### "database is locked" errors
+
+These are transient on NFS/Lustre. Increase timeout:
+```bash
+export LITKIT_SQLITE_BUSY_TIMEOUT_MS=300000  # 5 minutes
+```
+
+### Low GPU utilization (bursty pattern)
+
+Usually caused by compressed `.tar.gz` files blocking parallel parsing.
+
+**Solutions**:
+1. Convert to uncompressed `.tar` files
+2. Increase `--parse-workers` (e.g., 16 or 32)
+3. Use more producer nodes
+
+### Producer failed, consumer waiting forever
+
+Check producer logs for errors. If a producer crashes:
+1. Fix the underlying issue
+2. Restart the **entire** job (same node count!)
+3. Checkpoints allow resumption from last successful point
+
+### Stale writer guard file
+
+If a previous job crashed without cleanup:
+```bash
+rm workspace/.writer_guard
+```
+
+The batch script does this automatically at job start.
+
+---
+
+## Command Reference
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `LITKIT_WORKSPACE` | Output directory for indices/DB |
+| `LITKIT_TAR_DIR` | Default tar directory |
+| `LITKIT_TAR_MANIFEST` | Default manifest file |
+| `HF_HOME` | HuggingFace model cache |
+| `LITKIT_SQLITE_BUSY_TIMEOUT_MS` | SQLite lock timeout (default: 120000) |
+| `LITKIT_SAVE_EVERY_SEC` | FAISS save interval (default: 120) |
+| `LITKIT_DEBUG=1` | Enable verbose debugging |
+| `LITKIT_QUIET=1` | Suppress output |
+
+### Key CLI Flags
+
+```bash
+# Build modes
+--faiss-writer          # Enable FAISS writes (required for builds)
+--embed-producer        # Producer mode (write segments, not FAISS)
+--consume-only          # Consumer mode (ingest segments only)
+--init-indices-only     # Create empty indices and exit
+
+# Index types
+--papers-index {hnsw,flat}   # Paper index type (default: hnsw)
+--chunks-index {ivfpq,flat}  # Chunk index type (default: ivfpq)
+
+# Multi-node
+--shard-id N            # This producer's shard ID (0-indexed)
+--num-shards N          # Total number of producer shards
+
+# Performance
+--parse-workers N       # Parallel XML parsing threads (default: 8)
+--embed-devices SPEC    # GPU devices (auto, cpu, cuda:0,cuda:1)
+--paper-embed-bs N      # Paper embedding batch size (default: 16)
+--chunk-embed-bs N      # Chunk embedding batch size (default: 64)
+```
+
+---
+
+# Appendix A: HPC Cluster Reference (Site-Specific)
+
+> **Note:** This appendix contains site-specific details.
+> For public releases, this section can be removed entirely.
 
 ## HPC Hardware
 
@@ -51,35 +493,25 @@ Both node types are ARM64 (aarch64) and share the same container image.
 
 **Submit jobs with:** `sbatch -p gpu-gh200`
 
----
+## HPC-Specific Setup
 
-## One-Time Setup
+### One-Time CDI Generation
 
-These steps only need to be done once per cluster.
-
-### Step 1: Generate CDI Specs for GPU Passthrough
-
-**For V100 nodes** (run on any V100 node):
+**For V100 nodes:**
 ```bash
-# Get an interactive session
 salloc -N1 -t 1:00:00 -p gpu-v100 --no-shell
-ssh gpu-node1  # or whichever node you got
+ssh gpu-node1
 
-# Generate CDI spec
 mkdir -p /path/to/cdi-v100
 nvidia-ctk cdi generate \
   --format=json \
   --output=/path/to/cdi-v100/nvidia.json
 
-# Verify
-nvidia-ctk cdi list --spec-dir=/path/to/cdi-v100
-
-# Exit and release allocation
 exit
 scancel <jobid>
 ```
 
-**For GH200 nodes** (run on any Grace node):
+**For GH200 nodes:**
 ```bash
 salloc -N1 -t 1:00:00 -p gpu-gh200 --no-shell
 ssh gh-node1
@@ -89,491 +521,84 @@ nvidia-ctk cdi generate \
   --format=json \
   --output=/path/to/cdi-grace/nvidia.json
 
-nvidia-ctk cdi list --spec-dir=/path/to/cdi-grace
-
 exit
 scancel <jobid>
 ```
 
-### Step 2: Extract CUDA Toolkit from NVIDIA Image
-
-This provides a stable, module-free CUDA installation for container bindings:
+### CUDA Toolkit Extraction
 
 ```bash
 cd /path/to
 module purge
 module load charliecloud/0.42
 
-# Pull CUDA 12.5 image (multi-arch, will get ARM64)
 ch-image pull nvidia/cuda:12.5.0-devel-ubuntu22.04
 
-# Extract to host
 DEST=/path/to/cuda-12.5-host
 mkdir -p "$DEST"
 ch-run nvidia/cuda:12.5.0-devel-ubuntu22.04 -- bash -lc \
   'tar -C /usr/local -cf - cuda-12.5' | tar -C "$DEST" -xvf -
 ```
 
-### Step 3: Create Persistent HuggingFace Cache
+### SafeTensors Conversion
 
-```bash
-mkdir -p /path/to/hf_cache_persist
-```
-
-### Step 4: Convert SPECTER2 to SafeTensors (Required)
-
-From the litkit repo, run once:
+Run once from the litkit repo:
 ```bash
 cd /path/to/litkit
 ./setup_safetensors.sh
 ```
 
----
-
-## Building the Container
-
-### Rebuilding from Scratch
-
-If you need to rebuild the container after code changes:
+### HuggingFace Cache
 
 ```bash
-# On HPC login node
-cd /path/to/litkit
-git pull
-
-# Get an interactive compute node (just is only available there)
-salloc -p gpu-v100 -N 1 --time=2:00:00 --cpus-per-task=16
-
-# SSH to allocated node
-ssh gpu-node1  # replace with your allocated node
-
-# On compute node:
-cd /path/to/litkit
-module purge
-module load charliecloud/0.42
-
-# Clean build cache and rebuild (~30-60 min)
-just reset
-just build
-
-# Exit and release allocation
-exit
-scancel <jobid>
+mkdir -p /path/to/hf_cache_persist
 ```
 
-### Using the Justfile (Recommended)
-
-```bash
-cd /path/to/litkit
-module purge
-module load charliecloud/0.42
-
-# Build container (Dockerfile.lean by default)
-just build
-
-# Output: sqfs/litkit-v0.3.33-aarch64-lean.sqfs
-```
-
-### Manual Build
-
-```bash
-ch-image build -f Dockerfile.lean -t litkit-lean .
-ch-convert litkit-lean sqfs/litkit-v0.3.33-aarch64-lean.sqfs
-```
-
-### Updating the Dependency Lockfile
-
-If you modify `pyproject.toml` (add/remove dependencies), regenerate `uv.lock` before rebuilding:
-
-```bash
-# On HPC frontend (login node)
-cd /path/to/litkit
-
-# Ensure uv is installed
-python3.12 -m pip install --user uv
-
-# Regenerate lockfile
-~/.local/bin/uv lock --python 3.12
-```
-
-The `uv.lock` file ensures reproducible dependency resolution during container builds.
-
----
-
-## Running Single-Node Builds
-
-### Environment Setup (V100)
-
-```bash
-cd /path/to/litkit
-module purge
-module load charliecloud/0.42
-
-export CDI_SPEC_DIR=/path/to/cdi-v100
-export CUDA_BASE=/path/to/cuda-12.5-host/cuda-12.5
-export CUDA_LIBA="$CUDA_BASE/targets/sbsa-linux/lib"
-export CUDA_LIBB="$CUDA_BASE/lib64"
-export IMG="$(pwd)/sqfs/litkit-v0.3.33-aarch64-lean.sqfs"
-export HF_HOST=/path/to/hf_cache_persist
-```
-
-### Environment Setup (GH200)
-
-```bash
-cd /path/to/litkit
-module purge
-module load charliecloud/0.42
-
-export CDI_SPEC_DIR=/path/to/cdi-grace
-export CUDA_BASE=/path/to/cuda-12.5-host/cuda-12.5
-export CUDA_LIBA="$CUDA_BASE/targets/sbsa-linux/lib"
-export CUDA_LIBB="$CUDA_BASE/lib64"
-export IMG="$(pwd)/sqfs/litkit-v0.3.33-aarch64-lean.sqfs"
-export HF_HOST=/path/to/hf_cache_persist
-```
-
-### Verify Setup
-
-```bash
-ch-run \
-  --unset-env='*' \
-  --set-env=HOME=/root \
-  --cdi-dirs="$CDI_SPEC_DIR" \
-  --cdi=nvidia.com/gpu=all \
-  --bind "$CUDA_LIBA:$CUDA_LIBA" \
-  --bind "$CUDA_LIBB:$CUDA_LIBB" \
-  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
-  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/bin:/usr/bin:/bin" \
-  "$IMG" -- \
-  litkit --version
-```
-
-### Build Vector Store (Small Test)
-
-```bash
-ch-run \
-  --unset-env='*' \
-  --set-env=HOME=/root \
-  --cdi-dirs="$CDI_SPEC_DIR" \
-  --cdi=nvidia.com/gpu=all \
-  --bind "$CUDA_LIBA:$CUDA_LIBA" \
-  --bind "$CUDA_LIBB:$CUDA_LIBB" \
-  --bind "/path/to/test_tar_shards:/path/to/test_tar_shards" \
-  --bind "$(pwd)/workspace:/workspace" \
-  --bind "$HF_HOST:/app/hf_cache" \
-  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
-  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/bin:/usr/bin:/bin" \
-  --set-env="LITKIT_WORKSPACE=/workspace" \
-  --set-env="HF_HOME=/app/hf_cache" \
-  --set-env="TRANSFORMERS_USE_SAFE_TENSORS=1" \
-  "$IMG" -- \
-  litkit --faiss-writer --build-only --rebuild --yes \
-         --tar-manifest /workspace/test.manifest
-```
-
-### Using SLURM Batch Scripts
-
-**V100 single-node:**
-```bash
-sbatch -p gpu-v100 vector_build_single.sbatch
-```
-
-**GH200 single-node:**
-```bash
-sbatch -p gpu-gh200 --export=ALL,TARGET=gh vector_build_single.sbatch
-```
-
----
-
-## Running Multi-Node Builds
-
-For large corpora (126+ GB), use the producer/consumer architecture.
-
-### Architecture
-
-```
-[Producer 0] ──┐
-[Producer 1] ──┼── segments/ ──► [Consumer/Writer] ──► FAISS indices
-[Producer N] ──┘
-```
-
-- **Producers**: Scan tar files, embed chunks, write segment files
-- **Consumer**: Ingests segments into FAISS, manages SQLite
-
-### Submit Multi-Node Job
-
-```bash
-# 4 nodes: 3 producers + 1 consumer
-sbatch -p gpu-v100 vector_build_large.sbatch
-
-# Or adjust node count
-sed -i 's/--nodes=4/--nodes=3/' vector_build_large.sbatch
-sbatch -p gpu-v100 vector_build_large.sbatch
-```
-
-### Create a Manifest File
-
-For PMC-OA corpus:
-```bash
-cat > workspace/pmcoa.manifest << 'EOF'
-/path/to/PMC-OA/oa_comm_xml.PMC007xxxxxx.baseline.2025-06-26.tar.gz
-/path/to/PMC-OA/oa_comm_xml.PMC008xxxxxx.baseline.2025-06-26.tar.gz
-/path/to/PMC-OA/oa_comm_xml.PMC009xxxxxx.baseline.2025-06-26.tar.gz
-EOF
-```
-
----
-
-## Querying Your Literature
-
-### Retrieval Only (No LLM)
-
-```bash
-cat workspace/question.txt
-ch-run \
-  --unset-env='*' \
-  --set-env=HOME=/root \
-  --cdi-dirs="$CDI_SPEC_DIR" --cdi=nvidia.com/gpu=all \
-  --bind "$CUDA_LIBA:$CUDA_LIBA" \
-  --bind "$CUDA_LIBB:$CUDA_LIBB" \
-  --bind "$(pwd)/workspace:/workspace" \
-  --bind "$HF_HOST:/app/hf_cache" \
-  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
-  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/bin:/usr/bin:/bin" \
-  --set-env="LITKIT_WORKSPACE=/workspace" \
-  --set-env="HF_HOME=/app/hf_cache" \
-  "$IMG" -- \
-  litkit --no-llm --question-file /workspace/question.txt
-```
-
-### With hosted LLM API
-
-```bash
-KEY="$(head -n1 ~/.llm_api_key)"
-BASE="https://llm.example.com/v1"
-
-ch-run \
-  --unset-env='*' \
-  --set-env=HOME=/root \
-  --cdi-dirs="$CDI_SPEC_DIR" --cdi=nvidia.com/gpu=all \
-  --bind "$CUDA_LIBA:$CUDA_LIBA" \
-  --bind "$CUDA_LIBB:$CUDA_LIBB" \
-  --bind "$(pwd)/workspace:/workspace" \
-  --bind "$HF_HOST:/app/hf_cache" \
-  --bind "/etc/pki/tls/certs/ca-bundle.crt:/workspace/site-ca.pem" \
-  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
-  --set-env="SSL_CERT_FILE=/workspace/site-ca.pem" \
-  --set-env="REQUESTS_CA_BUNDLE=/workspace/site-ca.pem" \
-  --set-env="PATH=/root/.local/share/uv/tools/litkit/bin:/usr/local/bin:/usr/bin:/bin" \
-  --set-env="LITKIT_WORKSPACE=/workspace" \
-  --set-env="HF_HOME=/app/hf_cache" \
-  --set-env="OPENAI_BASE_URL=$BASE" \
-  --set-env="OPENAI_API_KEY=$KEY" \
-  "$IMG" -- \
-  litkit --llm-model gpt-oss-120b \
-         --openai-base-url "$BASE" \
-         --openai-api-key "$KEY" \
-         --question-file /workspace/question.txt
-```
-
----
-
-## Monitoring GPU Usage
-
-### Check GPU Utilization Across Nodes
-
-```bash
-JOB=$(squeue --me -h -o %i | head -1)
-for n in $(scontrol show hostnames $(squeue -j $JOB -h -o %N)); do
-  srun --jobid=$JOB --overlap -N1 -n1 -w $n -c1 --cpu-bind=none \
-    bash -lc 'echo === $(hostname) ===; nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader; echo'
-done
-```
-
-### Expected Output (Multi-GPU Working)
-
-```
-=== gpu-node1 ===
-0, Tesla V100-PCIE-32GB, 85 %, 3500 MiB, 32768 MiB
-1, Tesla V100-PCIE-32GB, 78 %, 2700 MiB, 32768 MiB
-
-=== gpu-node3 ===
-0, Tesla V100-PCIE-32GB, 82 %, 3500 MiB, 32768 MiB
-1, Tesla V100-PCIE-32GB, 90 %, 2700 MiB, 32768 MiB
-```
-
-### Continuous Monitoring
-
-```bash
-watch -n 5 "for n in \$(scontrol show hostnames \$(squeue -j $JOB -h -o %N) | head -3); do
-  srun --jobid=\$JOB --overlap -N1 -n1 -w \$n -c1 --cpu-bind=none \
-    bash -lc \"echo '=== '\\\$(hostname)' ==='; nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader\" 2>/dev/null
-done"
-```
-
----
-
-## Performance Tuning
-
-### Parallel XML Parsing
-
-For **uncompressed tar files** (`.tar` but not `.tar.gz`), LitKit can parse XML files in parallel using multiple CPU cores. This significantly improves ingestion throughput on multi-core systems.
-
-```bash
-# Use 16 parallel XML parsing workers (for uncompressed .tar files)
-litkit --faiss-writer --build-only --rebuild --yes \
-       --parse-workers 16 \
-       --tar-manifest /workspace/pmcoa_uncompressed.manifest
-```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--parse-workers` | 8 | Number of parallel XML parsing workers |
-
-**Notes:**
-- Parallel parsing **only works with uncompressed `.tar` files**
-- Compressed `.tar.gz` files always use sequential parsing (decompression is inherently serial)
-- Higher values help on nodes with many CPU cores (e.g., GH200's 72 ARM cores)
-- On V100 nodes (32 CPUs), `--parse-workers 8` is usually sufficient
-
-### Converting .tar.gz to .tar for Faster Ingestion
-
-To benefit from parallel parsing, you can decompress your tar archives:
-
-```bash
-# Decompress a single archive
-gunzip -k /path/to/PMC-OA/oa_comm_xml.PMC007xxxxxx.baseline.2025-06-26.tar.gz
-
-# Or create an uncompressed copy
-zcat file.tar.gz > file.tar
-```
-
-**Trade-off**: Uncompressed files are ~3-5x larger but can be parsed in parallel.
-
----
-
-## Troubleshooting
-
-### "pam_slurm_adopt" error when SSH to node
-
-You don't have an active allocation on that node:
-```bash
-# Check your allocations
-squeue --me
-
-# Request a new allocation
-salloc -N1 -t 1:00:00 -p gpu-v100 --no-shell
-```
-
-### "CUDA not available" inside container
-
-1. Verify CDI spec exists:
-   ```bash
-   ls /path/to/cdi-v100/nvidia.json
-   ```
-
-2. Check CDI flags are present in ch-run:
-   ```bash
-   --cdi-dirs="$CDI_SPEC_DIR" --cdi=nvidia.com/gpu=all
-   ```
-
-3. Verify CUDA lib bindings:
-   ```bash
-   ls "$CUDA_LIBA"/libcuda*
-   ls "$CUDA_LIBB"/libcudart*
-   ```
-
-### "database is locked" errors
-
-These are **transient and benign** on Lustre. Segment files remain on disk and are retried automatically. To reduce frequency:
-```bash
-export LITKIT_SQLITE_BUSY_TIMEOUT_MS=300000  # 5 minutes
-```
-
-### Low GPU utilization (bursty pattern)
-
-This pattern occurs when using compressed `.tar.gz` files, which require single-threaded decompression.
-
-**Solutions:**
-1. **Decompress archives** to `.tar` format and use `--parse-workers 16` (see [Performance Tuning](#performance-tuning))
-2. **Use multiple producer nodes** to parallelize across tar files (see [Running Multi-Node Builds](#running-multi-node-builds))
-
-### Container not found
-
-```bash
-# Rebuild the container
-cd /path/to/litkit
-just build
-
-# Verify
-ls -la sqfs/litkit-v0.3.33-aarch64-lean.sqfs
-```
-
----
-
-## Command Reference
-
-### SLURM Submission
-
-| Target | Command |
-|--------|---------|
-| V100 single-node | `sbatch -p gpu-v100 vector_build_single.sbatch` |
-| V100 multi-node | `sbatch -p gpu-v100 vector_build_multi.sbatch` |
-| GH200 single-node | `sbatch -p gpu-gh200 --export=ALL,TARGET=gh vector_build_single.sbatch` |
-
-### Key Paths
+## HPC Paths Quick Reference
 
 | Resource | Path |
 |----------|------|
 | LitKit repo | `/path/to/litkit` |
-| Container | `sqfs/litkit-v0.3.33-aarch64-lean.sqfs` |
+| Container | `sqfs/litkit-v0.3.35-aarch64-lean.sqfs` |
 | V100 CDI spec | `/path/to/cdi-v100` |
 | GH200 CDI spec | `/path/to/cdi-grace` |
 | CUDA toolkit | `/path/to/cuda-12.5-host/cuda-12.5` |
 | HF cache | `/path/to/hf_cache_persist` |
 | PMC-OA corpus | `/path/to/PMC-OA` |
+| Local SSD | `/local/scratch` |
 
-### Environment Variables
-
-| Variable | Purpose |
-|----------|---------|
-| `LITKIT_WORKSPACE` | Output directory for indices/DB |
-| `HF_HOME` | HuggingFace model cache |
-| `LITKIT_SQLITE_BUSY_TIMEOUT_MS` | SQLite lock timeout (default: 120000) |
-| `LITKIT_SAVE_EVERY_SEC` | FAISS save interval (default: 120) |
-
----
-
-## Quick Start Summary
+## HPC SLURM Commands
 
 ```bash
-# 1. SSH to HPC
-ssh login-node
-
-# 2. Clone/update repo
-cd /path/to/litkit
-git pull
-
-# 3. Rebuild container (if needed)
-module load charliecloud/0.42
-just build
-
-# 4. Submit job
+# V100 single-node
 sbatch -p gpu-v100 vector_build_single.sbatch
 
-# 5. Monitor
-squeue --me
-tail -f litkit-build.*.err
+# V100 multi-node (3 nodes)
+sbatch -p gpu-v100 vector_build_multi.sbatch
+
+# GH200 single-node
+sbatch -p gpu-gh200 --export=ALL,TARGET=gh vector_build_single.sbatch
+```
+
+## hosted LLM API Integration
+
+```bash
+KEY="$(head -n1 ~/.llm_api_key)"
+BASE="https://llm.example.com/v1"
+
+litkit --llm-model gpt-oss-120b \
+       --openai-base-url "$BASE" \
+       --openai-api-key "$KEY" \
+       --question-file /workspace/question.txt
+```
+
+**Certificate binding for container:**
+```bash
+--bind "/etc/pki/tls/certs/ca-bundle.crt:/workspace/site-ca.pem"
+--set-env="SSL_CERT_FILE=/workspace/site-ca.pem"
+--set-env="REQUESTS_CA_BUNDLE=/workspace/site-ca.pem"
 ```
 
 ---
 
-## Getting Help
-
-- **Version**: `litkit --version`
-- **Full help**: `litkit --help`
-- **Author**: William S. Hlavacek (hlavacek@lanl.gov)
-
----
-
-*LitKit v0.3.33 — Air-gapped RAG for Scientific Literature on HPC*
+*LitKit v0.3.35 — Air-gapped RAG for Scientific Literature*
