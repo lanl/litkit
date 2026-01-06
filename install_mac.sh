@@ -1,6 +1,18 @@
 #!/bin/bash
 # LitKit Mac Installation Script
-# Usage: ./install_mac.sh
+#
+# Prerequisites:
+#   git clone <repo-url> litkit
+#   cd litkit
+#
+# Usage:
+#   ./install_mac.sh
+#
+# This script:
+#   1. Installs uv (if needed)
+#   2. Creates a virtual environment in .venv/
+#   3. Installs litkit in editable mode
+#
 set -e
 
 echo "🔬 LitKit Mac Installer"
