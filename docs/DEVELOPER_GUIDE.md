@@ -2,6 +2,20 @@
 
 This document contains technical implementation details, optimization strategies, and architectural notes for developers working on LitKit internals.
 
+## Documentation Index
+
+```
+docs/
+├── DEVELOPER_GUIDE.md      # This file - main developer guide
+├── CODE_REVIEW_SUMMARY.md  # Architecture reference
+├── BOTTLENECK.md           # HPC performance tuning
+├── linting_notes.txt       # Ruff/black/mypy guide
+├── mac_notes.txt           # Mac dev cheatsheet
+├── ch-run_notes.txt        # Charliecloud/SLURM commands
+├── REFACTOR_PROGRESS.md    # Historical (can delete later)
+└── REFACTOR_ROADMAP.md     # Historical (can delete later)
+```
+
 ## Concurrency Model
 
 LitKit supports multi-node builds with a **producer/consumer architecture**:
