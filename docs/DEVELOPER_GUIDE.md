@@ -534,6 +534,112 @@ cli.py wrappers bridge the gap by passing globals to module functions.
 set `LITKIT_WRITER_GUARD_TTL=0` to disable auto-eviction entirely (requires manual
 guard cleanup after crashes).
 
+## Technical Debt Roadmap
+
+This section outlines the plan for addressing technical debt in priority order.
+
+### Phase 1: Unit Tests (Immediate Priority)
+
+**Goal:** Establish test infrastructure and achieve meaningful coverage on pure functions.
+
+**Timeline:** 2 weeks
+
+- [ ] Create test infrastructure
+  ```bash
+  mkdir -p tests/test_llm tests/test_retrieval tests/test_build tests/test_formatting
+  touch tests/conftest.py
+  ```
+- [ ] Test LLM module pure functions
+  - `llm/errors.py`: `is_overflow_error()` with real exception strings
+  - `llm/qa.py`: `pack_context()`, `approx_tokens()`
+- [ ] Test retrieval pure functions
+  - `retrieval/lexical.py`: `find_rare_terms()`, `merge_lexical_and_ann()`
+- [ ] Test build helpers
+  - `build/helpers.py`: `pack_paragraphs()`, `dedupe_*_with_doc_ids()`
+- [ ] Test formatting
+  - `formatting/citations.py`: bracket normalization, edge cases
+- [ ] Add CI integration (optional)
+  - GitHub Actions workflow for `pytest` on push/PR
+
+**Target:** 50%+ coverage on `litkit.llm`, `litkit.retrieval`, `litkit.build.helpers`
+
+### Phase 2: cli.py Simplification (Near-term)
+
+**Goal:** Reduce cli.py to a thin orchestration wrapper (~500 lines).
+
+**Timeline:** 1 month
+
+**Current state:** cli.py is ~2400 lines containing argparse, orchestration, and business logic.
+
+- [ ] Extract argparse to `litkit/cli/args.py`
+  - Move `_build_arg_parser()` and argument groups
+  - Export a single `parse_args()` function
+  - Target: ~300 lines moved out
+- [ ] Extract orchestration to `litkit/cli/run.py`
+  - Move `build_or_update_indices()` main loop
+  - Move writer guard functions
+  - Move signal handlers
+  - Target: ~800 lines moved out
+- [ ] cli.py becomes thin wrapper:
+  ```python
+  from litkit.cli.args import parse_args
+  from litkit.cli.run import run_build, run_query
+  
+  def main():
+      args = parse_args()
+      if args.build_only:
+          run_build(args)
+      else:
+          run_query(args)
+  ```
+- [ ] Update imports across codebase
+
+**Target:** cli.py < 500 lines, easy to read in one sitting
+
+### Phase 3: Import Purity (Mid-term)
+
+**Goal:** Eliminate import-time side effects so `from litkit.cli import X` is safe.
+
+**Timeline:** 2 months
+
+**Current problems:**
+- `__getattr__` triggers `get_runtime()` which creates directories
+- Heavy imports (faiss, numpy, torch) loaded at module level
+- Global mutable state (`paper_seg_writer`, `_last_save_ts`)
+
+- [ ] Remove `__getattr__` path access
+  - Paths should only be accessed after explicit `get_runtime()` call in `main()`
+  - Library callers must call `get_runtime()` explicitly or receive errors
+- [ ] Defer heavy imports
+  - Move `import faiss`, `import torch` inside functions
+  - Use `TYPE_CHECKING` for type hints with string annotations
+- [ ] Eliminate global mutable state
+  - Pass `paper_seg_writer`, `chunk_seg_writer` as parameters
+  - Bundle context in `BuildConfig` or `RuntimeContext` dataclass
+  - Module functions should never access cli.py globals
+- [ ] Add import-time test
+  ```python
+  def test_import_purity():
+      """Verify importing cli.py has no I/O side effects."""
+      # Unset all LITKIT_* env vars
+      # Import litkit.cli
+      # Assert no directories created
+  ```
+
+**Target:** `python -c "import litkit.cli"` completes in <0.5s with zero I/O
+
+### Not Prioritized (Accept the Debt)
+
+These items are acknowledged but not planned for immediate work:
+
+- **Tar staging in Python:** Currently handled by sbatch scripts. This is the right pattern for site-specific orchestration – the environment provides context (12-factor app style). Moving staging into Python would couple litkit to site-specific paths.
+
+- **Full integration tests:** Require actual corpus data and GPU resources. Manual testing via `./test_build.sh` is sufficient for now.
+
+- **Deterministic vector IDs:** Major schema change. Current `lastrowid` approach works; optimization is deferred.
+
+---
+
 ## Unit Testing Requirements
 
 The refactored codebase has no unit tests. This is a critical gap that should be addressed.
