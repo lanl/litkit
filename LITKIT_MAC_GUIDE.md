@@ -1,19 +1,20 @@
-# LitKit: MacBook Pro Installation & Usage Guide
+# LitKit: macOS Installation & Usage Guide
 
-A step-by-step guide for installing and using LitKit on macOS to query scientific literature using the hosted LLM API.
+A step-by-step guide for installing and using LitKit on macOS to query scientific literature.
 
 ## Table of Contents
 
 1. [Overview](#overview)
 2. [System Requirements](#system-requirements)
 3. [Installation](#installation)
-4. [Setting Up the AI Portal](#setting-up-the-ai-portal)
+4. [Configuring the LLM Backend](#configuring-the-llm-backend)
 5. [Preparing Your Papers](#preparing-your-papers)
 6. [Building the Index](#building-the-index)
 7. [Querying Your Literature](#querying-your-literature)
 8. [Command Reference](#command-reference)
 9. [Troubleshooting](#troubleshooting)
 10. [Tips & Best Practices](#tips--best-practices)
+11. [Appendix A: hosted LLM API Reference](#appendix-a-hosted-llm-api-reference-site-specific)
 
 ---
 
@@ -35,7 +36,7 @@ LitKit uses a **two-stage retrieval** approach:
 
 2. **Stage 2 (Chunks)**: Text chunks from the shortlisted papers are searched using SBERT embeddings to find the most relevant passages.
 
-3. **LLM Synthesis**: The top chunks are passed to an LLM (via the hosted LLM API) which synthesizes an answer with citations.
+3. **LLM Synthesis**: The top chunks are passed to an LLM which synthesizes an answer with citations.
 
 ---
 
@@ -45,7 +46,6 @@ LitKit uses a **two-stage retrieval** approach:
 - **macOS**: Sonoma, Ventura, or Monterey (Apple Silicon or Intel)
 - **RAM**: 8 GB minimum, 16 GB recommended
 - **Disk**: ~5 GB for models + index storage (varies with corpus size)
-- **Network**: Access to `llm.example.com` for LLM queries
 
 ### Software
 - **Python 3.12** (exact version required)
@@ -106,7 +106,7 @@ uv pip install -e . --no-deps
 
 ```bash
 # 1. Clone the repository
-git clone https://lanl-git/hlavacek/litkit.git
+git clone https://github.com/YOUR_ORG/litkit.git
 cd litkit
 
 # 2. Create a virtual environment
@@ -150,20 +150,48 @@ python -c "from litkit.embeddings.devices import detect_device; print('Device:',
 
 ---
 
-## Setting Up the AI Portal
+## Configuring the LLM Backend
 
-LitKit uses the hosted LLM API to generate answers from retrieved context. You need an API key.
+LitKit uses an OpenAI-compatible API to generate answers. You can use either a **local LLM** (LM Studio, Ollama) or an **online API** (OpenAI, Anthropic, etc.).
 
-### Step 1: Save Your API Key
+### Option A: Local LLM (Recommended for Privacy)
 
-Create a file containing your AI Portal API key:
+Run an LLM locally using [LM Studio](https://lmstudio.ai/) or [Ollama](https://ollama.ai/):
+
+**LM Studio** (default port 1234):
+```bash
+# No API key needed for local models
+litkit "What is the main finding?" \
+       --llm-model lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF \
+       --openai-base-url "http://localhost:1234/v1"
+```
+
+**Ollama** (default port 11434):
+```bash
+litkit "What is the main finding?" \
+       --llm-model llama3.2 \
+       --openai-base-url "http://localhost:11434/v1"
+```
+
+**Advantages**:
+- Complete privacy—data never leaves your machine
+- No API costs
+- Works offline
+
+### Option B: Online API
+
+Use OpenAI, Anthropic, or any OpenAI-compatible API:
 
 ```bash
-# Create the key file (replace YOUR_API_KEY with your actual key)
-echo "YOUR_API_KEY_HERE" > ~/.llm_api_key
-
-# Secure the file permissions
+# Store your API key in a file (not an environment variable)
+echo "YOUR_API_KEY" > ~/.llm_api_key
 chmod 600 ~/.llm_api_key
+
+# Query with OpenAI
+litkit "What is the main finding?" \
+       --llm-model gpt-4 \
+       --openai-base-url "https://api.openai.com/v1" \
+       --openai-api-key "$(cat ~/.llm_api_key)"
 ```
 
 > ⚠️ **Security Note**: Store your API key in a file rather than an environment variable. 
@@ -171,16 +199,21 @@ chmod 600 ~/.llm_api_key
 > listings. Using `$(cat ~/.llm_api_key)` reads the key at runtime without exposing it 
 > in logs or history.
 
-### Step 2: Test the Connection (Optional)
+### Listing Available Models
 
-You can test your API key with curl:
+Query any OpenAI-compatible endpoint to see available models:
 
 ```bash
-curl -H "Authorization: Bearer $(cat ~/.llm_api_key)" \
-     https://llm.example.com/v1/models
-```
+# LM Studio (local, no auth)
+curl -s http://localhost:1234/v1/models | jq '.data[].id'
 
-If successful, you'll see a list of available models.
+# Ollama
+curl -s http://localhost:11434/v1/models | jq '.data[].id'
+
+# OpenAI (with auth)
+curl -s -H "Authorization: Bearer $(cat ~/.llm_api_key)" \
+     https://api.openai.com/v1/models | jq '.data[].id'
+```
 
 ---
 
@@ -329,12 +362,20 @@ If the build is interrupted, simply re-run the same command. LitKit maintains ch
 
 Once the index is built, you can ask questions about your papers.
 
-### Basic Query
+### Basic Query (Local LLM)
 
 ```bash
 litkit "What is the main mechanism described in these papers?" \
-       --llm-model gpt-oss-120b \
-       --openai-base-url "https://llm.example.com/v1" \
+       --llm-model llama3.2 \
+       --openai-base-url "http://localhost:1234/v1"
+```
+
+### Basic Query (Online API)
+
+```bash
+litkit "What is the main mechanism described in these papers?" \
+       --llm-model gpt-4 \
+       --openai-base-url "https://api.openai.com/v1" \
        --openai-api-key "$(cat ~/.llm_api_key)"
 ```
 
@@ -344,9 +385,8 @@ Retrieve more chunks for a more comprehensive answer:
 
 ```bash
 litkit "What experimental methods were used?" \
-       --llm-model gpt-oss-120b \
-       --openai-base-url "https://llm.example.com/v1" \
-       --openai-api-key "$(cat ~/.llm_api_key)" \
+       --llm-model llama3.2 \
+       --openai-base-url "http://localhost:1234/v1" \
        --top-papers 100 \
        --top-chunks 30
 ```
@@ -359,9 +399,8 @@ For longer questions, save them to a file:
 echo "What are the key findings regarding the relationship between X and Y?" > question.txt
 
 litkit --question-file question.txt \
-       --llm-model gpt-oss-120b \
-       --openai-base-url "https://llm.example.com/v1" \
-       --openai-api-key "$(cat ~/.llm_api_key)"
+       --llm-model llama3.2 \
+       --openai-base-url "http://localhost:1234/v1"
 ```
 
 ### Retrieval Only (No LLM)
@@ -410,7 +449,7 @@ REFERENCES
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--llm-model MODEL` | LLM model name | gpt-oss:20b |
+| `--llm-model MODEL` | LLM model name | - |
 | `--openai-base-url URL` | API endpoint URL | localhost:1234 |
 | `--openai-api-key KEY` | API authentication key | - |
 | `--top-papers N` | Number of candidate papers (Stage 1) | 500 |
@@ -456,17 +495,28 @@ export HTTPS_PROXY=http://proxy.example.com:8080
 export HTTP_PROXY=http://proxy.example.com:8080
 ```
 
-### "401 Unauthorized" from AI Portal
+### Connection Refused (Local LLM)
+
+Make sure your local LLM server is running:
+```bash
+# Check if LM Studio is listening
+curl http://localhost:1234/v1/models
+
+# Check if Ollama is running
+curl http://localhost:11434/v1/models
+```
+
+### "401 Unauthorized" from Online API
 
 Check that your API key is correct:
 ```bash
 cat ~/.llm_api_key
 ```
 
-Verify the key works:
+Test with curl:
 ```bash
 curl -H "Authorization: Bearer $(cat ~/.llm_api_key)" \
-     https://llm.example.com/v1/models
+     https://api.openai.com/v1/models
 ```
 
 ### "No tar shards found"
@@ -581,19 +631,33 @@ litkit --build-only --faiss-writer --parse-workers 8 ...
 ### 4. Save Common Options in a Script
 
 Create a helper script for repeated use:
+
+**For local LLM:**
 ```bash
 cat > query.sh << 'EOF'
 #!/bin/bash
 source .venv/bin/activate
 litkit "$1" \
-    --llm-model gpt-oss-120b \
-    --openai-base-url "https://llm.example.com/v1" \
-    --openai-api-key "$(cat ~/.llm_api_key)"
+    --llm-model llama3.2 \
+    --openai-base-url "http://localhost:1234/v1"
 EOF
 chmod +x query.sh
 
 # Usage:
 ./query.sh "What is the main finding?"
+```
+
+**For online API:**
+```bash
+cat > query-online.sh << 'EOF'
+#!/bin/bash
+source .venv/bin/activate
+litkit "$1" \
+    --llm-model gpt-4 \
+    --openai-base-url "https://api.openai.com/v1" \
+    --openai-api-key "$(cat ~/.llm_api_key)"
+EOF
+chmod +x query-online.sh
 ```
 
 ### 5. Backup Your Index
@@ -617,23 +681,19 @@ uv pip install "torch>=2.6"
 uv pip install "numpy<2" && uv pip install "faiss-cpu>=1.8,<1.9"
 uv pip install -e . --no-deps
 
-# 2. Setup API key
-echo "YOUR_KEY" > ~/.llm_api_key && chmod 600 ~/.llm_api_key
-
-# 3. Add your papers
+# 2. Add your papers
 mkdir -p workspace/tar_shards
 cp /path/to/papers.tar workspace/tar_shards/
 
-# 4. Build index
+# 3. Build index
 litkit --build-only --faiss-writer \
        --tar-dir workspace/tar_shards \
        --papers-index flat --chunks-index flat
 
-# 5. Query
+# 4. Query (local LLM)
 litkit "What is the main finding?" \
-       --llm-model gpt-oss-120b \
-       --openai-base-url "https://llm.example.com/v1" \
-       --openai-api-key "$(cat ~/.llm_api_key)"
+       --llm-model llama3.2 \
+       --openai-base-url "http://localhost:1234/v1"
 ```
 
 ---
@@ -643,6 +703,75 @@ litkit "What is the main finding?" \
 - **Version**: `litkit --version`
 - **Full help**: `litkit --help`
 - **Author**: William S. Hlavacek (hlavacek@lanl.gov)
+
+---
+
+# Appendix A: hosted LLM API Reference (Site-Specific)
+
+> **Note:** This appendix contains site-specific details for using the hosted LLM API.
+> For public releases, this section can be removed entirely.
+
+## Storing Your API Key
+
+```bash
+# Create the key file
+echo "YOUR_API_KEY" > ~/.llm_api_key
+chmod 600 ~/.llm_api_key
+```
+
+> ⚠️ **Security Note**: Store your API key in a file rather than an environment variable.
+> Environment variables set via `export` may appear in shell history files and process
+> listings. Using `$(cat ~/.llm_api_key)` reads the key at runtime without exposing it
+> in logs or history.
+
+## Listing Available Models
+
+```bash
+curl -s -H "Authorization: Bearer $(cat ~/.llm_api_key)" \
+     https://llm.example.com/v1/models | jq '.data[].id'
+```
+
+Example output:
+```
+"gpt-oss-20b"
+"gpt-oss-120b"
+"llama-3-70b"
+...
+```
+
+## Querying with the hosted LLM API
+
+```bash
+litkit "What is the main finding?" \
+       --llm-model gpt-oss-120b \
+       --openai-base-url "https://llm.example.com/v1" \
+       --openai-api-key "$(cat ~/.llm_api_key)"
+```
+
+## Site-Specific Helper Script
+
+```bash
+cat > query-llm.sh << 'EOF'
+#!/bin/bash
+source .venv/bin/activate
+litkit "$1" \
+    --llm-model gpt-oss-120b \
+    --openai-base-url "https://llm.example.com/v1" \
+    --openai-api-key "$(cat ~/.llm_api_key)"
+EOF
+chmod +x query-llm.sh
+
+# Usage:
+./query-llm.sh "What is the main finding?"
+```
+
+## Quick Reference
+
+| Resource | Value |
+|----------|-------|
+| API Endpoint | `https://llm.example.com/v1` |
+| Recommended Model | `gpt-oss-120b` |
+| API Key File | `~/.llm_api_key` |
 
 ---
 
