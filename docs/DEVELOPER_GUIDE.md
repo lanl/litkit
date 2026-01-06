@@ -439,3 +439,158 @@ grep -rn "0\.3\." --include="*.py" --include="*.toml" --include="justfile" --inc
 1. `just reset && just build` — rebuild container with new tag
 2. Copy `.sqfs` to cluster: `/path/to/litkit/sqfs/`
 3. Commit and push all changed files
+
+## Deferred Architectural Issues
+
+These issues were identified during code review but deferred to future work. They are documented here for transparency and to guide future improvements.
+
+### Import-Time Side Effects (P2)
+
+**Problem:** `from litkit.cli import SQLITE_DIR` triggers:
+1. Heavy imports (faiss, numpy, litkit.build, litkit.retrieval, etc.) at module load
+2. Directory creation and env var mutation via `__getattr__` → `get_runtime()`
+
+**Impact:** Breaks import purity for unit tests, tooling, and indirect imports.
+
+**Current state:** cli.py has a "LAZY RUNTIME INITIALIZATION" comment block that
+documents what IS vs IS NOT deferred. However, it's a half-measure - only path I/O
+is deferred, not the heavy imports or side effects on attribute access.
+
+**Proper fix (requires completing refactor):**
+1. Move all business logic out of cli.py (per SCOPE CONTRACT at top of file)
+2. Make `__getattr__` read-only - return `None` or raise if uninitialized
+3. Require explicit `get_runtime()` call in `main()` only
+4. Defer all module imports to inside `main()` or guard with `if TYPE_CHECKING`
+
+This is orthogonal to line count reduction - it's about achieving true import purity
+so `from litkit.cli import X` doesn't have side effects.
+
+### Global Mutable State Leaks (P2)
+
+**Problem:** cli.py has module-level mutable globals that are only initialized in `main()`:
+- `paper_seg_writer`, `chunk_seg_writer` - set in `main()`, read in `build_or_update_indices()`
+- `_last_save_ts` - FAISS save throttling state (in `litkit/index/io.py`)
+- Lazy path globals via `__getattr__` (SQLITE_DIR, DB_PATH, etc.)
+- Batching constants (`PAPER_BATCH`, `CHUNK_BATCH`) mutated from `args`
+
+**Impact:** The "library use" comments (`get_runtime()`, wrapper helpers) suggest these
+functions can be called from outside `main()`, but they silently depend on globals that
+only `main()` initializes. This causes:
+- Unpredictable behavior when importing cli.py functions for tests
+- Hidden coupling between functions and module-level state
+- Stateful behavior that doesn't reset between calls
+
+**Current state:** Module functions in `litkit.build` and `litkit.retrieval` take
+explicit parameters (paths, locks, writers) - this is the correct pattern. The
+cli.py wrappers bridge the gap by passing globals to module functions.
+
+**Proper fix (requires completing refactor):**
+1. Pass all context (writers, paths, locks, config) explicitly down the call stack
+2. Eliminate `global paper_seg_writer` patterns - pass writers as parameters
+3. Bundle path/lock context in `BuildConfig` or `RuntimeContext` dataclass
+4. Module functions should never access cli.py globals
+
+### Concurrency Safety Gaps (P2)
+
+**Problem:** The current concurrency model mixes several mechanisms without clear guarantees:
+1. SQLite busy timeout + implicit DB concurrency
+2. Explicit file locks (`FileLock`) for "DB+FAISS" operations
+3. External writer guard file with TTL-based eviction
+
+**Weak points identified:**
+
+1. **`--rebuild` doesn't enforce exclusive access:**
+   - Requires `--faiss-writer` (enforced)
+   - But doesn't verify no producers/consumers are running
+   - A user could start `--rebuild` while stale producers are still active
+   - Risk: corrupt indices or data loss from concurrent writes
+
+2. **Cross-host TTL eviction is dangerous:**
+   - On same host: checks PID liveness via `os.kill(pid, 0)` before evicting
+   - On different host: can't check PID, relies solely on timestamp
+   - Risk: a legitimate 25-hour build gets evicted at 24h TTL
+
+**Potential fixes:**
+
+1. **Heartbeat-based guard:** Writer periodically touches guard file; staleness check looks at mtime
+2. **Default TTL off:** `LITKIT_WRITER_GUARD_TTL=0` → never auto-evict, require manual cleanup
+3. **Exclusive maintenance lock for `--rebuild`:** Verify no `.shard_XX_complete` markers present
+
+**Current mitigation:** TTL eviction documented as a known limitation. Users can
+set `LITKIT_WRITER_GUARD_TTL=0` to disable auto-eviction entirely (requires manual
+guard cleanup after crashes).
+
+## Unit Testing Requirements
+
+The refactored codebase has no unit tests. This is a critical gap that should be addressed.
+
+### Priority 1: LLM Module Tests
+
+| Module | Test Cases |
+|--------|------------|
+| `llm/errors.py` | `is_overflow_error()` with real exception strings from OpenAI/local endpoints |
+| `llm/qa.py` | `pack_context()` respects budget, returns partial results correctly |
+| `llm/qa.py` | `pack_context()` clamps `max_out_tokens` when >= budget |
+| `llm/qa.py` | `answer_question()` overflow retry trims chunks AND reduces `max_out` |
+| `llm/qa.py` | `answer_question()` returns `final_chunks_sent` matching actual context |
+| `llm/provider.py` | `AutoProvider` selects Responses for o3* models |
+| `llm/provider.py` | `OpenAIResponsesProvider` raises `EndpointNotSupportedError` on 404/405 |
+| `llm/rewrite.py` | `rewrite_query(mode="none")` is identity (passthrough) |
+
+### Priority 2: Build Module Tests
+
+| Module | Test Cases |
+|--------|------------|
+| `build/helpers.py` | `pack_paragraphs()` chunking with overlap |
+| `build/training.py` | `_effective_nlist()` data-aware caps |
+| `build/indices.py` | Index creation with correct types |
+| `build/backfill.py` | `reconcile_sqlite_flags_with_faiss()` finds desync |
+
+### Priority 3: Retrieval Module Tests
+
+| Module | Test Cases |
+|--------|------------|
+| `retrieval/lexical.py` | `find_rare_terms()` term extraction |
+| `retrieval/lexical.py` | `merge_lexical_and_ann()` interleaving |
+| `retrieval/stages.py` | `shortlist_papers()` returns valid paper IDs |
+
+### Priority 4: Formatting Tests
+
+| Module | Test Cases |
+|--------|------------|
+| `formatting/citations.py` | Fullwidth bracket normalization |
+| `formatting/citations.py` | `†Lx–Ly` tail removal |
+| `formatting/citations.py` | Edge cases: `[Figure 2]`, `[p < 0.05]`, nested brackets |
+
+### Test Infrastructure Setup
+
+1. **Create `tests/` structure:**
+   ```
+   tests/
+   ├── conftest.py          # Shared fixtures (mock LLM, test DB, etc.)
+   ├── test_llm/
+   │   ├── test_qa.py
+   │   ├── test_provider.py
+   │   └── test_errors.py
+   ├── test_build/
+   │   ├── test_helpers.py
+   │   └── test_training.py
+   ├── test_retrieval/
+   │   └── test_lexical.py
+   └── test_formatting/
+       └── test_citations.py
+   ```
+
+2. **Add pytest to dev dependencies** (already in pyproject.toml under `[project.optional-dependencies] dev`)
+
+3. **Running tests:**
+   ```bash
+   # Install dev dependencies
+   uv pip install -e ".[dev]"
+   
+   # Run tests
+   pytest tests/ -v
+   
+   # With coverage
+   pytest tests/ --cov=litkit --cov-report=html
+   ```
