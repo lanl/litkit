@@ -875,6 +875,12 @@ litkit --llm-model gpt-oss-120b \
        --question-file /workspace/question.txt
 ```
 
+> ⚠️ **Security Note**: Store your API key in a file (`~/.llm_api_key`) rather than an 
+> environment variable. Environment variables set via `--set-env="OPENAI_API_KEY=xxx"` 
+> or `export` may appear in shell history, SLURM job scripts, and container logs. 
+> Reading from a file at runtime with `$(head -n1 ~/.llm_api_key)` avoids exposing the 
+> key in these locations.
+
 **Certificate binding for container:**
 ```bash
 --bind "/etc/pki/tls/certs/ca-bundle.crt:/workspace/site-ca.pem"

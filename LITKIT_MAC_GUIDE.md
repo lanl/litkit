@@ -166,6 +166,11 @@ echo "YOUR_API_KEY_HERE" > ~/.llm_api_key
 chmod 600 ~/.llm_api_key
 ```
 
+> ⚠️ **Security Note**: Store your API key in a file rather than an environment variable. 
+> Environment variables set via `export` may appear in shell history files and process 
+> listings. Using `$(cat ~/.llm_api_key)` reads the key at runtime without exposing it 
+> in logs or history.
+
 ### Step 2: Test the Connection (Optional)
 
 You can test your API key with curl:
