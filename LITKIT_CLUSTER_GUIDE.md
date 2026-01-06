@@ -6,15 +6,17 @@ A guide for running LitKit on HPC clusters using Charliecloud containers with GP
 
 1. [Overview](#overview)
 2. [Prerequisites](#prerequisites)
-3. [Understanding Multi-Node Builds](#understanding-multi-node-builds)
-4. [Why Uncompressed Tar Files?](#why-uncompressed-tar-files)
-5. [Customizing SLURM Batch Scripts](#customizing-slurm-batch-scripts)
-6. [Running Single-Node Builds](#running-single-node-builds)
-7. [Running Multi-Node Builds](#running-multi-node-builds)
-8. [Querying Your Index](#querying-your-index)
-9. [Troubleshooting](#troubleshooting)
-10. [Command Reference](#command-reference)
-11. [Appendix A: HPC Cluster Reference (Site-Specific)](#appendix-a-hpc-cluster-reference-site-specific)
+3. [Building the Container](#building-the-container)
+4. [Caching HuggingFace Models](#caching-huggingface-models)
+5. [Understanding Multi-Node Builds](#understanding-multi-node-builds)
+6. [Why Uncompressed Tar Files?](#why-uncompressed-tar-files)
+7. [Customizing SLURM Batch Scripts](#customizing-slurm-batch-scripts)
+8. [Running Single-Node Builds](#running-single-node-builds)
+9. [Running Multi-Node Builds](#running-multi-node-builds)
+10. [Querying Your Index](#querying-your-index)
+11. [Troubleshooting](#troubleshooting)
+12. [Command Reference](#command-reference)
+13. [Appendix A: HPC Cluster Reference (Site-Specific)](#appendix-a-hpc-cluster-reference-site-specific)
 
 ---
 
@@ -58,12 +60,158 @@ On HPC clusters, LitKit runs inside a Charliecloud container with GPU passthroug
 - **NVIDIA CDI specs** generated for your GPU nodes
 - **uv** package manager (for lockfile regeneration)
 
+### CUDA Setup Options
+
+You need CUDA libraries available on the host to bind into the container. Two approaches:
+
+**Option A: Use site CUDA module** (recommended on managed clusters)
+```bash
+module load cuda/12.5.0
+export CUDA_HOME="${CUDA_HOME:-$(dirname "$(dirname "$(which nvcc)")")}"
+
+# Pick ARM runtime lib directory (SBSA for Grace/Hopper, aarch64 for older)
+if [ -d "$CUDA_HOME/targets/sbsa-linux/lib" ]; then
+  export CUDA_LIBA="$CUDA_HOME/targets/sbsa-linux/lib"
+elif [ -d "$CUDA_HOME/targets/aarch64-linux/lib" ]; then
+  export CUDA_LIBA="$CUDA_HOME/targets/aarch64-linux/lib"
+fi
+export CUDA_LIBB="$CUDA_HOME/lib64"
+```
+
+**Option B: Extract from NVIDIA container** (for clusters without CUDA modules)
+```bash
+module load charliecloud
+ch-image pull nvidia/cuda:12.5.0-devel-ubuntu22.04
+
+DEST=/path/to/cuda-12.5-host
+mkdir -p "$DEST"
+ch-run nvidia/cuda:12.5.0-devel-ubuntu22.04 -- bash -lc \
+  'tar -C /usr/local -cf - cuda-12.5' | tar -C "$DEST" -xvf -
+
+export CUDA_BASE="$DEST/cuda-12.5"
+export CUDA_LIBA="$CUDA_BASE/targets/sbsa-linux/lib"
+export CUDA_LIBB="$CUDA_BASE/lib64"
+```
+
 ### Container Image
 
 LitKit is distributed as a SquashFS container image:
 ```
 litkit-v0.3.35-aarch64-lean.sqfs    # ARM64 (aarch64)
 litkit-v0.3.35-x86_64-lean.sqfs     # x86-64 (if available)
+```
+
+---
+
+## Building the Container
+
+LitKit containers are built using the repo's `justfile` and either `Dockerfile.lean` or `Dockerfile.fat`.
+
+### Dockerfile Flavors
+
+| Flavor | File | CUDA in Image | Portability | Use Case |
+|--------|------|---------------|-------------|----------|
+| **lean** | `Dockerfile.lean` | No | High | Recommended for most clusters |
+| **fat** | `Dockerfile.fat` | Yes | Low | Single-cluster deployments |
+
+**lean** (recommended): No CUDA userspace baked in. At runtime, you bind host CUDA libraries via CDI. More portable—works across clusters with different driver versions.
+
+**fat**: CUDA userspace injected at build time. Simpler to run, but baked libs must be ≤ site driver version.
+
+### Building with the Justfile
+
+```bash
+# Ensure Charliecloud is loaded
+module load charliecloud
+
+# Build lean container (default)
+just build
+
+# Output: sqfs/litkit-v0.3.35-<arch>-lean.sqfs
+```
+
+### Build Commands
+
+| Command | Description |
+|---------|-------------|
+| `just build` | Build container and export to sqfs |
+| `just release` | Build + save wheel + export (full release) |
+| `just reset` | Clear Charliecloud build cache |
+
+### Regenerating the Lockfile
+
+If you modify `pyproject.toml` (add/remove dependencies), regenerate `uv.lock`:
+
+```bash
+# Install uv if needed
+pip install uv
+
+# Regenerate lockfile
+uv lock --python 3.12
+```
+
+The lockfile ensures reproducible builds.
+
+---
+
+## Caching HuggingFace Models
+
+LitKit uses two embedding models from HuggingFace:
+- **SPECTER2** (`allenai/specter2_base`) for paper-level embeddings
+- **SBERT** (`sentence-transformers/all-mpnet-base-v2`) for chunk-level embeddings
+
+### Why Cache Models?
+
+Air-gapped HPC clusters cannot download models at runtime. You must:
+1. Pre-download models to a persistent cache directory
+2. Bind the cache into the container
+3. Set `HF_HUB_OFFLINE=1` to prevent download attempts
+
+### Creating a Persistent Cache
+
+```bash
+# Create cache directory (shared filesystem, persistent across jobs)
+mkdir -p /path/to/hf_cache
+export HF_HOST=/path/to/hf_cache
+```
+
+### Converting to SafeTensors
+
+PyTorch's default model format (`.bin`) uses pickle, which has security concerns and slower loading. **SafeTensors** is preferred:
+
+- No arbitrary code execution (safer)
+- Memory-mapped loading (faster)
+- Required by LitKit when `TRANSFORMERS_USE_SAFE_TENSORS=1`
+
+The `setup_safetensors.sh` script handles conversion:
+
+```bash
+# Set required variables
+export IMG=/path/to/litkit.sqfs
+export HF_HOST=/path/to/hf_cache
+export CUDA_BASE=/path/to/cuda-12.x
+export CUDA_LIBA="$CUDA_BASE/targets/sbsa-linux/lib"
+export CUDA_LIBB="$CUDA_BASE/lib64"
+
+# Optional: CDI spec dir (if you have GPU access)
+export CDI_SPEC_DIR=/path/to/cdi-specs
+
+# Run conversion (idempotent - safe to run multiple times)
+./setup_safetensors.sh
+```
+
+The script:
+1. Seeds the host cache from the container image
+2. Converts `.bin` → `.safetensors` for SPECTER2 and SBERT
+3. Removes `.bin` artifacts after successful conversion
+
+### Environment Variables for Offline Mode
+
+```bash
+--set-env="HF_HOME=/app/hf_cache"
+--set-env="HF_HUB_OFFLINE=1"
+--set-env="TRANSFORMERS_OFFLINE=1"
+--set-env="TRANSFORMERS_USE_SAFE_TENSORS=1"
 ```
 
 ---
@@ -194,7 +342,7 @@ export LOCAL_SSD="/local/scratch"
 # CDI spec directory for GPU passthrough
 export CDI_SPEC_DIR="/path/to/cdi-specs"
 
-# CUDA toolkit libraries (extracted from nvidia/cuda container)
+# CUDA toolkit libraries
 export CUDA_BASE="/path/to/cuda-12.x"
 export CUDA_LIBA="${CUDA_BASE}/targets/sbsa-linux/lib"   # ARM64
 export CUDA_LIBB="${CUDA_BASE}/lib64"
@@ -373,6 +521,49 @@ litkit --llm-model gpt-4 \
 
 ## Troubleshooting
 
+### Verifying GPU Setup
+
+Before running builds, verify PyTorch can see GPUs:
+
+```bash
+ch-run YOUR_IMAGE.sqfs \
+  --cdi-dirs="$CDI_SPEC_DIR" --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" \
+  --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  -- /root/.local/share/uv/tools/litkit/bin/python - <<'PY'
+import torch
+print("Torch:", torch.__version__, "CUDA build:", torch.version.cuda)
+print("CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("Device:", torch.cuda.get_device_name(0))
+PY
+```
+
+**Expected output**:
+```
+Torch: 2.5.1 CUDA build: 12.5
+CUDA available: True
+Device: Tesla V100-PCIE-32GB
+```
+
+### Monitoring SLURM Jobs
+
+```bash
+# Check job status
+squeue --me
+
+# Get job ID for completed job
+jid=$(sacct -X -n --name=litkit-build --starttime=now-7days -o JobID | tail -1)
+
+# View logs
+less "litkit-build.$jid.out"
+less "litkit-build.$jid.err"
+
+# Get timing and status
+sacct -X -j "$jid" -o JobID,JobName%30,Partition,State,ExitCode,Elapsed
+```
+
 ### "CUDA not available" inside container
 
 1. Verify CDI spec exists:
@@ -423,6 +614,17 @@ rm workspace/.writer_guard
 
 The batch script does this automatically at job start.
 
+### "pam_slurm_adopt" error when SSH to node
+
+You don't have an active allocation on that node:
+```bash
+# Check your allocations
+squeue --me
+
+# Request a new allocation
+salloc -N1 -t 1:00:00 -p YOUR_PARTITION --no-shell
+```
+
 ---
 
 ## Command Reference
@@ -435,6 +637,8 @@ The batch script does this automatically at job start.
 | `LITKIT_TAR_DIR` | Default tar directory |
 | `LITKIT_TAR_MANIFEST` | Default manifest file |
 | `HF_HOME` | HuggingFace model cache |
+| `HF_HUB_OFFLINE=1` | Force offline mode (no downloads) |
+| `TRANSFORMERS_USE_SAFE_TENSORS=1` | Use SafeTensors format |
 | `LITKIT_SQLITE_BUSY_TIMEOUT_MS` | SQLite lock timeout (default: 120000) |
 | `LITKIT_SAVE_EVERY_SEC` | FAISS save interval (default: 120) |
 | `LITKIT_DEBUG=1` | Enable verbose debugging |
@@ -463,6 +667,15 @@ The batch script does this automatically at job start.
 --paper-embed-bs N      # Paper embedding batch size (default: 16)
 --chunk-embed-bs N      # Chunk embedding batch size (default: 64)
 ```
+
+### Utility Scripts
+
+| Script | Description |
+|--------|-------------|
+| `setup_safetensors.sh` | Convert HF models to SafeTensors format |
+| `vector_build_single.sbatch` | SLURM script for single-node builds |
+| `vector_build_multi.sbatch` | SLURM script for multi-node builds |
+| `vector_resume_consumer.sbatch` | Resume consumer after producer completion |
 
 ---
 
@@ -507,6 +720,8 @@ nvidia-ctk cdi generate \
   --format=json \
   --output=/path/to/cdi-v100/nvidia.json
 
+nvidia-ctk cdi list --spec-dir=/path/to/cdi-v100
+
 exit
 scancel <jobid>
 ```
@@ -520,6 +735,8 @@ mkdir -p /path/to/cdi-grace
 nvidia-ctk cdi generate \
   --format=json \
   --output=/path/to/cdi-grace/nvidia.json
+
+nvidia-ctk cdi list --spec-dir=/path/to/cdi-grace
 
 exit
 scancel <jobid>
@@ -540,11 +757,23 @@ ch-run nvidia/cuda:12.5.0-devel-ubuntu22.04 -- bash -lc \
   'tar -C /usr/local -cf - cuda-12.5' | tar -C "$DEST" -xvf -
 ```
 
-### SafeTensors Conversion
+### SafeTensors Conversion (HPC)
 
-Run once from the litkit repo:
 ```bash
 cd /path/to/litkit
+
+export IMG=$(pwd)/sqfs/litkit-v0.3.35-aarch64-lean.sqfs
+export HF_HOST=/path/to/hf_cache_persist
+export CUDA_BASE=/path/to/cuda-12.5-host/cuda-12.5
+export CUDA_LIBA="${CUDA_BASE}/targets/sbsa-linux/lib"
+export CUDA_LIBB="${CUDA_BASE}/lib64"
+
+# For V100 nodes:
+export CDI_SPEC_DIR=/path/to/cdi-v100
+
+# For GH200 nodes:
+# export CDI_SPEC_DIR=/path/to/cdi-grace
+
 ./setup_safetensors.sh
 ```
 
@@ -578,6 +807,40 @@ sbatch -p gpu-v100 vector_build_multi.sbatch
 
 # GH200 single-node
 sbatch -p gpu-gh200 --export=ALL,TARGET=gh vector_build_single.sbatch
+
+# Check job status
+squeue --me
+
+# Get job elapsed time and status
+jid=$(sacct -X -n --name=litkit-build --starttime=now-7days -o JobID | tail -1)
+sacct -X -j "$jid" -o JobID,JobName%30,Partition,State,ExitCode,Elapsed
+```
+
+## HPC: Verifying GPU Setup
+
+**V100 (gpu-v100):**
+```bash
+cd /path/to/litkit
+module purge
+module load charliecloud/0.42
+
+export CDI_SPEC_DIR=/path/to/cdi-v100
+export CUDA_BASE=/path/to/cuda-12.5-host/cuda-12.5
+export CUDA_LIBA="$CUDA_BASE/targets/sbsa-linux/lib"
+export CUDA_LIBB="$CUDA_BASE/lib64"
+export IMG="$(pwd)/sqfs/litkit-v0.3.35-aarch64-lean.sqfs"
+
+ch-run "$IMG" \
+  --cdi-dirs="$CDI_SPEC_DIR" --cdi=nvidia.com/gpu=all \
+  --bind "$CUDA_LIBA:$CUDA_LIBA" --bind "$CUDA_LIBB:$CUDA_LIBB" \
+  --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
+  -- /root/.local/share/uv/tools/litkit/bin/python - <<'PY'
+import torch
+print("Torch:", torch.__version__, "CUDA:", torch.version.cuda)
+print("CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("Device:", torch.cuda.get_device_name(0))
+PY
 ```
 
 ## hosted LLM API Integration
