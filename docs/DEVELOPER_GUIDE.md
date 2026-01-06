@@ -628,6 +628,92 @@ This section outlines the plan for addressing technical debt in priority order.
 
 **Target:** `python -c "import litkit.cli"` completes in <0.5s with zero I/O
 
+### Phase 4: Cluster Orchestration in Python (Long-term)
+
+**Goal:** Move multi-node build coordination from sbatch scripts into Python, keeping cluster-specific paths in configuration files.
+
+**Timeline:** 1 week (when prioritized)
+
+**Current problems:**
+- ~300 lines of orchestration logic in `vector_build_multi.sbatch`
+- Producer/consumer coordination, local SSD staging, rsync checkpointing
+- Watchdog for producer failures, job cancellation
+- Hard to test, easy to break, duplicated across sbatch files
+
+**Proposed architecture:**
+
+1. **Site Configuration Files (YAML)**
+   ```yaml
+   # litkit/cluster/sites/site_v100.yaml
+   name: site-gpu-v100
+   scheduler: slurm
+   container: charliecloud
+   
+   paths:
+     local_ssd: /local/scratch
+     cuda_liba: ${CUDA_BASE}/targets/sbsa-linux/lib
+     cuda_libb: ${CUDA_BASE}/lib64
+   
+   staging:
+     enabled: true
+     min_free_gb: 50
+     rsync_interval_sec: 1800
+     
+   defaults:
+     embed_workers: 2
+     parse_workers: 16
+   ```
+
+2. **Python Orchestrator (`litkit/cluster/orchestrator.py`)**
+   - Load site config from YAML
+   - Detect local SSD, validate free space
+   - Set up staging directories
+   - Run build with proper workspace paths
+   - Handle rsync checkpointing
+   - Clean up on success
+
+3. **New CLI Subcommand**
+   ```bash
+   litkit cluster-build \
+       --site site_v100 \
+       --manifest corpus.manifest \
+       --num-shards 3
+   ```
+
+4. **Simplified sbatch (~50 lines)**
+   ```bash
+   #!/bin/bash
+   #SBATCH --nodes=4
+   #SBATCH -p gpu-v100
+   
+   module load charliecloud/0.42
+   export LITKIT_SITE="site_v100"
+   
+   ch-run "$IMG" -- litkit cluster-build \
+       --site site_v100 \
+       --manifest /path/to/corpus.manifest \
+       --num-shards $((SLURM_NNODES - 1))
+   ```
+
+**Implementation checklist:**
+- [ ] Define site YAML schema and validation
+- [ ] Create `litkit/cluster/` module with:
+  - `sites.py` - Site config loader
+  - `staging.py` - Local SSD detection, staging logic
+  - `orchestrator.py` - Multi-node build coordination
+- [ ] Add `cluster-build` subcommand to CLI
+- [ ] Migrate `vector_build_multi.sbatch` logic to Python
+- [ ] Simplify sbatch to thin launcher
+- [ ] Add site config files for HPC (V100, GH200)
+
+**Benefits:**
+- No hardcoded paths in Python code
+- Testable orchestration logic
+- Portable across clusters (add new sites via YAML)
+- Maintainable cluster logic (Python vs. bash)
+
+**Target:** sbatch scripts < 50 lines; all orchestration in Python
+
 ### Not Prioritized (Accept the Debt)
 
 These items are acknowledged but not planned for immediate work:
