@@ -593,9 +593,29 @@ export LITKIT_SQLITE_BUSY_TIMEOUT_MS=300000  # 5 minutes
 
 Usually caused by compressed `.tar.gz` files blocking parallel parsing.
 
+**Diagnosing**: Check if multiple CPUs are parsing XML:
+
+```bash
+# In a separate terminal on the same node:
+htop   # Look for multiple Python threads with CPU usage
+
+# Or check thread count:
+ps -eLf | grep python | wc -l
+
+# Watch overall CPU utilization:
+watch -n1 'cat /proc/loadavg'
+```
+
+**What success looks like**:
+- Multiple CPU cores showing load during "Ingesting" phase
+- If only 1 core is busy → compressed tars blocking parallelism
+
 **Solutions**:
-1. Convert to uncompressed `.tar` files
-2. Increase `--parse-workers` (e.g., 16 or 32)
+1. Convert to uncompressed `.tar` files (see [Why Uncompressed Tar Files?](#why-uncompressed-tar-files))
+2. Increase `--parse-workers`:
+   ```bash
+   litkit --faiss-writer --build-only --parse-workers 16 ...  # default is 8
+   ```
 3. Use more producer nodes
 
 ### Producer failed, consumer waiting forever
