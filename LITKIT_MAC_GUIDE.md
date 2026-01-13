@@ -106,7 +106,7 @@ uv pip install -e . --no-deps
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/YOUR_ORG/litkit.git
+git clone https://github.com/lanl/litkit.git
 cd litkit
 
 # 2. Create a virtual environment
