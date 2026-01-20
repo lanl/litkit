@@ -802,7 +802,275 @@ With periodic rsync enabled:
 
 ---
 
+## FAISS Dedup Bottleneck Fix (2026-01-13)
+
+### Root Cause Analysis
+
+**Reported:** Email thread 2026-01-08  
+**Confirmed by:** Code review 2026-01-13  
+**Status:** ✅ FIX IMPLEMENTED (2026-01-13)
+
+#### Symptom
+
+Processing rate starts high (~100 files/sec) but degrades progressively as the build continues. The slowdown correlates with index size growth.
+
+#### Root Cause
+
+The `safe_remove_ids()` function (in `src/litkit/index/ids.py`) calls FAISS `index.remove_ids()`, which has **O(N) complexity** for IndexFlatIP wrapped in IndexIDMap2. As the index grows:
+
+- 10K vectors → each removal scans 10K vectors
+- 100K vectors → each removal scans 100K vectors  
+- 1M vectors → each removal scans 1M vectors
+
+This explains the "mysterious decay" in processing rate—it's proportional to index size.
+
+#### Compounding Factor: Double-Call Bug
+
+The code calls `safe_remove_ids()` **TWICE** per batch:
+
+1. Explicitly in caller code before `add_with_ids_dedup()`
+2. Again inside `add_with_ids_dedup()` itself
+
+This doubles the O(N) cost per batch.
+
+**Evidence in `ingest_loop.py`:**
+```python
+sel = make_id_selector(u_ids)
+with FileLock(faiss_lock):
+    safe_remove_ids(paper_index, sel)    # FIRST CALL - explicit
+    added, ids_added = add_with_ids_dedup(paper_index, u_ids, Xp)  # SECOND CALL inside
+```
+
+**Inside `add_with_ids_dedup()` (dedup.py):**
+```python
+def add_with_ids_dedup(index, ids, X):
+    ...
+    sel = make_id_selector(ids_arr)
+    safe_remove_ids(index, sel)   # Redundant second call
+    index.add_with_ids(X, ids_arr)
+```
+
+#### Why HNSW Users Don't See This
+
+The `safe_remove_ids` function has a special case:
+```python
+if kind == INDEX_KIND_HNSW:
+    return 0  # No-op - HNSW doesn't support ID removal
+```
+
+HNSW index users bypass this bottleneck entirely.
+
+### Affected Files
+
+| File | Double-Call Sites | Notes |
+|------|-------------------|-------|
+| `src/litkit/build/ingest_loop.py` | 6 | Main build loop, faiss_writer mode |
+| `src/litkit/build/backfill.py` | 2 | Backfill reconciliation |
+| `src/litkit/segments/ingest.py` | 2 | Consumer segment ingestion |
+
+### Fix Implementation
+
+#### Phase 1: Eliminate Double-Calls ✅ COMPLETE
+
+Removed explicit `safe_remove_ids()` calls that immediately preceded `add_with_ids_dedup()`. The dedup function already handles removal internally.
+
+**Files modified:**
+
+1. **`src/litkit/build/ingest_loop.py`** - Removed 6 explicit calls ✅
+   - Paper batch flush in faiss_writer mode
+   - Chunk batch flush in faiss_writer mode
+   - Final buffer flush sections (process_tar_files and flush_final_buffers)
+   
+2. **`src/litkit/build/backfill.py`** - Removed 2 explicit calls ✅
+   - Paper backfill
+   - Chunk backfill
+
+3. **`src/litkit/segments/ingest.py`** - Removed 2 explicit calls ✅
+   - `ingest_paper_segments()` 
+   - `ingest_chunk_segments()`
+
+#### Phase 2: Add skip_dedup for Rebuild Mode ✅ COMPLETE
+
+Added `skip_dedup` parameter to `add_with_ids_dedup()` in `src/litkit/index/dedup.py`:
+
+```python
+def add_with_ids_dedup(
+    index: faiss.Index,
+    ids: list[int],
+    X: np.ndarray,
+    skip_dedup: bool = False,  # NEW PARAMETER
+) -> tuple[int, np.ndarray]:
+    """Add vectors with IDs, optionally skipping dedup for rebuild mode."""
+    ...
+    # skip_dedup=True is safe for --rebuild mode (index starts empty)
+    if not skip_dedup:
+        sel = make_id_selector(ids_arr)
+        safe_remove_ids(index, sel)
+    ...
+```
+
+**Phase 2.2:** Updated `process_tar_files()` in `ingest_loop.py` to pass `skip_dedup=rebuild`:
+- Paper batch flush (faiss_writer mode) ✅
+- Chunk batch flush (faiss_writer mode) ✅
+- Final buffer flush (inside process_tar_files) ✅
+
+**Remaining:** The standalone `flush_final_buffers()` function doesn't receive the `rebuild` flag and defaults to `skip_dedup=False`. This is a minor gap affecting only the final buffer flush when called externally.
+
+#### Phase 3: Test
+
+| Test Case | Expected Result |
+|-----------|-----------------|
+| `--rebuild` small corpus | Fast, constant rate |
+| `--rebuild` medium corpus | Fast, constant rate |
+| `--update` on existing index | Dedup works correctly |
+| Segment ingestion | No regression |
+
+### Expected Performance Impact
+
+| Scenario | Before | After Phase 1 | After Phase 2 |
+|----------|--------|--------------|---------------|
+| `--rebuild` 100K chunks | 2× O(N) per batch | 1× O(N) per batch | O(1) per batch |
+| `--update` 100K chunks | 2× O(N) per batch | 1× O(N) per batch | 1× O(N) per batch |
+| Processing rate | Degrades with N | 2× improvement | Constant (rebuild) |
+
+---
+
+## Comprehensive Scalability Code Review Plan
+
+### Motivation
+
+The FAISS dedup bottleneck reveals a pattern: code that works at small scale (1K papers) may fail at production scale (1M+ papers). This section outlines a systematic review to find other scalability issues.
+
+### Review Categories
+
+#### 1. Algorithmic Complexity (O(N²) and O(N) in loops)
+
+**What to look for:**
+- Nested loops over growing data structures
+- List/set membership checks in loops (O(N) per check)
+- String concatenation in loops
+- Repeated computation that could be cached
+
+**Files to prioritize:**
+- `src/litkit/build/ingest_loop.py` - Main processing loop
+- `src/litkit/segments/ingest.py` - Segment processing
+- `src/litkit/db/queries.py` - Database operations
+- `src/litkit/ingest/ingest.py` - XML parsing
+
+**Search patterns:**
+```bash
+grep -n "for.*in.*:" src/litkit/**/*.py  # All loops
+grep -n "\.append\|\.extend" src/litkit/**/*.py  # Growing lists
+grep -n "in list\|in set" src/litkit/**/*.py  # Membership checks
+```
+
+#### 2. I/O Patterns
+
+**What to look for:**
+- Unbatched writes (fsync per item instead of per batch)
+- Small reads that could be batched
+- Missing file buffering
+- NFS-hostile patterns (many small files, frequent metadata ops)
+
+**Files to check:**
+- `src/litkit/segments/writer.py` - Segment output
+- `src/litkit/index/io.py` - FAISS save/load
+- `src/litkit/db/connection.py` - SQLite operations
+
+**Known good patterns to verify:**
+- SQLite WAL mode enabled
+- FAISS save throttling (save every N batches)
+- Segment batching (write every N chunks)
+
+#### 3. Lock Contention
+
+**What to look for:**
+- Fine-grained locks held during I/O
+- Locks acquired in different orders (deadlock risk)
+- Long-held locks that serialize parallel work
+
+**Files to check:**
+- `src/litkit/concurrent/locking.py` - Lock implementation
+- All files using `FileLock` - Lock usage patterns
+
+**Check for:**
+```bash
+grep -n "FileLock\|with.*lock" src/litkit/**/*.py
+```
+
+#### 4. Memory Growth
+
+**What to look for:**
+- Unbounded buffers (lists that grow without limit)
+- Cached data that's never evicted
+- Large objects held beyond their useful lifetime
+
+**Files to check:**
+- `src/litkit/build/ingest_loop.py` - Buffer management
+- `src/litkit/embeddings/pool.py` - Embedding cache
+- `src/litkit/db/queries.py` - Preloaded maps
+
+**Search patterns:**
+```bash
+grep -n "= \[\]" src/litkit/**/*.py  # Empty list init
+grep -n "\.clear()" src/litkit/**/*.py  # Buffer clearing
+```
+
+#### 5. SQLite Patterns
+
+**What to look for:**
+- Missing indices on frequently-queried columns
+- N+1 query patterns (query per item instead of batch)
+- Large transactions that block readers
+- VACUUM/ANALYZE not run after bulk inserts
+
+**Files to check:**
+- `src/litkit/db/schema.py` - Index definitions
+- `src/litkit/db/queries.py` - Query patterns
+- `src/litkit/db/indexing.py` - Batch operations
+
+**Verify indices exist for:**
+- `papers.doc_id` (used in segment resolution)
+- `papers.pmcid`, `papers.pmid` (used in dedup)
+- `chunks.paper_id` (used in paper→chunk lookup)
+- `files.path` (used in already_processed check)
+
+#### 6. Embedding Pipeline
+
+**What to look for:**
+- GPU underutilization (small batches)
+- CPU-GPU transfer overhead
+- Model loading per batch instead of once
+
+**Files to check:**
+- `src/litkit/embeddings/base.py` - Embedder interface
+- `src/litkit/embeddings/pool.py` - Batch management
+- `src/litkit/embeddings/hf_local.py` - HuggingFace backend
+
+### Review Checklist
+
+| Category | Status | Findings |
+|----------|--------|----------|
+| Algorithmic complexity | 🔲 TODO | |
+| I/O patterns | 🔲 TODO | |
+| Lock contention | 🔲 TODO | |
+| Memory growth | 🔲 TODO | |
+| SQLite patterns | 🔲 TODO | |
+| Embedding pipeline | 🔲 TODO | |
+
+### Priority Order
+
+1. **CRITICAL** - Fix FAISS dedup bottleneck (this document)
+2. **HIGH** - SQLite patterns (N+1 queries common source of slowdown)
+3. **HIGH** - I/O patterns (NFS sensitivity)
+4. **MEDIUM** - Memory growth (OOM risk on large corpus)
+5. **MEDIUM** - Lock contention (parallelism limiter)
+6. **LOW** - Embedding pipeline (usually GPU-bound)
+
+---
+
 ## References
 
 - Slurm CPU binding: https://slurm.schedmd.com/cpu_management.html
 - FAISS threading: https://github.com/facebookresearch/faiss/wiki/Threads-and-asynchronous-calls
+- FAISS IndexIDMap2 limitations: https://github.com/facebookresearch/faiss/wiki/FAQ#can-i-remove-vectors-from-an-index

@@ -89,8 +89,7 @@ def backfill_unindexed_vectors(
 
         prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
         with FileLock(faiss_lock_path):
-            sel = make_id_selector(ids)
-            safe_remove_ids(paper_index, sel)
+            # add_with_ids_dedup handles removal internally - no explicit safe_remove_ids needed
             added, ids_added = add_with_ids_dedup(paper_index, ids, Xp)
             saved = False
             if added:
@@ -128,8 +127,7 @@ def backfill_unindexed_vectors(
 
         prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
         with FileLock(faiss_lock_path):
-            sel = make_id_selector(ids)
-            safe_remove_ids(chunk_index, sel)
+            # add_with_ids_dedup handles removal internally - no explicit safe_remove_ids needed
             added, ids_added = add_with_ids_dedup(chunk_index, ids, Xc)
             saved = False
             if added:

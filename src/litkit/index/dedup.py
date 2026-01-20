@@ -14,17 +14,21 @@ def add_with_ids_dedup(
     index: faiss.Index,
     ids: list[int],
     X: np.ndarray,
+    skip_dedup: bool = False,
 ) -> tuple[int, np.ndarray]:
-    """Add vectors with IDs, removing stale IDs first (dedup).
+    """Add vectors with IDs, optionally removing stale IDs first (dedup).
     
-    Normalizes vectors and removes any existing IDs before adding.
-    Ensures the index is wrapped in IndexIDMap2 for safe external ID
-    semantics.
+    Normalizes vectors and (unless skip_dedup=True) removes any existing
+    IDs before adding. Ensures the index is wrapped in IndexIDMap2 for
+    safe external ID semantics.
     
     Args:
         index: FAISS index (should be IndexIDMap2-wrapped)
         ids: List of integer IDs for the vectors
         X: Vector array, shape (n, dim)
+        skip_dedup: If True, skip the O(N) removal step. Use this for
+                    --rebuild mode where the index starts empty and no
+                    dedup is needed. Default False for safety.
     
     Returns:
         Tuple of (num_added, ids_added_array) where:
@@ -45,9 +49,11 @@ def add_with_ids_dedup(
         index = faiss.IndexIDMap2(index)
     
     try:
-        # Remove existing IDs first (dedup)
-        sel = make_id_selector(ids_arr)
-        safe_remove_ids(index, sel)
+        # Remove existing IDs first (dedup) unless explicitly skipped
+        # skip_dedup=True is safe for --rebuild mode (index starts empty)
+        if not skip_dedup:
+            sel = make_id_selector(ids_arr)
+            safe_remove_ids(index, sel)
         
         # Add new vectors
         index.add_with_ids(X, ids_arr)

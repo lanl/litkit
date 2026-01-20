@@ -231,10 +231,7 @@ def ingest_paper_segments(
             added, ids_added, saved = 0, [], False
             
             with FileLock(faiss_lock_path):
-                # Remove existing IDs to allow re-embedding (mirrors chunk behavior)
-                sel = make_id_selector(ids)
-                safe_remove_ids(paper_index, sel)
-                
+                # add_with_ids_dedup handles removal internally - no explicit safe_remove_ids needed
                 added, ids_added = add_with_ids_dedup(paper_index, ids, X)
                 if added:
                     # Force save on first vectors, throttled save otherwise
@@ -456,10 +453,7 @@ def ingest_chunk_segments(
             added, ids_added, saved = 0, [], False
             
             with FileLock(faiss_lock_path):
-                # Remove existing IDs to allow re-embedding
-                sel = make_id_selector(ids)
-                safe_remove_ids(chunk_index, sel)
-                
+                # add_with_ids_dedup handles removal internally - no explicit safe_remove_ids needed
                 added, ids_added = add_with_ids_dedup(chunk_index, ids, X)
                 if added:
                     saved = faiss_save_force(chunk_index, chunk_index_path) if prior_ntotal == 0 \

@@ -548,10 +548,9 @@ def process_tar_files(
                             progress_done_summary=False,
                         )
                         prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
-                        sel = make_id_selector(u_ids)
                         with FileLock(faiss_lock):
-                            safe_remove_ids(paper_index, sel)
-                            added, ids_added = add_with_ids_dedup(paper_index, u_ids, Xp)
+                            # skip_dedup=rebuild: in rebuild mode, index starts empty, no dedup needed
+                            added, ids_added = add_with_ids_dedup(paper_index, u_ids, Xp, skip_dedup=rebuild)
                             saved = False
                             if added:
                                 if prior_ntotal == 0:
@@ -647,10 +646,9 @@ def process_tar_files(
                             progress_done_summary=False,
                         )
                         prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
-                        sel = make_id_selector(u_ids)
                         with FileLock(faiss_lock):
-                            safe_remove_ids(chunk_index, sel)
-                            added, ids_added = add_with_ids_dedup(chunk_index, u_ids, Xc)
+                            # skip_dedup=rebuild: in rebuild mode, index starts empty, no dedup needed
+                            added, ids_added = add_with_ids_dedup(chunk_index, u_ids, Xc, skip_dedup=rebuild)
                             saved = False
                             if added:
                                 if prior_ntotal == 0:
@@ -788,9 +786,8 @@ def process_tar_files(
             
             with FileLock(db_lock), FileLock(faiss_lock):
                 prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
-                sel = make_id_selector(u_ids)
-                safe_remove_ids(paper_index, sel)
-                added, ids_added = add_with_ids_dedup(paper_index, u_ids, Xp)
+                # skip_dedup=rebuild: in rebuild mode, index starts empty, no dedup needed
+                added, ids_added = add_with_ids_dedup(paper_index, u_ids, Xp, skip_dedup=rebuild)
                 if added:
                     if prior_ntotal == 0:
                         faiss_save_force(paper_index, paper_index_path)
@@ -820,9 +817,8 @@ def process_tar_files(
             
             with FileLock(db_lock), FileLock(faiss_lock):
                 prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
-                sel = make_id_selector(u_ids)
-                safe_remove_ids(chunk_index, sel)
-                added, ids_added = add_with_ids_dedup(chunk_index, u_ids, Xc)
+                # skip_dedup=rebuild: in rebuild mode, index starts empty, no dedup needed
+                added, ids_added = add_with_ids_dedup(chunk_index, u_ids, Xc, skip_dedup=rebuild)
                 if added:
                     if prior_ntotal == 0:
                         faiss_save_force(chunk_index, chunk_index_path)
@@ -942,8 +938,7 @@ def flush_final_buffers(
             
             with FileLock(db_lock), FileLock(faiss_lock):
                 prior_ntotal = int(getattr(paper_index, "ntotal", 0) or 0)
-                sel = make_id_selector(u_ids)
-                safe_remove_ids(paper_index, sel)
+                # add_with_ids_dedup handles removal internally - no explicit safe_remove_ids needed
                 added, ids_added = add_with_ids_dedup(paper_index, u_ids, Xp)
                 if added:
                     if prior_ntotal == 0:
@@ -974,8 +969,7 @@ def flush_final_buffers(
             
             with FileLock(db_lock), FileLock(faiss_lock):
                 prior_ntotal = int(getattr(chunk_index, "ntotal", 0) or 0)
-                sel = make_id_selector(u_ids)
-                safe_remove_ids(chunk_index, sel)
+                # add_with_ids_dedup handles removal internally - no explicit safe_remove_ids needed
                 added, ids_added = add_with_ids_dedup(chunk_index, u_ids, Xc)
                 if added:
                     if prior_ntotal == 0:
