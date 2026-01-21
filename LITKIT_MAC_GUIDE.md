@@ -246,14 +246,31 @@ EOF
 
 Before you can query your papers, LitKit needs to build a searchable index.
 
-### First-Time Model Download
+### Download Embedding Models (Required Once)
 
-The first time you run LitKit, it will download the required embedding models from HuggingFace (~2 GB total):
+LitKit requires two embedding models from HuggingFace (~1 GB total). **You must download them before your first build:**
 
-- **SPECTER2**: For paper-level embeddings
-- **all-mpnet-base-v2**: For chunk-level embeddings
+```bash
+# Set cache location
+export HF_HOME=$(pwd)/workspace/hf_cache
 
-This download happens automatically and is cached in `workspace/hf_cache/`.
+# Download models
+uv run python -c "
+from transformers import AutoModel, AutoTokenizer
+from sentence_transformers import SentenceTransformer
+
+print('Downloading SPECTER2...')
+AutoTokenizer.from_pretrained('allenai/specter2_base')
+AutoModel.from_pretrained('allenai/specter2_base')
+
+print('Downloading SBERT...')
+SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
+
+print('Done!')
+"
+```
+
+> **Note:** Models are cached in `workspace/hf_cache/` and only need to be downloaded once.
 
 ### Build Command (Small Corpus)
 
@@ -490,6 +507,22 @@ curl -H "Authorization: Bearer $(cat ~/.llm_api_key)" \
      https://api.openai.com/v1/models
 ```
 
+### "No local snapshot found for allenai/specter2_base"
+
+The embedding models haven't been downloaded yet. Run the model download step from the "Building the Index" section:
+
+```bash
+export HF_HOME=$(pwd)/workspace/hf_cache
+uv run python -c "
+from transformers import AutoModel, AutoTokenizer
+from sentence_transformers import SentenceTransformer
+AutoTokenizer.from_pretrained('allenai/specter2_base')
+AutoModel.from_pretrained('allenai/specter2_base')
+SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
+print('Done!')
+"
+```
+
 ### "No tar shards found"
 
 Ensure your tar file is in the correct location and has a valid extension:
@@ -634,16 +667,27 @@ Before relying on LLM answers, use `--no-llm` to verify the right papers/chunks 
 unzip litkit-v0.3.35.zip && cd litkit
 uv sync
 
-# 2. Add your papers
+# 2. Download embedding models (once)
+export HF_HOME=$(pwd)/workspace/hf_cache
+uv run python -c "
+from transformers import AutoModel, AutoTokenizer
+from sentence_transformers import SentenceTransformer
+AutoTokenizer.from_pretrained('allenai/specter2_base')
+AutoModel.from_pretrained('allenai/specter2_base')
+SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
+print('Done!')
+"
+
+# 3. Add your papers
 mkdir -p workspace/tar_shards
 cp /path/to/papers.tar workspace/tar_shards/
 
-# 3. Build index
+# 4. Build index
 uv run litkit --build-only --faiss-writer \
        --tar-dir workspace/tar_shards \
        --papers-index flat --chunks-index flat
 
-# 4. Query (local LLM)
+# 5. Query (local LLM)
 uv run litkit "What is the main finding?" \
        --llm-model llama3.2 \
        --openai-base-url "http://localhost:1234/v1"
