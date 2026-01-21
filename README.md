@@ -28,12 +28,22 @@ LitKit uses a **two-stage retrieval** approach:
 
 ## Quick Start
 
+### Prerequisites
+
+- **Python 3.12** (exact version required)
+- **uv** package manager
+
+```bash
+# Install uv if needed
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
 ### Install
 
 ```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -e .
+# Clone or extract litkit, then:
+cd litkit
+uv sync
 ```
 
 ### Build Index

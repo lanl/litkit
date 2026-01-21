@@ -85,21 +85,11 @@ If you received LitKit as a ZIP file:
 unzip litkit-v0.3.35.zip
 cd litkit
 
-# 2. Create a virtual environment with Python 3.12
-uv venv --python 3.12
+# 2. Install all dependencies (uv.lock ensures correct versions)
+uv sync
 
-# 3. Activate the virtual environment
-source .venv/bin/activate
-
-# 4. Install PyTorch first (MPS support)
-uv pip install "torch>=2.6"
-
-# 5. Install dependencies (order matters for FAISS compatibility)
-uv pip install "numpy<2"
-uv pip install "faiss-cpu>=1.8,<1.9"
-
-# 6. Install LitKit (editable, skip deps to preserve torch version)
-uv pip install -e . --no-deps
+# 3. Verify installation
+uv run litkit --version
 ```
 
 ### Option B: Install from Git
@@ -109,43 +99,27 @@ uv pip install -e . --no-deps
 git clone https://github.com/lanl/litkit.git
 cd litkit
 
-# 2. Create a virtual environment
-uv venv --python 3.12
+# 2. Install all dependencies (uv.lock ensures correct versions)
+uv sync
 
-# 3. Activate it
-source .venv/bin/activate
-
-# 4. Install PyTorch first (MPS support)
-uv pip install "torch>=2.6"
-
-# 5. Install dependencies (order matters for FAISS compatibility)
-uv pip install "numpy<2"
-uv pip install "faiss-cpu>=1.8,<1.9"
-
-# 6. Install LitKit (editable, skip deps to preserve torch version)
-uv pip install -e . --no-deps
+# 3. Verify installation
+uv run litkit --version
 ```
-
-### Why This Install Order?
-
-- **PyTorch first**: Ensures you get a version with MPS (Metal) support and latest security fixes
-- **numpy<2**: FAISS-CPU wheels are not yet compatible with NumPy 2.x
-- **--no-deps**: Prevents uv from downgrading PyTorch when installing litkit's dependencies
 
 ### Verify Installation
 
 ```bash
-litkit --version
+uv run litkit --version
 # Should output: litkit 0.3.35
 
 # Verify MPS is available (Apple Silicon)
-python -c "import torch; print('MPS:', torch.backends.mps.is_available())"
+uv run python -c "import torch; print('MPS:', torch.backends.mps.is_available())"
 
 # Verify FAISS
-python -c "import faiss; print('FAISS OK')"
+uv run python -c "import faiss; print('FAISS OK')"
 
 # Verify device detection
-python -c "from litkit.embeddings.devices import detect_device; print('Device:', detect_device())"
+uv run python -c "from litkit.embeddings.devices import detect_device; print('Device:', detect_device())"
 ```
 
 ---
@@ -286,10 +260,7 @@ This download happens automatically and is cached in `workspace/hf_cache/`.
 For a small collection of papers (< 10,000), use FLAT indices for simplicity:
 
 ```bash
-cd litkit
-source .venv/bin/activate
-
-litkit --build-only \
+uv run litkit --build-only \
        --faiss-writer \
        --tar-dir workspace/tar_shards \
        --papers-index flat \
@@ -299,7 +270,7 @@ litkit --build-only \
 Or using a manifest file:
 
 ```bash
-litkit --build-only \
+uv run litkit --build-only \
        --faiss-writer \
        --tar-manifest workspace/papers.manifest \
        --papers-index flat \
@@ -311,7 +282,7 @@ litkit --build-only \
 For larger collections (> 10,000 papers), use HNSW for papers and IVF-PQ for chunks:
 
 ```bash
-litkit --build-only \
+uv run litkit --build-only \
        --faiss-writer \
        --tar-manifest workspace/papers.manifest \
        --papers-index hnsw \
@@ -532,18 +503,9 @@ ls workspace/tar_shards/
 FAISS can segfault if dependencies are mismatched. Reinstall in a fresh environment:
 
 ```bash
-# Remove old environment
+# Remove old environment and reinstall
 rm -rf .venv
-
-# Create fresh environment
-uv venv --python 3.12
-source .venv/bin/activate
-
-# Reinstall in correct order
-uv pip install "torch>=2.6"
-uv pip install "numpy<2"
-uv pip install "faiss-cpu>=1.8,<1.9"
-uv pip install -e . --no-deps
+uv sync
 ```
 
 ### FAISS Hangs During Build
@@ -563,24 +525,18 @@ On Apple Silicon Macs, LitKit should automatically use MPS (Metal Performance Sh
 
 ```bash
 # Check MPS availability
-python -c "import torch; print('MPS:', torch.backends.mps.is_available())"
+uv run python -c "import torch; print('MPS:', torch.backends.mps.is_available())"
 # Should output: MPS: True
 
 # Check device detection
-python -c "from litkit.embeddings.devices import detect_device; print('Device:', detect_device())"
+uv run python -c "from litkit.embeddings.devices import detect_device; print('Device:', detect_device())"
 # Should output: Device: mps
 ```
 
-If MPS shows False but you have Apple Silicon, reinstall PyTorch:
+If MPS shows False but you have Apple Silicon, try reinstalling:
 ```bash
-uv pip install "torch>=2.6" --force-reinstall
-```
-
-### Torch Downgraded After Install
-
-If torch gets downgraded and MPS stops working:
-```bash
-uv pip install "torch>=2.6" --force-reinstall
+rm -rf .venv
+uv sync
 ```
 
 ### Index Corruption
@@ -676,22 +632,19 @@ Before relying on LLM answers, use `--no-llm` to verify the right papers/chunks 
 ```bash
 # 1. Extract and install
 unzip litkit-v0.3.35.zip && cd litkit
-uv venv --python 3.12 && source .venv/bin/activate
-uv pip install "torch>=2.6"
-uv pip install "numpy<2" && uv pip install "faiss-cpu>=1.8,<1.9"
-uv pip install -e . --no-deps
+uv sync
 
 # 2. Add your papers
 mkdir -p workspace/tar_shards
 cp /path/to/papers.tar workspace/tar_shards/
 
 # 3. Build index
-litkit --build-only --faiss-writer \
+uv run litkit --build-only --faiss-writer \
        --tar-dir workspace/tar_shards \
        --papers-index flat --chunks-index flat
 
 # 4. Query (local LLM)
-litkit "What is the main finding?" \
+uv run litkit "What is the main finding?" \
        --llm-model llama3.2 \
        --openai-base-url "http://localhost:1234/v1"
 ```
