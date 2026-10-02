@@ -143,7 +143,7 @@ pandoc README.md LITKIT_MAC_GUIDE.md LITKIT_CLUSTER_GUIDE.md \
 
 ## License
 
-LitKit is released under the MIT License; see [LICENSE](LICENSE). LANL software release O5068.
+LitKit is released under the MIT License; see [LICENSE](LICENSE).
 
 © 2026. Triad National Security, LLC. All rights reserved.
 This program was produced under U.S. Government contract 89233218CNA000001 for Los Alamos
@@ -154,3 +154,5 @@ Security Administration. The Government is granted for itself and others acting 
 nonexclusive, paid-up, irrevocable worldwide license in this material to reproduce, prepare
 derivative works, distribute copies to the public, perform publicly and display publicly, and to permit
 others to do so.
+
+LANL software release O5068.
