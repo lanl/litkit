@@ -726,7 +726,7 @@ paper_seg_writer = None
 
 
 # -------------------- LLM defaults --------------------
-# (HPC) production: o3; laptop testing: gpt-oss:20b
+# cluster production: o3; laptop testing: gpt-oss:20b
 DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-oss:20b")
 # default LLM timeout (seconds) for OpenAI client; safe on air-gapped cluster
 OPENAI_TIMEOUT_SEC = int(os.environ.get("LITKIT_OPENAI_TIMEOUT_SEC", "15"))

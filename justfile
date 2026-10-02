@@ -25,7 +25,7 @@
 #     just run python -c 'import sys; print(sys.version)'
 #     just run litkit --version
 #
-# (C) Run with GPU on GH200 (HPC) using CDI + host CUDA 12.5
+# (C) Run with GPU on GH200 using CDI + host CUDA 12.5
 #     module purge; module load cuda/12.5.0
 #     # one-time: ensure your CDI specs dir (e.g. /path/to/cdi-hpc) is correct:
 #     #   nvidia-ctk cdi list --spec-dir=/path/to/cdi-hpc
@@ -78,9 +78,9 @@ workspace-host := justfile_directory() / workspace
 test-tar-shards-host := env("TEST_TAR_SHARDS", "/path/to/test_tar_shards")
 pmc-oa-host          := env("PMC_OA_DIR",      "/path/to/PMC-OA")
 
-# Secrets/LLM (hosted LLM API defaults)
+# Secrets/LLM (any OpenAI-compatible endpoint)
 openai-api-key := env("OPENAI_API_KEY", "")
-openai-base-url := env("OPENAI_BASE_URL", "https://llm.example.com")
+openai-base-url := env("OPENAI_BASE_URL", "http://localhost:1234/v1")
 llm-model := env("LLM_MODEL", "gpt-oss-120b")
 ssl-cert-file := env("SSL_CERT_FILE", "/etc/ssl/certs/ca-bundle.crt")
 llm-api-key-file := env("LLM_API_KEY_FILE", "~/.llm_api_key")

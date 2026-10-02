@@ -174,8 +174,8 @@ monitor_procs() {
 /ram                   ~128G tmpfs   Risky for large files; use only for small temp
 
 # Shared NFS (AVOID for high-churn writes):
-/nfs/home             NFS           Corpus input (/path/to/PMC-OA)
-/nfs/projects         NFS           Current workspace (slow for metadata)
+/nfs/home              NFS           Corpus input (/path/to/PMC-OA)
+/nfs/projects          NFS           Current workspace (slow for metadata)
 ```
 
 ### Why Local Staging is Critical

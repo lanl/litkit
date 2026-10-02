@@ -47,7 +47,7 @@ if [[ -z "$CHRUN" ]]; then
   exit 2
 fi
 
-# HPC-specific paths
+# Site-specific paths (CUSTOMIZE FOR YOUR CLUSTER)
 export LITKIT_REPO="/path/to/litkit"
 export LITKIT_WORKSPACE="${LITKIT_REPO}/workspace"  # Shared NFS workspace (consumer reads from here)
 
@@ -61,7 +61,8 @@ export USE_LOCAL_STAGING="${USE_LOCAL_STAGING:-1}"  # Local SSD staging enabled 
 #   small_test.manifest   (~760 MB, 15-20 min) - quick validation  
 #   medium_test.manifest  (~7 GB, 30-45 min)   - moderate test
 #   large_test.manifest   (~185 GB, 3-5 hours) - full production
-# Tar files referenced by manifests are at: /path/to/PMC-OA
+# Tar files referenced by manifests are at: $CORPUS_DIR (bound into the container at the same path)
+export CORPUS_DIR="${CORPUS_DIR:-/path/to/PMC-OA}"
 MANIFEST_FILE="${MANIFEST:-tiny_test.manifest}"
 export LITKIT_TAR_MANIFEST="${LITKIT_WORKSPACE}/${MANIFEST_FILE}"
 
@@ -233,7 +234,7 @@ run_producer() {
                 --cdi=nvidia.com/gpu=all
                 --bind "${CUDA_LIBA}:${CUDA_LIBA}"
                 --bind "${CUDA_LIBB}:${CUDA_LIBB}"
-                --bind /path/to/PMC-OA:/path/to/PMC-OA
+                --bind "${CORPUS_DIR}:${CORPUS_DIR}"
                 --bind "${LITKIT_WORKSPACE}:${CONTAINER_NFS_WS}"
                 --bind "${HF_HOST}:/app/hf_cache"
             )
@@ -345,7 +346,7 @@ srun -N1 -n1 -w "$CONSUMER_NODE" \
     --cdi=nvidia.com/gpu=all \
     --bind "$CUDA_LIBA:$CUDA_LIBA" \
     --bind "$CUDA_LIBB:$CUDA_LIBB" \
-    --bind /path/to/PMC-OA:/path/to/PMC-OA \
+    --bind "${CORPUS_DIR}:${CORPUS_DIR}" \
     --bind "${LITKIT_WORKSPACE}:/workspace" \
     --bind "$HF_HOST:/app/hf_cache" \
     --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \
@@ -423,7 +424,7 @@ srun -N1 -n1 -w "$CONSUMER_NODE" \
     --cdi=nvidia.com/gpu=all \
     --bind "$CUDA_LIBA:$CUDA_LIBA" \
     --bind "$CUDA_LIBB:$CUDA_LIBB" \
-    --bind /path/to/PMC-OA:/path/to/PMC-OA \
+    --bind "${CORPUS_DIR}:${CORPUS_DIR}" \
     --bind "${LITKIT_WORKSPACE}:/workspace" \
     --bind "$HF_HOST:/app/hf_cache" \
     --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \

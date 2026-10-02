@@ -47,7 +47,7 @@ done
 [[ -n "$CHRUN" ]] || { echo "FATAL: no arch-correct ch-run found" >&2; exit 2; }
 echo "[resume] Using ch-run: $CHRUN"
 
-# Paths (same as vector_build_multi.sbatch)
+# Paths (same as vector_build_multi.sbatch; CUSTOMIZE FOR YOUR CLUSTER)
 export LITKIT_REPO="/path/to/litkit"
 export LITKIT_WORKSPACE="${LITKIT_REPO}/workspace"
 export IMG="${LITKIT_REPO}/sqfs/litkit-v0.3.35-aarch64-lean.sqfs"
@@ -56,6 +56,7 @@ export CUDA_BASE="/path/to/cuda-12.5-host/cuda-12.5"
 export CUDA_LIBA="${CUDA_BASE}/targets/sbsa-linux/lib"
 export CUDA_LIBB="${CUDA_BASE}/lib64"
 export HF_HOST="/path/to/hf_cache_persist"
+export CORPUS_DIR="${CORPUS_DIR:-/path/to/PMC-OA}"
 
 SEG_DIR="${LITKIT_WORKSPACE}/emb_segments"
 
@@ -115,7 +116,7 @@ echo ""
     --cdi=nvidia.com/gpu=all \
     --bind "$CUDA_LIBA:$CUDA_LIBA" \
     --bind "$CUDA_LIBB:$CUDA_LIBB" \
-    --bind /path/to/PMC-OA:/path/to/PMC-OA \
+    --bind "${CORPUS_DIR}:${CORPUS_DIR}" \
     --bind "${LITKIT_WORKSPACE}:/workspace" \
     --bind "$HF_HOST:/app/hf_cache" \
     --set-env="LD_LIBRARY_PATH=$CUDA_LIBA:$CUDA_LIBB" \

@@ -14,7 +14,6 @@ A step-by-step guide for installing and using LitKit on macOS to query scientifi
 8. [Command Reference](#command-reference)
 9. [Troubleshooting](#troubleshooting)
 10. [Tips & Best Practices](#tips--best-practices)
-11. [Appendix A: hosted LLM API Reference](#appendix-a-hosted-llm-api-reference-site-specific)
 
 ---
 
@@ -700,75 +699,7 @@ uv run litkit "What is the main finding?" \
 - **Version**: `litkit --version`
 - **Full help**: `litkit --help`
 - **Author**: William S. Hlavacek (hlavacek@lanl.gov)
-
----
-
-# Appendix A: hosted LLM API Reference (Site-Specific)
-
-> **Note:** This appendix contains site-specific details for using the hosted LLM API.
-> For public releases, this section can be removed entirely.
-
-## Storing Your API Key
-
-```bash
-# Create the key file
-echo "YOUR_API_KEY" > ~/.llm_api_key
-chmod 600 ~/.llm_api_key
-```
-
-> ⚠️ **Security Note**: Store your API key in a file rather than an environment variable.
-> Environment variables set via `export` may appear in shell history files and process
-> listings. Using `$(cat ~/.llm_api_key)` reads the key at runtime without exposing it
-> in logs or history.
-
-## Listing Available Models
-
-```bash
-curl -s -H "Authorization: Bearer $(cat ~/.llm_api_key)" \
-     https://llm.example.com/v1/models | jq '.data[].id'
-```
-
-Example output:
-```
-"gpt-oss-20b"
-"gpt-oss-120b"
-"llama-3-70b"
-...
-```
-
-## Querying with the hosted LLM API
-
-```bash
-litkit "What is the main finding?" \
-       --llm-model gpt-oss-120b \
-       --openai-base-url "https://llm.example.com/v1" \
-       --openai-api-key "$(cat ~/.llm_api_key)"
-```
-
-## Site-Specific Helper Script
-
-```bash
-cat > query-llm.sh << 'EOF'
-#!/bin/bash
-source .venv/bin/activate
-litkit "$1" \
-    --llm-model gpt-oss-120b \
-    --openai-base-url "https://llm.example.com/v1" \
-    --openai-api-key "$(cat ~/.llm_api_key)"
-EOF
-chmod +x query-llm.sh
-
-# Usage:
-./query-llm.sh "What is the main finding?"
-```
-
-## Quick Reference
-
-| Resource | Value |
-|----------|-------|
-| API Endpoint | `https://llm.example.com/v1` |
-| Recommended Model | `gpt-oss-120b` |
-| API Key File | `~/.llm_api_key` |
+- **Issues**: https://github.com/lanl/litkit/issues
 
 ---
 

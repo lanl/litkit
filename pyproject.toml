@@ -8,7 +8,7 @@ version = "0.3.35"
 description = "Literature tooling: ingest, embed, index, answer."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-license = { text = "Proprietary" }
+license = { text = "MIT" }
 authors = [{ name = "William S. Hlavacek", email = "hlavacek@lanl.gov" }]
 
 dependencies = [
@@ -31,6 +31,7 @@ classifiers = [
   "Operating System :: POSIX :: Linux",
   "Operating System :: MacOS",
   "Operating System :: MacOS :: MacOS X",
+  "License :: OSI Approved :: MIT License",
 ]
 
 [project.optional-dependencies]

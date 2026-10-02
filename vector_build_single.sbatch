@@ -119,7 +119,7 @@ fi
 : "${EXTRA_ARGS:=}"
 
 ### ----- CLUSTER PATHS --------------------------------------------------------
-BASE="/path/to"
+BASE="${BASE:-/path/to}"                 # CUSTOMIZE: root holding litkit/, cdi-*/, cuda-12.5-host/, hf_cache_persist/
 LITKIT_DIR="$BASE/litkit"
 IMG="$LITKIT_DIR/sqfs/litkit-v0.3.35-aarch64-lean.sqfs"   # keep in sync with your image
 if [[ "$TARGET" == "gh" ]]; then

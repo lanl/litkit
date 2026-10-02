@@ -246,9 +246,9 @@ ch-run \
 cp question.txt workspace/
 cat workspace/question.txt
 
-# path to file with API key for hosted LLM API
+# path to file with API key for your LLM endpoint
 KEY="$(head -n1 ~/.llm_api_key)"
-# hosted LLM API endpoint 
+# OpenAI-compatible LLM endpoint
 BASE="https://llm.example.com/v1"
 
 cat workspace/question.txt
