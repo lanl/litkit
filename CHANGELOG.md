@@ -47,7 +47,7 @@ internal versions are summarized under 0.3.33.
 
 ### Added
 - `doc_id` column on `papers` (PMC ID, then PMID, then a content hash) for
-  deduplication across producers. Existing databases are migrated automatically.
+  deduplication across producers.
 - Multi-node build options `--embed-producer`, `--consume-only`, and
   `--init-indices-only`, with tar files spread across shards by size.
 - Charliecloud container builds (`Dockerfile.lean`, `justfile`) and Slurm batch
