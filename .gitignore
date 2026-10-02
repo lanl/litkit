@@ -44,3 +44,6 @@ litkit_multi_*.err
 
 # Generated documentation
 #*.pdf
+
+# JOSS paper (kept locally, not tracked)
+paper/
