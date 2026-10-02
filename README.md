@@ -124,7 +124,6 @@ For the complete list, run `litkit --help`.
 ## Documentation
 
 - **Platform Guides:** See [LITKIT_CLUSTER_GUIDE.md](LITKIT_CLUSTER_GUIDE.md) and [LITKIT_MAC_GUIDE.md](LITKIT_MAC_GUIDE.md)
-- **Developer Guide:** See [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) for internals, optimization strategies, and version bump procedures
 
 ### Generating PDF Documentation
 

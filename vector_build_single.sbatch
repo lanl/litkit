@@ -92,7 +92,7 @@ fi
 # Debug mode for parallelism verification (set to 0 for quiet production runs)
 : "${LITKIT_DEBUG:=1}"
 
-# Local staging: use node-local SSD to avoid NFS metadata storm (see BOTTLENECK.md)
+# Local staging: use node-local SSD to avoid NFS metadata storm
 : "${LOCAL_SSD:=/local/scratch}"
 : "${USE_LOCAL_STAGING:=1}"                  # 1 = stage to local SSD, rsync back at end
 : "${LOCAL_SSD_MIN_FREE_GB:=50}"             # Minimum free space required

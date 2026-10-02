@@ -52,7 +52,7 @@ export LITKIT_REPO="/path/to/litkit"
 export LITKIT_WORKSPACE="${LITKIT_REPO}/workspace"  # Shared NFS workspace (consumer reads from here)
 
 # LOCAL STAGING: Use node-local SSD to avoid NFS metadata storm
-# Evidence: 47× faster for small-file creates (see BOTTLENECK.md)
+# Measured ~47× faster than NFS for small-file creates
 export LOCAL_SSD="/local/scratch"
 export USE_LOCAL_STAGING="${USE_LOCAL_STAGING:-1}"  # Local SSD staging enabled by default
 

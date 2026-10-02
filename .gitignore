@@ -48,3 +48,6 @@ litkit_multi_*.err
 # JOSS paper and build script (kept locally, not tracked)
 paper/
 build_paper.sh
+
+# Developer notes, reviews, and refactor logs (kept locally, not tracked)
+dev/
