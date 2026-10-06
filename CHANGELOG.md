@@ -12,6 +12,10 @@ internal versions are summarized under 0.3.33.
 
 ### Changed
 - macOS requires torch ≥ 2.6, which fixes CVE-2025-32434; Linux stays on 2.5.1.
+- torch is loaded only when a model is, so `litkit --version`, `--help` and
+  argument errors return in about 0.1 s instead of 0.5 s.
+- `uv sync` installs the development tools (now a `dev` dependency group), and
+  `uv run pytest` runs the new test suite.
 
 ### Fixed
 - Builds slowed down as the index grew, because every batch scanned the whole FAISS

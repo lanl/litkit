@@ -29,11 +29,11 @@ LitKit uses [uv](https://docs.astral.sh/uv/) and supports Python 3.12 on macOS
 ```sh
 git clone https://github.com/lanl/litkit.git
 cd litkit
-uv sync --extra dev
+uv sync
 ```
 
-`uv sync` makes the environment match exactly the extras you name, so a later
-bare `uv sync` removes the development tools. Pass `--extra dev` every time.
+The development tools are in the `dev` dependency group, which `uv sync` and
+`uv run` install by default. `uv sync --no-dev` leaves them out.
 
 If you change dependencies in `pyproject.toml`, run `uv lock` and commit
 `uv.lock` in the same pull request. `uv lock --check` confirms the lock file is
@@ -52,11 +52,53 @@ unrelated churn makes a pull request hard to review.
 
 ## Testing
 
-LitKit doesn't have a unit test suite yet; contributions toward one are
-especially welcome. Use pytest, and put tests under `tests/`. Tests should run in
-seconds without a GPU, network access, model downloads, or real corpus data.
+```sh
+uv run pytest
+```
 
-To test a change end to end, build a small index and validate it:
+runs the default suite: a few seconds, with no GPU, network access, model files
+or corpus data. Every test gets a fresh workspace under a temporary directory,
+with `LITKIT_*`, `HF_*` and `OPENAI_*` environment variables cleared, so the
+suite never touches a real workspace.
+
+Tests that need more are marked and excluded by default:
+
+| Marker | Needs | Run with |
+|---|---|---|
+| `slow` | real models | `LITKIT_TEST_HF_HOME=/path/to/hf_cache uv run pytest -m slow` |
+| `gpu` | real models and a CUDA or Apple MPS device | `LITKIT_TEST_HF_HOME=/path/to/hf_cache uv run pytest -m gpu` |
+| `network` | network access or an API key | none yet |
+
+`LITKIT_TEST_HF_HOME=/path/to/hf_cache uv run pytest -m ""` runs everything. The `slow` tests load SPECTER2 and
+`all-mpnet-base-v2` from `LITKIT_TEST_HF_HOME`, a Hugging Face cache that holds
+`hub/models--allenai--specter2_base` and
+`hub/models--sentence-transformers--all-mpnet-base-v2`, and skip when it isn't
+set, as they do where torch isn't installed. Markers are strict: a misspelled
+marker is an error.
+
+`tests/conftest.py` has the shared pieces:
+
+- `FakeEmbedder`, with the same `encode()` contract as the real embedders.
+  It returns bag-of-words vectors, so texts that share words score higher, and
+  a retrieval test can have a known right answer without a model.
+- `jats()` and `pubmed_xml()`, which build small article records, and
+  `tiny_corpus`, two tars with edge cases (an empty `<article>`, a missing
+  abstract, a PubMed record, a non-XML member, the same PMCID in both tars).
+- `make_index`, `unit_vectors` and a seeded `rng` for FAISS tests.
+
+`tests/integration/` runs the real CLI in a subprocess with the fake embedders
+(`run_litkit_fake.py`): a build of the tiny corpus, `--update`, and a query.
+
+A test for a known, unfixed bug is marked
+`@pytest.mark.xfail(strict=True, raises=AssertionError, reason="#N: ...")` with
+the issue number. It then fails as soon as the bug is fixed: remove the marker in
+the fix's pull request. `raises=AssertionError` keeps an unrelated crash from
+counting as the expected failure, so inside such a test, check for anything other
+than the bug itself without `assert` (the integration tests' `_ok()` raises
+`CliFailed` when the CLI exits nonzero, and `_check()` raises `WrongResult`). A bug fix needs a test that fails
+without the fix.
+
+To test a change end to end with real models, build a small index and validate it:
 
 ```sh
 uv run ./test_build.sh --clean
