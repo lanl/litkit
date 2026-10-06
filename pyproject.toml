@@ -38,6 +38,10 @@ classifiers = [
 # Dev tools
 dev = ["black", "ruff", "mypy", "pytest"]
 
+[dependency-groups]
+# uv installs this group by default, so a bare `uv sync` or `uv run pytest` gets the dev tools.
+dev = ["litkit[dev]"]
+
 [project.scripts]
 litkit = "litkit.cli:main"
 
@@ -50,6 +54,15 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["litkit*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers -m 'not slow and not gpu and not network'"
+markers = [
+  "slow: real models or builds that take more than a few seconds",
+  "gpu: needs a CUDA or Apple MPS device",
+  "network: needs network access or an API key",
+]
 
 # Formatting / linting
 [tool.black]

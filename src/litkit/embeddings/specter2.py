@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import numpy as np
-import torch
 
 from .base import Embedder
 from .base import inline_progress_renderer as _inline_progress_renderer
@@ -34,6 +33,10 @@ class PaperEmbedderSpecter2(Embedder):
         model_id: str = SPECTER2_ID,
         device: str | None = None,
     ) -> None:
+        # torch is imported here, not at module level, so that importing litkit
+        # (retrieval, build, the CLI) doesn't load torch until a model is built.
+        import torch
+
         self.model_id = model_id
         self.device = device or detect_device()
         local_path = local_snapshot_dir(self.model_id)
@@ -68,6 +71,8 @@ class PaperEmbedderSpecter2(Embedder):
         If progress_label is provided, render a single compact line with updates,
         ending with a newline when finished.
         """
+        import torch
+
         if not texts:
             return np.zeros((0, self.dim), dtype="float32")
 

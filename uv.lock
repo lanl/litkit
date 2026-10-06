@@ -278,6 +278,11 @@ dev = [
     { name = "ruff", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux')" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "litkit", extra = ["dev"], marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux')" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "black", marker = "extra == 'dev'" },
@@ -295,6 +300,9 @@ requires-dist = [
     { name = "transformers", specifier = ">=4.44,<5" },
 ]
 provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "litkit", extras = ["dev"] }]
 
 [[package]]
 name = "lxml"
