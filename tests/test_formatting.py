@@ -29,6 +29,8 @@ def _chunks(*dois):
         ("[1，2、3]", "[1, 2, 3]"),  # fullwidth and ideographic commas
         ("[1†L1–L8]", "[1]"),  # line-location tail removed
         ("[2†L1-L8]", "[2]"),
+        ("[1; 2]", "[1, 2]"),  # semicolon-separated list (#22)
+        ("[1；2、3]", "[1, 2, 3]"),  # CJK semicolon + ideographic comma
         ("[1​]", "[1]"),  # zero-width space stripped
         ("text [Note] more", "text [Note] more"),  # not a citation
         ("【Note】", "[Note]"),  # brackets unified even when not a citation
@@ -38,7 +40,6 @@ def test_normalize_citations_canonical_form(raw, expected):
     assert normalize_citations(raw) == expected
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="#8: ranges cut to first number")
 @pytest.mark.parametrize("cite", ["[1-3]", "[1–3]", "[1, 2-3]"])
 def test_range_citation_survives_the_answer_pipeline(cite):
     """As cli.py runs it: normalize_citations, then normalize_answer_and_build_refs.
@@ -53,10 +54,33 @@ def test_range_citation_survives_the_answer_pipeline(cite):
     assert [r["doi"] for r in refs] == ["a", "b", "c"]
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="#22: prose read as citation")
-@pytest.mark.parametrize("prose", ["[3 patients]", "[95% CI 1.3–3.4]", "[2a]"])
+@pytest.mark.parametrize(
+    "prose",
+    ["[3 patients]", "[95% CI 1.3–3.4]", "[2a]", "[5, 6 of them]"],
+)
 def test_normalize_citations_leaves_prose_alone(prose):
+    # A bracket is a citation only when its whole contents are a numeric list
+    # (#22); prose that merely starts with a number is kept verbatim.
     assert normalize_citations(f"x {prose} y") == f"x {prose} y"
+
+
+def test_semicolon_separated_citation_is_normalized():
+    # #22: accept ";" like "," so "[1; 2]" is a real citation, not prose.
+    assert normalize_citations("Shown before [1; 2].") == "Shown before [1, 2]."
+
+
+def test_prose_bracket_does_not_create_phantom_references():
+    """Regression for #22 through the full cli.py pipeline.
+
+    "[3 patients]" is prose, not a citation to chunk 3, so no reference to the
+    third paper may be invented and the real [1] must keep its number.
+    """
+    chunks = _chunks("a", "b", "c")
+    out, refs = normalize_answer_and_build_refs(
+        normalize_citations("Responders [3 patients] improved [1]."), chunks
+    )
+    assert out == "Responders [3 patients] improved [1]."
+    assert [r["doi"] for r in refs] == ["a"]
 
 
 @pytest.mark.parametrize("z", ["\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"])
