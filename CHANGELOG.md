@@ -20,6 +20,11 @@ internal versions are summarized under 0.3.33.
 ### Fixed
 - Builds slowed down as the index grew, because every batch scanned the whole FAISS
   index twice to remove IDs. `--rebuild` now skips the scan, and updates scan once.
+- `normalize_citations()` no longer reads bracketed prose that merely starts with a
+  number ("[3 patients]", "[95% CI 1.3–3.4]", "[2a]") as a citation, which had been
+  inventing references and renumbering the real ones. Numeric lists may now also be
+  separated by `;` and include ranges ("[1; 2-3]") or location tails ("[1–3†L3-L6]").
+  Range expansion is limited to the selected chunks. (#22, #8)
 
 ## [0.3.35] - 2025-12-24
 
