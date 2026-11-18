@@ -220,7 +220,7 @@ def render_references(doc_refs: list[dict[str, Any]]) -> str:
             id_parts.append(f"PMCID: {pmcid}")
         if pmid:
             id_parts.append(f"PMID: {pmid}")
-        id_str = (". " + ", ".join(id_parts)) if id_parts else ""
+        id_str = (" " + ", ".join(id_parts)) if id_parts else ""
 
         lines.append(f"[{n}] {title}{year_str}.{id_str}")
 

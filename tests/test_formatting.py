@@ -160,7 +160,6 @@ def test_uncited_chunks_are_not_referenced():
 # ------------------------------------------------------------------ render_references
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="#23: two periods before ids")
 def test_render_references_full_text():
     refs = [
         {"docnum": 2, "paper_title": "B", "year": None, "pmcid": "PMC2", "pmid": "22"},
