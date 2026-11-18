@@ -62,7 +62,7 @@ def _doc_key(ch: dict[str, Any]) -> str:
     return f"title:{title}" if title else f"rowid:{id(ch)}"
 
 
-def _expand_ranges(nums: str) -> list[int]:
+def _expand_ranges(nums: str, chunk_count: int) -> list[int]:
     """Turn strings like '1-3, 5, 7–8' into [1,2,3,5,7,8].
     Accepts hyphen '-', en dash '–', and em dash '—' as range separators.
     Accepts ASCII comma ',' and common CJK commas.
@@ -76,7 +76,7 @@ def _expand_ranges(nums: str) -> list[int]:
         if m:
             a, b = int(m.group(1)), int(m.group(2))
             lo, hi = (a, b) if a <= b else (b, a)
-            out.extend(range(lo, hi + 1))
+            out.extend(range(max(1, lo), min(hi, chunk_count) + 1))
         else:
             if part.isdigit():
                 out.append(int(part))
@@ -128,7 +128,7 @@ def normalize_answer_and_build_refs(
     # First pass: discover order of first mentions (assign doc numbers)
     def _discover(match: re.Match) -> str:
         nums = match.group("a") or match.group("b") or ""
-        for n in _expand_ranges(nums):
+        for n in _expand_ranges(nums, len(selected_chunks)):
             if 1 <= n <= len(selected_chunks):
                 k = idx2key[n]
                 if k not in key2docnum:
@@ -142,7 +142,7 @@ def normalize_answer_and_build_refs(
     def _replace(match: re.Match) -> str:
         nums = match.group("a") or match.group("b") or ""
         mapped = []
-        for n in _expand_ranges(nums):
+        for n in _expand_ranges(nums, len(selected_chunks)):
             dn = chunk2docnum.get(n)
             if dn is not None:
                 mapped.append(dn)

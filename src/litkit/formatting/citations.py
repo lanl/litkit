@@ -3,48 +3,40 @@
 Normalizes LLM-generated citations (e.g., [1], [2†L1-L8]) into a canonical
 format for downstream bibliography matching.
 """
+
 import re
 import unicodedata
 
 # Regex for line-location tails like "†L1–L8" in citations
-_CITATION_LINELOC = re.compile(
-    r"([\[【]\s*\d+)\s*†L\d+(?:[–—-]\d+)?(\s*[】\]])"
-)
+_CITATION_LINELOC = re.compile(r"([\[【]\s*\d+)\s*†L\d+(?:[–—-]\d+)?(\s*[】\]])")
 
 # General bracket grabber for rebuilding citations
-_CITATION_ANYBR = re.compile(
-    r"(?P<open>[\[【])(?P<inside>[^\[\]【】]{0,200}?)(?P<close>[】\]])"
-)
+_CITATION_ANYBR = re.compile(r"(?P<open>[\[【])(?P<inside>[^\[\]【】]{0,200}?)(?P<close>[】\]])")
 
-# Leading numeric list pattern (supports ASCII/CJK commas and semicolons)
-_LEADING_NUM_LIST = re.compile(r"^\s*(\d+(?:\s*[，、,;；]\s*\d+)*)")
-
-# A bracket is a citation only when its *entire* contents are a numeric list,
-# optionally followed by a location tail ("†L1–L8", ":0†source").
-# Prose that merely starts with a number ("[3 patients]", "[95% CI 1.3–3.4]",
-# "[2a]") is left untouched (see #22). Ranges such as "[1-3]" are passed through
-# instead of being cut to their first number, so the answer pipeline can expand
-# them (see #8, which shares this regex and lands together).
+# Require the entire bracket to be a citation so prose such as "[3 patients]"
+# stays intact. Keep range endpoints for the answer parser to expand.
+_CITATION_ITEM = r"\d+(?:\s*[-–—]\s*\d+)?"
+_LIST_SEPARATOR = r"[，、,;；]"
 _CITATION_LIST = re.compile(
-    r"^\s*\d+(?:\s*[，、,;；]\s*\d+)*"
-    r"(?:\s*(?:†L\d+(?:[–—-]L?\d+)?|:\d+†\S+))?\s*$"
+    rf"\s*(?P<items>{_CITATION_ITEM}(?:\s*{_LIST_SEPARATOR}\s*{_CITATION_ITEM})*)"
+    r"(?:\s*(?:†L\d+(?:[–—-]L?\d+)?|:\d+†\S+))?\s*"
 )
 
 
 def normalize_citations(text: str) -> str:
     """Canonically normalize bracketed numeric citations.
-    
+
     1. Convert fullwidth brackets to ASCII [ ]
     2. Remove '†Lx–Ly' / location tails by only keeping the numeric list
     3. Normalize separators/spacing, de-duplicate while preserving order;
        brackets that are not a pure numeric list are left untouched
-    
+
     Args:
         text: Raw text containing citations like [1], [2†L1-L8], etc.
-    
+
     Returns:
         Text with normalized citations like [1], [2]
-    
+
     Examples:
         "[1†L1–L8]" -> "[1]"
         "【1, 2, 1】" -> "[1, 2]"
@@ -68,27 +60,13 @@ def normalize_citations(text: str) -> str:
     # Rebuild each bracketed group, but only when the whole bracket is a
     # numeric citation list. Ordinary prose is left exactly as written.
     def _rebuild(m: re.Match) -> str:
-        inside = m.group("inside")
-        if not _CITATION_LIST.match(inside):
-            # Not a numeric citation; leave untouched (e.g., [Note], [3 patients])
+        citation = _CITATION_LIST.fullmatch(m.group("inside"))
+        if citation is None:
             return m.group(0)
 
-        lead = _LEADING_NUM_LIST.match(inside)
-        nums_str = lead.group(1)
-        parts = [p.strip() for p in re.split(r"[，、,;；]", nums_str) if p.strip()]
-
-        out, seen = [], set()
-        for p in parts:
-            if p.isdigit():
-                n = int(p)
-                if n not in seen:
-                    seen.add(n)
-                    out.append(n)
-
-        if not out:
-            # Nothing numeric survived; drop the brackets
-            return ""
-
-        return "[" + ", ".join(str(n) for n in out) + "]"
+        items = re.split(_LIST_SEPARATOR, citation.group("items"))
+        # Canonical decimal IDs preserve the original handling of leading zeros.
+        normalized = (re.sub(r"\d+", lambda n: str(int(n[0])), item.strip()) for item in items)
+        return "[" + ", ".join(dict.fromkeys(normalized)) + "]"
 
     return _CITATION_ANYBR.sub(_rebuild, s)

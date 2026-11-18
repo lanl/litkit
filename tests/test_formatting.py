@@ -40,7 +40,9 @@ def test_normalize_citations_canonical_form(raw, expected):
     assert normalize_citations(raw) == expected
 
 
-@pytest.mark.parametrize("cite", ["[1-3]", "[1–3]", "[1, 2-3]"])
+@pytest.mark.parametrize(
+    "cite", ["[1-3]", "[1–3]", "[1, 2-3]", "[1; 2-3]", "[1–3†L3-L6]", "【1；2 — 3:0†source】"]
+)
 def test_range_citation_survives_the_answer_pipeline(cite):
     """As cli.py runs it: normalize_citations, then normalize_answer_and_build_refs.
 
@@ -112,6 +114,15 @@ def test_ranges_expand_in_answer_normalization():
     out, refs = normalize_answer_and_build_refs("See [1-3].", _chunks("a", "b", "c"))
     assert out == "See [1, 2, 3]."
     assert [r["doi"] for r in refs] == ["a", "b", "c"]
+
+
+def test_range_expansion_is_bounded_by_selected_chunks():
+    # A range this wide cannot be materialized as a Python list.
+    high = 10**30
+    answer = f"[{high}-2] [0-{high}] [4-{high}]"
+    out, refs = normalize_answer_and_build_refs(answer, _chunks("a", "b", "c"))
+    assert out == f"[1, 2] [3, 1, 2] [4-{high}]"
+    assert [r["doi"] for r in refs] == ["b", "c", "a"]
 
 
 def test_doi_match_ignores_case_and_pmcid_is_uppercased():
