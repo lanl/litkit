@@ -1,0 +1,30 @@
+name: contributors
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: contributors-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  listed:
+    name: contributors listed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            CONTRIBUTORS.md
+            ci/contributors.py
+          sparse-checkout-cone-mode: false
+
+      - name: Every commit author is in CONTRIBUTORS.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ci/contributors.py check --pr ${{ github.event.pull_request.number }}

@@ -124,7 +124,7 @@ For the complete list, run `litkit --help`.
 ## Documentation
 
 - **Platform Guides:** See [LITKIT_CLUSTER_GUIDE.md](LITKIT_CLUSTER_GUIDE.md) and [LITKIT_MAC_GUIDE.md](LITKIT_MAC_GUIDE.md)
-- **Contributing:** See [CONTRIBUTING.md](CONTRIBUTING.md); release notes are in [CHANGELOG.md](CHANGELOG.md)
+- **Contributing:** See [CONTRIBUTING.md](CONTRIBUTING.md) and the [contributor list](CONTRIBUTORS.md). Release notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ### Generating PDF Documentation
 
