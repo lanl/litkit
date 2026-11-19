@@ -16,6 +16,7 @@ import faiss
 
 from litkit.index import (
     add_with_ids_dedup,
+    faiss_load,
     faiss_present_ids,
     faiss_save,
     faiss_save_force,
@@ -232,7 +233,7 @@ def post_build_sanity_check(
     """
     # ----- papers -----
     try:
-        p_idx = faiss.read_index(str(paper_index_path))
+        p_idx = faiss_load(paper_index_path)
     except Exception:
         p_idx = None
     report_faiss_index("papers", paper_index_path)
@@ -250,7 +251,7 @@ def post_build_sanity_check(
 
     # ----- chunks -----
     try:
-        c_idx = faiss.read_index(str(chunk_index_path))
+        c_idx = faiss_load(chunk_index_path)
     except Exception:
         c_idx = None
     report_faiss_index("chunks", chunk_index_path)

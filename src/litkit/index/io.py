@@ -53,6 +53,29 @@ def _assert_faiss_locked() -> None:
         )
 
 
+def _write_index_atomically(index: faiss.Index, path: Path) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    if os.name == "nt":
+        # FAISS 1.8 uses narrow filenames on Windows. Python opens Unicode paths.
+        with tmp.open("wb") as stream:
+            faiss.write_index(index, faiss.PyCallbackIOWriter(stream.write))
+    else:
+        faiss.write_index(index, str(tmp))
+
+    # fsync the temp file before rename for durability
+    try:
+        fd = os.open(str(tmp), os.O_RDWR)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+    os.replace(tmp, path)
+    _maybe_fsync_dir(path)
+
+
 def faiss_save(index: faiss.Index, path: Path) -> bool:
     """Save FAISS index atomically with throttling and fsync.
     
@@ -87,21 +110,7 @@ def faiss_save(index: faiss.Index, path: Path) -> bool:
     if (now - _last_save_ts.get(label, 0.0)) < _SAVE_MIN_SEC:
         return False
     
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    faiss.write_index(index, str(tmp))
-    
-    # fsync the temp file before rename for durability
-    try:
-        fd = os.open(str(tmp), os.O_RDWR)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except Exception:
-        pass
-    
-    os.replace(tmp, path)
-    _maybe_fsync_dir(path)
+    _write_index_atomically(index, path)
     _last_save_ts[label] = now
     return True
 
@@ -128,21 +137,7 @@ def faiss_save_force(index: faiss.Index, path: Path) -> bool:
     """
     _assert_faiss_locked()
     
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    faiss.write_index(index, str(tmp))
-    
-    # fsync the temp file before rename for durability
-    try:
-        fd = os.open(str(tmp), os.O_RDWR)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except Exception:
-        pass
-    
-    os.replace(tmp, path)
-    _maybe_fsync_dir(path)
+    _write_index_atomically(index, path)
     
     label = "papers" if Path(path).name.startswith("papers") else "chunks"
     _last_save_ts[label] = time.time()
@@ -161,6 +156,9 @@ def faiss_load(path: Path) -> faiss.Index:
     Raises:
         FileNotFoundError: If the index file doesn't exist
     """
+    if os.name == "nt":
+        with Path(path).open("rb") as stream:
+            return faiss.read_index(faiss.PyCallbackIOReader(stream.read))
     return faiss.read_index(str(path))
 
 
@@ -193,7 +191,7 @@ def faiss_load_cached(path: Path) -> faiss.Index:
     
     if key not in cache:
         cache.clear()  # Clear on mtime change to avoid memory growth
-        cache[key] = faiss.read_index(str(p))
+        cache[key] = faiss_load(p)
     
     return cache[key]
 

@@ -15,6 +15,7 @@ from litkit.index.constants import (
     INDEX_KIND_IVF,
     INDEX_KIND_UNKNOWN,
 )
+from litkit.index.io import faiss_load
 
 
 def _eprint(msg: str = "", *, end: str = "\n") -> None:
@@ -184,7 +185,7 @@ def report_faiss_index(label: str, path: Path) -> None:
         path: Path to the index file
     """
     try:
-        idx = faiss.read_index(str(path))
+        idx = faiss_load(path)
     except Exception as e:
         _eprint(
             f"[faiss] {label}: (could not load index: {e.__class__.__name__})"
