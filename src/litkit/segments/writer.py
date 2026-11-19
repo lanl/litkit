@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import sys
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,15 @@ def _eprint(msg: str = "", *, end: str = "\n") -> None:
         sys.stderr.flush()
     except Exception:
         pass
+
+
+def _write_segment(path: Path, **arrays: np.ndarray) -> None:
+    """Close the writable handle before the pending file can be renamed."""
+    with path.open("wb") as segment:
+        np.savez_compressed(segment, **arrays)
+        segment.flush()
+        with suppress(OSError):  # fsync is best effort on shared filesystems.
+            os.fsync(segment.fileno())
 
 
 def cleanup_orphan_pending_files(outdir: Path, kinds: list[str] | None = None) -> int:
@@ -210,22 +220,13 @@ class SegmentWriter:
         filename = f"{prefix}_{seg_id}{PENDING_SUFFIX}{SEGMENT_EXTENSION}"
         path = self.outdir / filename
         
-        # Save to disk with fsync for durability
-        np.savez_compressed(
+        _write_segment(
             path,
             doc_ids=np.array(self._doc_ids, dtype=object),
             vecs=X,  # Use 'vecs' key for consistency with ingest.py
             kind=np.array(self.kind),
         )
-        
-        # fsync to ensure durability before we consider it "written"
-        try:
-            fd = os.open(path, os.O_RDONLY)
-            os.fsync(fd)
-            os.close(fd)
-        except Exception:
-            pass
-        
+
         n = len(self._doc_ids)
         _eprint(f"[segment] Wrote {n} {self.kind} embeddings to {filename} (pending)")
         
@@ -442,23 +443,14 @@ class ChunkSegmentWriter:
         filename = f"{CHUNK_SEGMENT_PREFIX}_{seg_id}{PENDING_SUFFIX}{SEGMENT_EXTENSION}"
         path = self.outdir / filename
         
-        # Save to disk with fsync for durability
-        np.savez_compressed(
+        _write_segment(
             path,
             paper_doc_ids=np.array(self._doc_ids, dtype=object),
             ords=np.array(self._ords, dtype="int32"),
             vecs=X,
             kind=np.array("chunks"),
         )
-        
-        # fsync to ensure durability before we consider it "written"
-        try:
-            fd = os.open(path, os.O_RDONLY)
-            os.fsync(fd)
-            os.close(fd)
-        except Exception:
-            pass
-        
+
         n = len(self._doc_ids)
         _eprint(f"[segment] Wrote {n} chunk embeddings to {filename} (pending)")
         

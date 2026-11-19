@@ -46,7 +46,7 @@ endpoint returns up to 250 commits. Check additional commits and
 ## Development setup
 
 LitKit uses [uv](https://docs.astral.sh/uv/) and supports Python 3.12 on macOS
-(Apple Silicon) and Linux (aarch64). Install LitKit with the development tools
+(Apple Silicon), Linux (aarch64), and Windows x64 (CPU). Install LitKit with the development tools
 (ruff, black, mypy, pytest):
 
 ```sh
@@ -111,6 +111,8 @@ marker is an error.
 
 `tests/integration/` runs the real CLI in a subprocess with the fake embedders
 (`run_litkit_fake.py`): a build of the tiny corpus, `--update`, and a query.
+The Windows CI job also runs `uv run pytest -m slow tests/integration/test_cpu_install.py`.
+It builds and queries through the installed CLI with tiny local transformer weights on CPU.
 
 A test for a known, unfixed bug is marked
 `@pytest.mark.xfail(strict=True, raises=AssertionError, reason="#N: ...")` with
