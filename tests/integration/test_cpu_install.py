@@ -71,7 +71,7 @@ def test_installed_cpu_build_and_search(tmp_path):
 
     corpus = tmp_path / "input articles"
     corpus.mkdir()
-    passage = "The lunar rock sample contained basalt with a distinctive β-phase beneath the surface."
+    passage = "The lunar rock contained basalt with a distinctive β-phase beneath the surface."
     article = jats(
         pmcid="PMC101", title="Lunar rock", abstract="A basalt sample.", paragraphs=[passage]
     )
@@ -95,8 +95,12 @@ def test_installed_cpu_build_and_search(tmp_path):
             [cli, *args], cwd=tmp_path, env=env, capture_output=True, timeout=120
         )
         assert result.returncode == 0, result.stderr.decode("utf-8", errors="backslashreplace")
-        return result.stdout.decode("utf-8")
+        return result
 
-    run("--build-only", "--faiss-writer", "--tar-dir", str(corpus), "--chunks-index", "flat")
-    output = run("--no-llm", "lunar rock basalt")
+    build = run(
+        "--build-only", "--faiss-writer", "--tar-dir", str(corpus), "--chunks-index", "flat"
+    )
+    assert b"[summary] papers: db=1 in_index=1 faiss_ntotal=1" in build.stderr
+    assert b"[faiss] chunks: FLAT" in build.stderr
+    output = run("--no-llm", "lunar rock basalt").stdout.decode("utf-8")
     assert "PMC101" in output and passage in output

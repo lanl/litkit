@@ -1598,6 +1598,16 @@ def get_chunks(conn, ids: list[int]) -> list[dict[str, str]]:
 # -------------------- Main --------------------
 def main():
     """CLI entry point."""
+    # Windows pipes default to the ANSI code page, which can lose scientific text.
+    if (
+        os.name == "nt"
+        and sys.stdout is not None
+        and sys.stdout is sys.__stdout__
+        and not sys.stdout.isatty()
+        and not os.environ.get("PYTHONIOENCODING")
+    ):
+        sys.stdout.reconfigure(encoding="utf-8", errors=sys.stdout.errors)
+
     # Check Python version at runtime (moved from import-time for import purity)
     if sys.version_info < (3, 10):
         sys.stderr.write("[env] Python >= 3.10 required.\n")
