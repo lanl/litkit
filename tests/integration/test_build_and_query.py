@@ -143,6 +143,15 @@ def test_build_counts_match_between_db_and_indexes(built):
     assert rows == [(v["pmcid"], v["pmid"], v["title"]) for v in CORPUS.values()]
 
 
+def test_reconcile_only_can_run_without_explicit_writer_flag(built):
+    ws, _ = built
+    _ok(litkit(ws, "--reconcile-only"))
+    question, title = QUESTIONS[1]
+    proc = _ok(litkit(ws, "--no-llm", "--top-papers", "1", "--per-paper-cap", "0", question))
+    assert set(_context_titles(proc.stdout)) == {title}
+    assert CORPUS["egfr"]["paragraphs"][0] in proc.stdout
+
+
 def test_index_ids_are_database_ids(built):
     ws, _ = built
     from litkit.index.introspection import faiss_present_ids

@@ -356,7 +356,7 @@ def _maybe_cleanup_own_stale_guard():
         pass
 
 
-def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
+def _create_writer_guard_or_exit(*, ttl_sec: int | None = None):
     """Create a writer guard file or exit if another writer is active.
     
     Stdlib imports (atexit, errno, signal, socket, time) are deferred to this function
@@ -399,11 +399,9 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
     if os.name == "nt":
         # Windows owns the guard for the process lifetime, including crash cleanup.
         # In particular, os.kill(pid, 0) is not a liveness probe on Windows.
-        LockManager.from_paths(paths).create_writer_guard_or_exit(getattr(args, "faiss_writer", False))
+        LockManager.from_paths(paths).create_writer_guard_or_exit(faiss_writer=True)
         return
     _maybe_cleanup_own_stale_guard()
-    if not getattr(args, "faiss_writer", False):
-        return
     if ttl_sec is None:
         try:
             # Default TTL=0 (disabled) for safety in multi-host HPC environments.
@@ -2175,7 +2173,9 @@ def main():
     # where _load_heavy_deps() is already called. This allows fast exits for other
     # validation errors without paying the import penalty.
 
-    _create_writer_guard_or_exit(args)
+    # Reconciliation backfills and saves both indices, even without --faiss-writer.
+    if args.faiss_writer or args.reconcile_only:
+        _create_writer_guard_or_exit()
 
     if args.hnsw_recall == "high" and args.papers_index == "hnsw":
         args.hnsw_m = max(args.hnsw_m, 48)

@@ -12,10 +12,9 @@ from litkit.concurrent import FileLock
 GUARD_OWNER = """
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from litkit.cli import _create_writer_guard_or_exit
 
-_create_writer_guard_or_exit(SimpleNamespace(faiss_writer=True))
+_create_writer_guard_or_exit()
 Path(sys.argv[1]).touch()
 input()
 """
@@ -48,16 +47,17 @@ def test_second_writer_is_refused_and_can_restart(isolated_env, abrupt):
     with subprocess.Popen(owner_cmd, env=env, stdin=subprocess.PIPE, text=True) as owner:
         try:
             wait_for_marker(ready, owner)
-            contender = subprocess.run(
-                [sys.executable, "-m", "litkit", "--init-indices-only", "--faiss-writer"],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            assert contender.returncode == 2, contender.stderr
-            assert "Another FAISS writer" in contender.stderr
-            assert owner.poll() is None
+            for flags in (["--init-indices-only", "--faiss-writer"], ["--reconcile-only"]):
+                contender = subprocess.run(
+                    [sys.executable, "-m", "litkit", *flags],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                assert contender.returncode == 2, contender.stderr
+                assert "Another FAISS writer" in contender.stderr
+                assert owner.poll() is None
         finally:
             if abrupt:
                 owner.kill()
