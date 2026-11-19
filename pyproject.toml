@@ -19,7 +19,11 @@ dependencies = [
   "sentence-transformers>=3.1,<4",
   "transformers>=4.44,<5",
   "openai>=1,<2",
-  "faiss-cpu>=1.8,<1.9",
+  "faiss-cpu>=1.8,<1.9; sys_platform != 'win32'",
+  # The Windows post1 wheel crashes on HNSW inserts. 1.8.0 imports packaging
+  # without declaring it in its wheel metadata.
+  "faiss-cpu==1.8.0; sys_platform == 'win32'",
+  "packaging; sys_platform == 'win32'",
   "torch>=2.5.1",
 ]
 
@@ -27,6 +31,7 @@ dependencies = [
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.12",
+  "Operating System :: Microsoft :: Windows",
   "Operating System :: POSIX",
   "Operating System :: POSIX :: Linux",
   "Operating System :: MacOS",
@@ -100,13 +105,14 @@ human_reviewed = true
 # Only resolve for the platform/arch/Python we actually ship.
 environments = [
   "sys_platform == 'linux' and platform_machine == 'aarch64' and python_full_version >= '3.12' and python_full_version < '3.13'",
-  "sys_platform == 'darwin' and platform_machine == 'arm64' and python_full_version >= '3.12' and python_full_version < '3.13'"
+  "sys_platform == 'darwin' and platform_machine == 'arm64' and python_full_version >= '3.12' and python_full_version < '3.13'",
+  "sys_platform == 'win32' and (platform_machine == 'AMD64' or platform_machine == 'x86_64')",
 ]
 
-# Platform-specific overrides: macOS needs torch 2.6+ to avoid CVE-2025-32434 security block
-# (transformers blocks torch.load on .bin files in torch <2.6)
+# The laptop builds need torch 2.6+ to load .bin weights with transformers.
+# Linux ARM64 uses the torch build supplied by its container.
 override-dependencies = [
-  "torch>=2.6 ; sys_platform == 'darwin'",
+  "torch>=2.6 ; sys_platform == 'darwin' or sys_platform == 'win32'",
 ]
 
 # Tell uv exactly where to get torch. This enforces our CUDA 12.5.0 build.

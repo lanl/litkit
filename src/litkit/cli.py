@@ -91,7 +91,7 @@ from litkit.progress import (
 )
 from litkit.concurrent import (
     FileLock as _FileLockBase,
-    FLOCK_AVAILABLE,
+    LockManager,
 )
 
 # Type hints only - not imported at runtime
@@ -395,7 +395,12 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
     import socket
     import time
     
-    get_runtime()  # ensure WRITER_GUARD is bound
+    paths = get_runtime()
+    if os.name == "nt":
+        # Windows owns the guard for the process lifetime, including crash cleanup.
+        # In particular, os.kill(pid, 0) is not a liveness probe on Windows.
+        LockManager.from_paths(paths).create_writer_guard_or_exit(getattr(args, "faiss_writer", False))
+        return
     _maybe_cleanup_own_stale_guard()
     if not getattr(args, "faiss_writer", False):
         return
@@ -2124,20 +2129,6 @@ def main():
     PAPER_BATCH = int(args.paper_batch)
     CHUNK_BATCH = int(args.chunk_batch)
     CKPT_EVERY = int(args.ckpt_every)
-
-    # Windows gating
-    if not FLOCK_AVAILABLE and sys.platform.startswith("win"):
-        if args.faiss_writer or args.embed_producer or args.consume_segments:
-            sys.stderr.write(
-                "[lock] This run needs POSIX flock (writer/producer modes), "
-                "which is unavailable on Windows. "
-                "Please run on Linux/macOS for indexing/segment ingestion.\n"
-                "Tip: you can still query with --no-llm or do non-mutating reads on Windows.\n"
-            )
-            sys.exit(2)
-        else:
-            # allow read-only flows, --version, help, etc.
-            pass
 
     # ---- Validate mutually exclusive flag combinations ----
     if args.embed_producer and args.faiss_writer:

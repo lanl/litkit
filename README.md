@@ -46,6 +46,9 @@ cd litkit
 uv sync
 ```
 
+On Windows x64, run the same install commands in PowerShell. Use Python 3.12 and
+`uv run litkit` to invoke the CPU build in the project environment.
+
 ### Build Index
 
 ```bash

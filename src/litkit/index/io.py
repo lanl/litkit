@@ -92,7 +92,7 @@ def faiss_save(index: faiss.Index, path: Path) -> bool:
     
     # fsync the temp file before rename for durability
     try:
-        fd = os.open(str(tmp), os.O_RDONLY)
+        fd = os.open(str(tmp), os.O_RDWR)
         try:
             os.fsync(fd)
         finally:
@@ -133,7 +133,7 @@ def faiss_save_force(index: faiss.Index, path: Path) -> bool:
     
     # fsync the temp file before rename for durability
     try:
-        fd = os.open(str(tmp), os.O_RDONLY)
+        fd = os.open(str(tmp), os.O_RDWR)
         try:
             os.fsync(fd)
         finally:

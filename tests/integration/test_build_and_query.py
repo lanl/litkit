@@ -115,7 +115,7 @@ def _check(ok, message):
 @pytest.mark.parametrize("paper_index", ["flat", "hnsw"])
 def test_build_and_query_with_each_paper_index(isolated_env, corpus_dir, paper_index):
     """Control for the xfails below: HNSW is the default paper index."""
-    ws = isolated_env
+    ws = isolated_env / "library with spaces"
     args = ["--build-only", "--faiss-writer", "--rebuild", "--tar-dir", str(corpus_dir)]
     _ok(litkit(ws, *args, "--chunks-index", "flat", "--papers-index", paper_index))
     assert _ntotal(ws, "papers.faiss") == EXPECTED_PAPERS
@@ -123,9 +123,10 @@ def test_build_and_query_with_each_paper_index(isolated_env, corpus_dir, paper_i
     from litkit.index.introspection import kind_and_core
 
     assert kind_and_core(faiss.read_index(str(ws / "indices" / "papers.faiss")))[0] == paper_index
-    question, title = QUESTIONS[0]
+    question, title = QUESTIONS[1]
     proc = _ok(litkit(ws, "--no-llm", "--top-papers", "1", "--per-paper-cap", "0", question))
     assert set(_context_titles(proc.stdout)) == {title}
+    assert CORPUS["egfr"]["paragraphs"][0] in proc.stdout
 
 
 def test_build_counts_match_between_db_and_indexes(built):
