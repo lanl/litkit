@@ -336,7 +336,8 @@ requires-dist = [
     { name = "safetensors", specifier = ">=0.4,<1" },
     { name = "sentence-transformers", specifier = ">=3.1,<4" },
     { name = "sympy", specifier = "==1.13.1" },
-    { name = "torch", specifier = ">=2.5.1" },
+    { name = "torch", marker = "sys_platform != 'darwin' and sys_platform != 'win32'", specifier = ">=2.5.1" },
+    { name = "torch", marker = "sys_platform == 'darwin' or sys_platform == 'win32'", specifier = ">=2.6" },
     { name = "transformers", specifier = ">=4.44,<5" },
 ]
 provides-extras = ["dev"]

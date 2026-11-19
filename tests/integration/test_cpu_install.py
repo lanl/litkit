@@ -3,11 +3,25 @@
 import os
 import subprocess
 import sys
+from importlib.metadata import requires
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
 
 from conftest import jats, write_tar
+
+
+@pytest.mark.parametrize("platform", ["win32", "darwin"])
+def test_laptop_wheel_requires_torch_for_specter2_weights(platform):
+    requirements = map(Requirement, requires("litkit"))
+    (torch_requirement,) = [
+        req
+        for req in requirements
+        if req.name == "torch"
+        and (req.marker is None or req.marker.evaluate({"sys_platform": platform}))
+    ]
+    assert "2.5.1" not in torch_requirement.specifier
 
 
 @pytest.mark.slow
@@ -49,7 +63,10 @@ def test_installed_cpu_build_and_search(tmp_path):
             / "snapshots"
             / "tiny"
         )
-        model.save_pretrained(snapshot)
+        # Distributed SPECTER2 weights use pytorch_model.bin. MPNet has safetensors.
+        # The Linux container supplies its own converted SPECTER2 safetensors.
+        use_bin_weights = model_id == SPECTER2_ID and sys.platform in ("win32", "darwin")
+        model.save_pretrained(snapshot, safe_serialization=not use_bin_weights)
         tokenizer.save_pretrained(snapshot)
 
     corpus = tmp_path / "input articles"

@@ -24,7 +24,9 @@ dependencies = [
   # without declaring it in its wheel metadata.
   "faiss-cpu==1.8.0; sys_platform == 'win32'",
   "packaging; sys_platform == 'win32'",
-  "torch>=2.5.1",
+  # Transformers needs torch 2.6+ to load SPECTER2's .bin weights on laptops.
+  "torch>=2.6; sys_platform == 'win32' or sys_platform == 'darwin'",
+  "torch>=2.5.1; sys_platform != 'win32' and sys_platform != 'darwin'",
 ]
 
 # Advertise supported operating systems (informational)
@@ -109,8 +111,8 @@ environments = [
   "sys_platform == 'win32' and (platform_machine == 'AMD64' or platform_machine == 'x86_64')",
 ]
 
-# The laptop builds need torch 2.6+ to load .bin weights with transformers.
-# Linux ARM64 uses the torch build supplied by its container.
+# Linux ARM64 supplies torch in the container. Resolve torch only for laptops.
+# Keep this lockfile override in sync with the wheel requirements above.
 override-dependencies = [
   "torch>=2.6 ; sys_platform == 'darwin' or sys_platform == 'win32'",
 ]
