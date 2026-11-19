@@ -71,27 +71,31 @@ def test_installed_cpu_build_and_search(tmp_path):
 
     corpus = tmp_path / "input articles"
     corpus.mkdir()
-    passage = "The lunar rock sample contained a distinctive layer of basalt beneath the surface."
+    passage = "The lunar rock sample contained basalt with a distinctive β-phase beneath the surface."
     article = jats(
         pmcid="PMC101", title="Lunar rock", abstract="A basalt sample.", paragraphs=[passage]
     )
     write_tar(corpus / "sample.tar", {"sample.nxml": article})
 
-    workspace = tmp_path / "index with spaces"
+    workspace = tmp_path / "文献 index with spaces"
     env = dict(
         os.environ,
         LITKIT_WORKSPACE=str(workspace),
         HF_HOME=str(tmp_path / "hf"),
         LITKIT_FORCE_DEVICE="cpu",
     )
+    if os.name == "nt":
+        # Exercise ordinary Windows pipes even if the runner enabled Python's UTF-8 mode.
+        env.pop("PYTHONIOENCODING", None)
+        env["PYTHONUTF8"] = "0"
     cli = Path(sys.executable).with_name("litkit.exe" if os.name == "nt" else "litkit")
 
     def run(*args):
         result = subprocess.run(
-            [cli, *args], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120
+            [cli, *args], cwd=tmp_path, env=env, capture_output=True, timeout=120
         )
-        assert result.returncode == 0, result.stderr
-        return result.stdout
+        assert result.returncode == 0, result.stderr.decode("utf-8", errors="backslashreplace")
+        return result.stdout.decode("utf-8")
 
     run("--build-only", "--faiss-writer", "--tar-dir", str(corpus), "--chunks-index", "flat")
     output = run("--no-llm", "lunar rock basalt")
