@@ -91,7 +91,7 @@ from litkit.progress import (
 )
 from litkit.concurrent import (
     FileLock as _FileLockBase,
-    FLOCK_AVAILABLE,
+    LockManager,
 )
 
 # Type hints only - not imported at runtime
@@ -356,7 +356,7 @@ def _maybe_cleanup_own_stale_guard():
         pass
 
 
-def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
+def _create_writer_guard_or_exit(*, ttl_sec: int | None = None):
     """Create a writer guard file or exit if another writer is active.
     
     Stdlib imports (atexit, errno, signal, socket, time) are deferred to this function
@@ -395,10 +395,13 @@ def _create_writer_guard_or_exit(args, *, ttl_sec: int | None = None):
     import socket
     import time
     
-    get_runtime()  # ensure WRITER_GUARD is bound
-    _maybe_cleanup_own_stale_guard()
-    if not getattr(args, "faiss_writer", False):
+    paths = get_runtime()
+    if os.name == "nt":
+        # Windows owns the guard for the process lifetime, including crash cleanup.
+        # In particular, os.kill(pid, 0) is not a liveness probe on Windows.
+        LockManager.from_paths(paths).create_writer_guard_or_exit(faiss_writer=True)
         return
+    _maybe_cleanup_own_stale_guard()
     if ttl_sec is None:
         try:
             # Default TTL=0 (disabled) for safety in multi-host HPC environments.
@@ -1595,6 +1598,16 @@ def get_chunks(conn, ids: list[int]) -> list[dict[str, str]]:
 # -------------------- Main --------------------
 def main():
     """CLI entry point."""
+    # Windows pipes default to the ANSI code page, which can lose scientific text.
+    if (
+        os.name == "nt"
+        and sys.stdout is not None
+        and sys.stdout is sys.__stdout__
+        and not sys.stdout.isatty()
+        and not os.environ.get("PYTHONIOENCODING")
+    ):
+        sys.stdout.reconfigure(encoding="utf-8", errors=sys.stdout.errors)
+
     # Check Python version at runtime (moved from import-time for import purity)
     if sys.version_info < (3, 10):
         sys.stderr.write("[env] Python >= 3.10 required.\n")
@@ -2125,20 +2138,6 @@ def main():
     CHUNK_BATCH = int(args.chunk_batch)
     CKPT_EVERY = int(args.ckpt_every)
 
-    # Windows gating
-    if not FLOCK_AVAILABLE and sys.platform.startswith("win"):
-        if args.faiss_writer or args.embed_producer or args.consume_segments:
-            sys.stderr.write(
-                "[lock] This run needs POSIX flock (writer/producer modes), "
-                "which is unavailable on Windows. "
-                "Please run on Linux/macOS for indexing/segment ingestion.\n"
-                "Tip: you can still query with --no-llm or do non-mutating reads on Windows.\n"
-            )
-            sys.exit(2)
-        else:
-            # allow read-only flows, --version, help, etc.
-            pass
-
     # ---- Validate mutually exclusive flag combinations ----
     if args.embed_producer and args.faiss_writer:
         sys.exit(
@@ -2184,7 +2183,9 @@ def main():
     # where _load_heavy_deps() is already called. This allows fast exits for other
     # validation errors without paying the import penalty.
 
-    _create_writer_guard_or_exit(args)
+    # Reconciliation backfills and saves both indices, even without --faiss-writer.
+    if args.faiss_writer or args.reconcile_only:
+        _create_writer_guard_or_exit()
 
     if args.hnsw_recall == "high" and args.papers_index == "hnsw":
         args.hnsw_m = max(args.hnsw_m, 48)

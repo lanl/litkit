@@ -7,6 +7,7 @@ internal versions are summarized under 0.3.33.
 ## [Unreleased]
 
 ### Added
+- Windows x64 CPU builds and queries on Python 3.12, with native locking for writers.
 - Open-source release under the MIT license (LANL O5068).
 - macOS (Apple Silicon) support in `uv.lock`, so `uv sync` installs on a Mac; `install_mac.sh`.
 

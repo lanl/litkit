@@ -4,14 +4,9 @@
 from __future__ import annotations
 
 import logging
-import sys
 from importlib.metadata import PackageNotFoundError, version
 
 from .core.types import Chunk, Document  # dataclasses
-
-# Block unsupported platforms.
-if sys.platform.startswith("win"):
-    raise RuntimeError("litkit supports macOS and Linux only.")
 
 # Be quiet by default; let host app configure handlers.
 logging.getLogger(__name__).addHandler(logging.NullHandler())

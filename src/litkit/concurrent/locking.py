@@ -4,7 +4,7 @@ File-based locking and concurrency control for litkit.
 
 This module centralizes all locking logic that was previously scattered
 throughout cli.py, including:
-- FileLock context manager (POSIX flock with NFS/Windows fallback)
+- FileLock context manager (POSIX flock or Windows byte-range locking)
 - Lock depth tracking for nested acquisition
 - Writer guard management for exclusive FAISS writers
 - Lock ordering enforcement (DB_LOCK before FAISS_LOCK)
@@ -40,17 +40,8 @@ except ModuleNotFoundError:
 
 
 def has_real_file_locks() -> bool:
-    """Return True if real inter-process file locking is available.
-    
-    This is False on Windows (no fcntl) and on filesystems where
-    advisory locking is unsupported (NFS without proper configuration).
-    
-    Use this to:
-    - Decide whether to allow concurrent writers
-    - Emit warnings when running in degraded mode
-    - Adjust behavior in higher-level code paths
-    """
-    return FLOCK_AVAILABLE and not _ADVISORY_LOCK_DISABLED
+    """Return whether the platform supports locking and no fallback has been used."""
+    return not _ADVISORY_LOCK_DISABLED
 
 
 # Track whether we've already warned about degraded mode
@@ -93,9 +84,9 @@ def in_db_lock() -> bool:
 
 # Track advisory lock status
 # Set to True when:
-# - fcntl is unavailable (Windows)
+# - neither flock nor Windows byte-range locking is available
 # - flock raises ENOTSUP/EOPNOTSUPP (NFS without advisory locking)
-_ADVISORY_LOCK_DISABLED = not FLOCK_AVAILABLE
+_ADVISORY_LOCK_DISABLED = not FLOCK_AVAILABLE and os.name != "nt"
 
 
 def _eprint(msg: str = "", *, end: str = "\n") -> None:
@@ -112,10 +103,9 @@ def _eprint(msg: str = "", *, end: str = "\n") -> None:
 # ---------------------------------------------------------------------------
 
 class FileLock:
-    """File-based lock using POSIX flock when available.
+    """Exclusive inter-process lock using flock or Windows byte-range locking.
     
-    Falls back to best-effort (no locking) on Windows or NFS filesystems
-    that don't support advisory locks.
+    On POSIX filesystems without flock support, retain the best-effort fallback.
     
     Usage:
         with FileLock(path):
@@ -152,7 +142,23 @@ class FileLock:
         # This is safer for cross-platform compatibility and external inspection
         self._fd = open(self.path, "a")
 
-        if FLOCK_AVAILABLE and fcntl is not None:
+        if os.name == "nt":
+            import msvcrt
+
+            # The range may extend past EOF. All contenders lock byte zero.
+            # Closing the descriptor releases the lock, including on process exit.
+            try:
+                self._fd.seek(0)
+                while True:
+                    try:
+                        msvcrt.locking(self._fd.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except PermissionError:
+                        time.sleep(0.05)
+            except BaseException:
+                self._fd.close()
+                raise
+        elif FLOCK_AVAILABLE and fcntl is not None:
             try:
                 fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX)
             except OSError as e:
@@ -170,7 +176,7 @@ class FileLock:
                     _DEGRADED_MODE_WARNED = True
                 _ADVISORY_LOCK_DISABLED = True
         else:
-            # No flock available (Windows) - log once
+            # No native lock available - log once
             if not _DEGRADED_MODE_WARNED:
                 _eprint(
                     "[lock] WARNING: Advisory file locking unavailable on "
@@ -245,6 +251,7 @@ class LockManager:
     # Internal state
     _guard_cleanup_registered: bool = field(default=False, init=False)
     _guard_created: bool = field(default=False, init=False)
+    _windows_guard_fd: int | None = field(default=None, init=False)
     
     @classmethod
     def from_paths(cls, paths: "WorkspacePaths") -> "LockManager":
@@ -343,6 +350,11 @@ class LockManager:
         Raises:
             SystemExit: If another active writer holds the guard
         """
+        if os.name == "nt":
+            if faiss_writer:
+                self._acquire_windows_writer_guard()
+            return
+
         self._maybe_cleanup_own_stale_guard()
         
         if not faiss_writer:
@@ -428,9 +440,33 @@ class LockManager:
             )
             sys.exit(2)
     
+    def _acquire_windows_writer_guard(self) -> None:
+        """Keep the guard until the kernel closes the owner's last handle."""
+        try:
+            fd = os.open(
+                self.writer_guard_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_TEMPORARY,
+            )
+        except FileExistsError:
+            _eprint(f"[writer] Another FAISS writer holds the guard at {self.writer_guard_path}.")
+            raise SystemExit(2) from None
+
+        try:
+            os.write(fd, f"{os.getpid()} {socket.gethostname()} {int(time.time())}\n".encode())
+        except BaseException:
+            os.close(fd)
+            raise
+        self._windows_guard_fd = fd
+        if not self._guard_cleanup_registered:
+            atexit.register(self.cleanup_writer_guard)
+            self._guard_cleanup_registered = True
+
     def cleanup_writer_guard(self) -> None:
         """Explicitly clean up the writer guard (for graceful shutdown)."""
-        if self._guard_created:
+        if self._windows_guard_fd is not None:
+            os.close(self._windows_guard_fd)
+            self._windows_guard_fd = None
+        elif self._guard_created:
             self._cleanup_writer_guard()
             self._guard_created = False
 
