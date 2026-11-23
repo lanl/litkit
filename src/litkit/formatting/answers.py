@@ -208,7 +208,9 @@ def render_references(doc_refs: list[dict[str, Any]]) -> str:
         n = d.get("docnum", "?")
         title = (d.get("paper_title") or d.get("title") or "untitled").strip()
         year = d.get("year")
-        year_str = f" ({year})" if year else ""
+        title_and_year = f"{title} ({year})" if year else title
+        if not title_and_year.endswith("."):
+            title_and_year += "."
 
         id_parts: list[str] = []
         doi = (d.get("doi") or "").strip()
@@ -220,9 +222,9 @@ def render_references(doc_refs: list[dict[str, Any]]) -> str:
             id_parts.append(f"PMCID: {pmcid}")
         if pmid:
             id_parts.append(f"PMID: {pmid}")
-        id_str = (". " + ", ".join(id_parts)) if id_parts else ""
+        id_str = (" " + ", ".join(id_parts)) if id_parts else ""
 
-        lines.append(f"[{n}] {title}{year_str}.{id_str}")
+        lines.append(f"[{n}] {title_and_year}{id_str}")
 
     return "\n".join(lines)
 

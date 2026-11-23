@@ -160,7 +160,6 @@ def test_uncited_chunks_are_not_referenced():
 # ------------------------------------------------------------------ render_references
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="#23: two periods before ids")
 def test_render_references_full_text():
     refs = [
         {"docnum": 2, "paper_title": "B", "year": None, "pmcid": "PMC2", "pmid": "22"},
@@ -169,6 +168,18 @@ def test_render_references_full_text():
     assert render_references(refs) == (
         "References\n" "[1] A (2020). DOI: 10.1/a\n" "[2] B. PMCID: PMC2, PMID: 22"
     )
+
+
+@pytest.mark.parametrize(
+    ("identifiers", "expected"),
+    [
+        ({"doi": "10.1/a"}, "[1] Example. DOI: 10.1/a"),
+        ({}, "[1] Example."),
+    ],
+)
+def test_render_references_preserves_period_on_yearless_title(identifiers, expected):
+    ref = {"docnum": 1, "paper_title": "Example.", **identifiers}
+    assert render_references([ref]) == f"References\n{expected}"
 
 
 def test_render_references_order_ids_and_title_fallback():

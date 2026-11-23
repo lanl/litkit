@@ -19,6 +19,8 @@ internal versions are summarized under 0.3.33.
   `uv run pytest` runs the new test suite.
 
 ### Fixed
+- References no longer add a second period before a DOI, PMCID or PMID, or after
+  a yearless title that already ends in a period. (#23)
 - Builds slowed down as the index grew, because every batch scanned the whole FAISS
   index twice to remove IDs. `--rebuild` now skips the scan, and updates scan once.
 - `normalize_citations()` no longer reads bracketed prose that merely starts with a
