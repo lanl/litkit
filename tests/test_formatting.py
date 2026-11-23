@@ -170,6 +170,18 @@ def test_render_references_full_text():
     )
 
 
+@pytest.mark.parametrize(
+    ("identifiers", "expected"),
+    [
+        ({"doi": "10.1/a"}, "[1] Example. DOI: 10.1/a"),
+        ({}, "[1] Example."),
+    ],
+)
+def test_render_references_preserves_period_on_yearless_title(identifiers, expected):
+    ref = {"docnum": 1, "paper_title": "Example.", **identifiers}
+    assert render_references([ref]) == f"References\n{expected}"
+
+
 def test_render_references_order_ids_and_title_fallback():
     """The parts of each line that #23 doesn't affect."""
     refs = [
