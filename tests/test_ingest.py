@@ -35,17 +35,22 @@ def test_parse_jats_fields():
     assert meta["paragraphs"] == CORPUS["hiv"]["paragraphs"]  # ref-list text excluded
 
 
-def test_parse_jats_skips_tables_figures_captions_and_short_paragraphs():
-    long = "x" * 40  # the parser keeps paragraphs of 40+ characters
-    xml = (
-        "<article><front><article-meta><title-group><article-title>T</article-title>"
-        "</title-group></article-meta></front><body>"
-        f"<p>{long}</p><p>{'y' * 39}</p>"
-        f"<table-wrap><p>table {long}</p></table-wrap>"
-        f"<fig><caption><p>figure {long}</p></caption></fig>"
-        "</body></article>"
-    )
-    assert _parse(xml)["paragraphs"] == [long]
+def test_parse_jats_keeps_nonempty_body_paragraphs_in_order():
+    xml = """<article><body><sec>
+        <p>Level  the <italic>base.</italic></p>
+        <p/><p>   </p>
+        <table-wrap><p>Table text.</p></table-wrap>
+        <fig><p>Figure text.</p></fig>
+        <boxed-text><caption><p>Caption text.</p></caption></boxed-text>
+        <ref-list><p>Reference text.</p></ref-list>
+        <p>Record the pressure reading in the log before proceeding.</p>
+        <p>✓</p>
+    </sec></body></article>"""
+    assert _parse(xml)["paragraphs"] == [
+        "Level the base.",
+        "Record the pressure reading in the log before proceeding.",
+        "✓",
+    ]
 
 
 def test_parse_jats_whitespace_is_collapsed():

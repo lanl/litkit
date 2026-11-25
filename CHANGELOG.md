@@ -19,6 +19,8 @@ internal versions are summarized under 0.3.33.
   `uv run pytest` runs the new test suite.
 
 ### Fixed
+- Stage-2 retrieval now includes JATS body paragraphs shorter than 40 characters, even when
+  one line is the entire body. Rebuild existing indexes from their source archives to include these passages. (#32)
 - References no longer add a second period before a DOI, PMCID or PMID, or after
   a yearless title that already ends in a period. (#23)
 - Builds slowed down as the index grew, because every batch scanned the whole FAISS

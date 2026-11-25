@@ -143,6 +143,39 @@ def test_build_counts_match_between_db_and_indexes(built):
     assert rows == [(v["pmcid"], v["pmid"], v["title"]) for v in CORPUS.values()]
 
 
+def test_short_jats_paragraphs_reach_the_body_index(isolated_env, tmp_path):
+    from litkit.index.introspection import faiss_present_ids
+
+    ws = isolated_env
+    tars = tmp_path / "tars"
+    tars.mkdir()
+    articles = {
+        "Alignment notes": ["Level the base."],
+        "Bench notes": [
+            "Close the inlet valve.",
+            "Record the pressure reading in the log before proceeding.",
+        ],
+    }
+    members = {
+        f"{title}.xml": jats(title=title, abstract="Maintenance checklist.", paragraphs=paragraphs)
+        for title, paragraphs in articles.items()
+    }
+    write_tar(tars / "notes.tar", members)
+    _ok(litkit(ws, "--build-only", "--faiss-writer", "--tar-dir", str(tars), *FLAT))
+
+    with _db(ws) as conn:
+        rows = conn.execute(
+            "SELECT p.title, c.text, c.id FROM chunks c JOIN papers p ON p.id = c.paper_id "
+            "WHERE c.ord >= 0 ORDER BY p.title, c.ord"
+        ).fetchall()
+    assert [(title, text) for title, text, _ in rows] == [
+        (title, " ".join(articles[title])) for title in sorted(articles)
+    ]
+    indexed = faiss_present_ids(faiss.read_index(str(ws / "indices" / "chunks.faiss")))
+    assert indexed is not None
+    assert {chunk_id for _, _, chunk_id in rows} <= indexed
+
+
 def test_reconcile_only_can_run_without_explicit_writer_flag(built):
     ws, _ = built
     _ok(litkit(ws, "--reconcile-only"))
