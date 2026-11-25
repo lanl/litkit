@@ -160,8 +160,8 @@ def jats(pmcid="", pmid="", title="", abstract="", paragraphs=()):
         f"<title-group><article-title>{title}</article-title></title-group>"
         f"{abs_xml}</article-meta></front>"
         f"<body><sec><title>Results</title>{body}</sec></body>"
-        "<back><ref-list><ref><mixed-citation>Ref text that must not be a paragraph, "
-        "long enough to pass the 40-character filter.</mixed-citation></ref></ref-list></back>"
+        "<back><ref-list><ref><mixed-citation>Reference text outside the body."
+        "</mixed-citation></ref></ref-list></back>"
         "</article>"
     )
 

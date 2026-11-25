@@ -78,8 +78,8 @@ class ArticleMeta(TypedDict):
     abstract : str
         Abstract text with whitespace normalized; empty string if missing.
     paragraphs : list[str]
-        Body paragraphs (whitespace-normalized), excluding figures/tables/captions/refs.
-        Entries are typically >= 40 characters as filtered by the parser.
+        Nonempty, whitespace-normalized body paragraphs in document order,
+        excluding figures/tables/captions/refs.
     """
 
     pmid: str
@@ -156,7 +156,7 @@ def parse_jats(tree: etree._ElementTree) -> ArticleMeta:
         'ancestor::*[local-name()="caption"])]'
     ):
         t = _txt(p)
-        if len(t) >= 40:
+        if t:
             paras.append(t)
 
     return {
